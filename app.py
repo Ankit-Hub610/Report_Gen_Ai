@@ -47,7 +47,7 @@ except ImportError:
 # ==================================================================================
 # PAGE CONFIG
 # ==================================================================================
-st.set_page_config(page_title="Sports Analytics Platform", page_icon="🏆", layout="wide")
+st.set_page_config(page_title="Report Gen AI By Ankit Solanki", page_icon="🏆", layout="wide")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SAMPLE_PATH = os.path.join(APP_DIR, "sample_data", "sample_sports_payments.csv")
