@@ -8,3 +8,7 @@ openpyxl      # needed to read/write .xlsx files (pd.ExcelFile)
 kaleido       # needed for fig.to_image(...) -> chart PNGs used in the PDF export
 pdfplumber    # optional: only needed if you upload PDFs as a data source on Raw Analysis
 requests      # needed for the 🤖 AI Assistant page (talks to the free OpenRouter API)
+sqlalchemy             # 🔌 Database Connector tab — connect to an external SQL database
+psycopg2-binary        # PostgreSQL driver for the Database Connector
+pymysql                # MySQL / MariaDB driver for the Database Connector
+streamlit-autorefresh  # powers the auto-refresh toggle on Database Connector query tabs
