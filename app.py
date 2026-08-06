@@ -1,0 +1,1946 @@
+"""
+app.py
+------
+SPORTS ANALYTICS PLATFORM
+A password-protected, self-contained BI tool that works on ANY tabular
+dataset (CSV / XLSX / JSON / PDF). No column names are hard-coded anywhere -
+everything (KPIs, chart variants, filters) is auto-derived from whatever
+data you load.
+
+PAGES
+  1. Raw Analysis   -> upload data, auto KPIs, 10 variants per chart family,
+                        filters on everything, pick your favourites (⭐)
+  2. Boss Dashboard -> only the charts/KPIs you picked, full theme control,
+                        swap any chart for another variant, export to PDF
+  3. Data Table     -> SQL-like column picker + filters + sort + CSV export
+  4. Settings       -> tool defaults, full "How this works" guide
+  5. Admin Panel    -> admin-only (separate 🔐 login on the sign-in screen):
+                        create/delete report-user accounts, reset passwords
+
+Run with:  streamlit run app.py
+"""
+
+import os
+import sys
+import io
+import copy
+import hashlib
+import time
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from modules import auth, data_engine as de, chart_engine as ce, pdf_export as pe
+from modules import measures as ms, builder_engine as be
+from modules import workspace_store as ws
+from modules import query_engine as qe
+from modules import db_connector as dbc
+from modules import ai_chat as ac
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+    AUTOREFRESH_AVAILABLE = True
+except ImportError:
+    AUTOREFRESH_AVAILABLE = False
+
+# ==================================================================================
+# PAGE CONFIG
+# ==================================================================================
+st.set_page_config(page_title="Sports Analytics Platform", page_icon="🏆", layout="wide")
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+SAMPLE_PATH = os.path.join(APP_DIR, "sample_data", "sample_sports_payments.csv")
+
+DEFAULT_THEME = {
+    "bg_color": "#0E1117",
+    "panel_color": "#161A23",
+    "font_color": "#F5F5F5",
+    "accent_color": "#2C6E49",
+    "font_name": "Helvetica",
+    "font_family": "Arial",
+    "font_size": 13,
+    "palette_name": "Set2",
+    "show_legend": True,
+    "show_labels": True,
+    "template": "plotly_dark",
+    "chart_bg": "rgba(0,0,0,0)",
+    "plot_bg": "rgba(0,0,0,0)",
+    "wallpaper_bytes": None,
+}
+
+PALETTES = {
+    "Set2": ["#66C2A5", "#FC8D62", "#8DA0CB", "#E78AC3", "#A6D854", "#FFD92F", "#E5C494", "#B3B3B3"],
+    "Bold": ["#7F3C8D", "#11A579", "#3969AC", "#F2B701", "#E73F74", "#80BA5A", "#E68310", "#008695"],
+    "Corporate Blue": ["#003f5c", "#2f4b7c", "#665191", "#a05195", "#d45087", "#f95d6a", "#ff7c43", "#ffa600"],
+    "Vivid": ["#E58606", "#5D69B1", "#52BCA3", "#99C945", "#CC61B0", "#24796C", "#DAA51B", "#2F8AC4"],
+    "Mono Green": ["#013220", "#0B6E4F", "#08A045", "#6BCB77", "#A6E3A1", "#D4F1D4"],
+}
+
+DEFAULT_BRAND = {
+    "text": "🏆 Sports Analytics",
+    "font_size": 22,       # px, sidebar heading
+    "color": "#F5F5F5",
+    "bold": True,
+    "italic": False,
+    "font_family": "sans-serif",  # sans-serif / serif / monospace
+}
+
+FAMILY_ICONS = {
+    "Bar": "📊", "Line": "📈", "Pie": "🥧", "Comparison": "⚖️", "Area": "🏔️",
+    "Scatter": "🔵", "Box": "📦", "Histogram": "📶", "Treemap": "🌳", "Heatmap": "🔥",
+}
+
+
+# ==================================================================================
+# SESSION STATE INIT
+# ==================================================================================
+def init_state():
+    ss = st.session_state
+    ss.setdefault("authenticated", False)
+    ss.setdefault("username", None)
+    ss.setdefault("role", None)
+    ss.setdefault("workspace_id", None)      # which data workspace this account owns (Phase 4: multi-tenant)
+    ss.setdefault("view_as_workspace", None)  # admin-only: workspace_id currently being viewed/managed instead of their own
+    ss.setdefault("_loaded_workspace_id", None)  # which workspace's data is currently sitting in session_state
+    ss.setdefault("df_raw", None)
+    ss.setdefault("meta", None)
+    ss.setdefault("filters", {})
+    ss.setdefault("theme", copy.deepcopy(DEFAULT_THEME))
+    ss.setdefault("dashboard_charts", [])   # list of dicts: {family, variant} chosen for Boss Dashboard
+    ss.setdefault("pinned_kpis", [])        # list of kpi labels pinned to dashboard
+    ss.setdefault("p1_kpi_filters", {})     # {kpi_label: [filter,...]} — per-card filters, Raw Analysis KPI cards
+    ss.setdefault("p1_kpi_number_format", "auto")  # global number format toolbar, Raw Analysis KPI cards
+    ss.setdefault("page", "Connect Data")
+    ss.setdefault("data_source_name", None)
+    ss.setdefault("custom_kpis", [])        # list of user-built KPI card dicts (Custom Builder)
+    ss.setdefault("custom_charts", [])      # list of user-built chart dicts (Custom Builder, Power-BI style)
+    ss.setdefault("dashboard_slicers", [])  # list of dicts: {field, style} - Boss Dashboard slicer widgets
+    ss.setdefault("dashboard_name", "⭐ Boss Dashboard")  # fully editable Boss Dashboard title
+    # App branding (sidebar title) - GLOBAL across every account, admin-editable.
+    # Loaded from disk once per session (not per-workspace - see workspace_store.load_branding).
+    if "app_brand" not in ss:
+        saved_brand = ws.load_branding()
+        ss["app_brand"] = {**DEFAULT_BRAND, **saved_brand} if saved_brand else copy.deepcopy(DEFAULT_BRAND)
+    # External Database Connector (Data Table page) - NEVER persisted to disk (see workspace_store.py)
+    ss.setdefault("ai_chat_history", [])     # list of {role, content} — the AI Assistant page's chat log
+    ss.setdefault("ai_groq_key", None)       # session-only OpenRouter API key typed into the UI by admin (never written to disk)
+    ss.setdefault("db_conn_uri", "")
+    ss.setdefault("db_conn_type", "PostgreSQL")
+    ss.setdefault("db_connected", False)
+    ss.setdefault("db_queries", [])         # list of query-tab dicts, see modules/db_connector.py
+    ss.setdefault("db_query_results", {})   # {query_id: DataFrame}
+
+
+init_state()
+
+
+def effective_workspace_id():
+    """The workspace whose data should be shown/edited on THIS run: an
+    admin's own workspace_id, unless they've picked a client/viewer to
+    'view as' in the sidebar, in which case that account's workspace_id
+    takes over for the rest of this run."""
+    ss = st.session_state
+    if ss.role == auth.ROLE_ADMIN and ss.get("view_as_workspace"):
+        return ss["view_as_workspace"]
+    return ss.get("workspace_id") or ss.get("username")
+
+
+def can_edit() -> bool:
+    """True for admin and client accounts (can upload data, build/curate
+    dashboards). False for viewer accounts (read-only - they can look at
+    whatever their linked client/own workspace has, but never change it)."""
+    return st.session_state.role in (auth.ROLE_ADMIN, auth.ROLE_CLIENT)
+
+
+def sync_workspace_from_disk():
+    """Call once near the top of every run, AFTER the effective workspace_id
+    for this run is known. If it's different from what's currently sitting
+    in session_state (first login, or an admin just switched 'view as'),
+    load that workspace's saved data from disk - never invents empty state
+    for a workspace, and never bleeds one workspace's data into another."""
+    ss = st.session_state
+    wsid = effective_workspace_id()
+    if ss.get("_loaded_workspace_id") == wsid:
+        return
+    for k in ws.PERSISTED_KEYS:
+        ss[k] = [] if isinstance(ss.get(k), list) else None
+    ss["filters"] = {}
+    ss["p3_sql_result"] = None  # SQL Query tab result belongs to the previous workspace — drop it on switch
+    ss["p3_sql_error"] = None
+    saved = ws.load(wsid)
+    if saved:
+        for k, v in saved.items():
+            if v is not None:
+                ss[k] = v
+    # dashboard_name is a plain string with a non-None default (set in init_state).
+    # Old workspace saves made before this field existed (or a save with the
+    # title cleared) can leave it as None here, which crashes the Boss
+    # Dashboard title editor (`new_name.strip()` on None). Always fall back
+    # to the default instead of leaving it None.
+    if not ss.get("dashboard_name"):
+        ss["dashboard_name"] = "⭐ Boss Dashboard"
+    ss["_loaded_workspace_id"] = wsid
+
+
+# ==================================================================================
+# AUTH GATE
+# ==================================================================================
+# The admin login form is NEVER shown as a button/icon on the normal sign-in
+# screen - a regular report-user should have no visual hint that it exists at
+# all. It only appears if the page is opened with this exact secret value in
+# the URL, e.g.  http://localhost:8501/?admin=SET-YOUR-OWN-SECRET-HERE
+# Change this string to whatever private value you want, then bookmark the URL
+# with it for yourself. Anyone without that exact link just sees a plain login.
+ADMIN_URL_KEY = "admin"
+ADMIN_URL_SECRET = "SET-YOUR-OWN-SECRET-HERE"
+
+
+def login_screen():
+    st.markdown("<h1 style='text-align:center;'>🏆 Sports Analytics Platform</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col2:
+        with st.form("login_form"):
+            u = st.text_input("Username")
+            p = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Login", use_container_width=True)
+            if submitted:
+                role = auth.verify_login(u, p)
+                if role:
+                    st.session_state.authenticated = True
+                    st.session_state.username = u.strip()
+                    st.session_state.role = role
+                    st.session_state.workspace_id = auth.get_workspace_id(u.strip())
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password.")
+
+        admin_link_used = st.query_params.get(ADMIN_URL_KEY) == ADMIN_URL_SECRET
+        if admin_link_used:
+            st.write("")
+            st.info("Admin login — for the person who manages this tool's users, not for daily reporting.")
+            with st.form("admin_login_form"):
+                au = st.text_input("Admin username", key="admin_u")
+                ap = st.text_input("Admin password", type="password", key="admin_p")
+                admin_submitted = st.form_submit_button("Admin Login", use_container_width=True)
+                if admin_submitted:
+                    if auth.verify_admin_login(au, ap):
+                        st.session_state.authenticated = True
+                        st.session_state.username = au.strip()
+                        st.session_state.role = auth.ROLE_ADMIN
+                        st.session_state.workspace_id = auth.get_workspace_id(au.strip())
+                        st.rerun()
+                    else:
+                        st.error("Invalid admin username or password.")
+
+
+if not st.session_state.authenticated:
+    login_screen()
+    st.stop()
+
+
+# ==================================================================================
+# HELPERS
+# ==================================================================================
+def get_style_dict():
+    th = st.session_state.theme
+    return {
+        "palette": PALETTES.get(th["palette_name"], PALETTES["Set2"]),
+        "template": th["template"],
+        "font_family": th["font_family"],
+        "font_color": th["font_color"],
+        "font_size": th["font_size"],
+        "show_legend": th["show_legend"],
+        "show_labels": th["show_labels"],
+        "chart_bg": th["chart_bg"],
+        "plot_bg": th["plot_bg"],
+    }
+
+
+@st.cache_data(show_spinner=False)
+def _load_and_clean(file_bytes, file_name):
+    class _F:
+        def __init__(self, b, n):
+            self._b = b
+            self.name = n
+        def read(self):
+            return self._b
+    sheets = de.load_dataframe(_F(file_bytes, file_name))
+    cleaned = {name: de.clean_dataframe(df) for name, df in sheets.items()}
+    return cleaned
+
+
+def load_file(uploaded_file):
+    """Single-file load (kept for backward compatibility / the sample loader)."""
+    file_bytes = uploaded_file.read()
+    sheets = _load_and_clean(file_bytes, uploaded_file.name)
+    if len(sheets) > 1:
+        sheet_name = st.selectbox("Multiple sheets found — pick one", list(sheets.keys()), key="sheet_pick")
+    else:
+        sheet_name = list(sheets.keys())[0]
+    df = sheets[sheet_name]
+    if df is None or df.empty:
+        st.error("Could not read any usable rows from this file.")
+        return None
+    _apply_loaded_df(df, uploaded_file.name)
+    return df
+
+
+def _apply_loaded_df(df, source_name):
+    st.session_state.df_raw = df
+    st.session_state.meta = de.profile_columns(df)
+    st.session_state.data_source_name = source_name
+    st.session_state.filters = {}
+    st.session_state.dashboard_charts = []
+    st.session_state.pinned_kpis = []
+    st.session_state.dashboard_slicers = []
+
+
+def load_files(uploaded_files, combine_mode="stack"):
+    """Loads MULTIPLE uploaded files and combines them into a single dataset.
+    combine_mode: 'stack' (append rows, union columns, tag each row with its
+    source file) or 'columns' (paste sheets side by side)."""
+    if not uploaded_files:
+        return None
+
+    if len(uploaded_files) == 1:
+        return load_file(uploaded_files[0])
+
+    named_dfs = []
+    for f in uploaded_files:
+        file_bytes = f.read()
+        sheets = _load_and_clean(file_bytes, f.name)
+        # if a file itself has multiple sheets, stack/union all of them under that file's name
+        for sheet_name, sdf in sheets.items():
+            if sdf is None or sdf.empty:
+                continue
+            label = f.name if len(sheets) == 1 else f"{f.name} [{sheet_name}]"
+            named_dfs.append((label, sdf))
+
+    if not named_dfs:
+        st.error("Could not read any usable rows from these files.")
+        return None
+
+    combined = de.combine_dataframes(named_dfs, mode=combine_mode)
+    if combined is None or combined.empty:
+        st.error("Combining these files produced no usable rows — check they share a similar structure.")
+        return None
+
+    combined_name = f"{len(uploaded_files)} files combined ({', '.join(f.name for f in uploaded_files[:3])}{', ...' if len(uploaded_files) > 3 else ''})"
+    _apply_loaded_df(combined, combined_name)
+    return combined
+
+
+def load_sample():
+    if not os.path.exists(SAMPLE_PATH):
+        st.error("Sample file not found.")
+        return
+    with open(SAMPLE_PATH, "rb") as f:
+        data = f.read()
+    sheets = _load_and_clean(data, "sample_sports_payments.csv")
+    df = sheets["Sheet1"]
+    st.session_state.df_raw = df
+    st.session_state.meta = de.profile_columns(df)
+    st.session_state.data_source_name = "sample_sports_payments.csv (demo data)"
+    st.session_state.filters = {}
+    st.session_state.dashboard_charts = []
+    st.session_state.pinned_kpis = []
+    st.session_state.dashboard_slicers = []
+
+
+def render_filters(df, meta, key_prefix=""):
+    """Draws filter widgets for every column and returns the filtered dataframe."""
+    filters = st.session_state.filters
+    # NOTE: a column can appear in BOTH categorical_cols and status_cols (data_engine
+    # tags "status/stage/state" columns into status_cols without excluding them from
+    # categorical_cols). De-dupe here so we never build two widgets with the same key.
+    cat_and_status_cols = list(dict.fromkeys(meta["categorical_cols"] + meta["status_cols"]))
+    with st.expander("🔎 Filters (apply to every KPI & chart below)", expanded=False):
+        cols_ui = st.columns(3)
+        i = 0
+        for col in cat_and_status_cols:
+            if col not in df.columns:
+                continue
+            with cols_ui[i % 3]:
+                opts = sorted([str(x) for x in df[col].dropna().unique()])[:500]
+                sel = st.multiselect(col, opts, default=filters.get(f"{key_prefix}{col}", []), key=f"{key_prefix}filt_{col}")
+                filters[f"{key_prefix}{col}"] = sel
+            i += 1
+        for col in meta["numeric_cols"]:
+            if col not in df.columns:
+                continue
+            s = pd.to_numeric(df[col], errors="coerce").dropna()
+            if s.empty:
+                continue
+            lo, hi = float(s.min()), float(s.max())
+            if lo == hi:
+                continue
+            with cols_ui[i % 3]:
+                default = filters.get(f"{key_prefix}{col}_range", (lo, hi))
+                rng = st.slider(col, lo, hi, default, key=f"{key_prefix}filt_num_{col}")
+                filters[f"{key_prefix}{col}_range"] = rng
+            i += 1
+        for col in meta["date_cols"]:
+            if col not in df.columns:
+                continue
+            d = pd.to_datetime(df[col], errors="coerce").dropna()
+            if d.empty:
+                continue
+            lo, hi = d.min().date(), d.max().date()
+            with cols_ui[i % 3]:
+                default = filters.get(f"{key_prefix}{col}_daterange", (lo, hi))
+                rng = st.date_input(col, default, key=f"{key_prefix}filt_date_{col}")
+                filters[f"{key_prefix}{col}_daterange"] = rng
+            i += 1
+        c1, c2 = st.columns([1, 5])
+        with c1:
+            if st.button("Reset filters", key=f"{key_prefix}reset_filters"):
+                st.session_state.filters = {}
+                st.rerun()
+
+    fdf = df.copy()
+    for col in cat_and_status_cols:
+        sel = filters.get(f"{key_prefix}{col}")
+        if sel:
+            fdf = fdf[fdf[col].astype(str).isin(sel)]
+    for col in meta["numeric_cols"]:
+        rng = filters.get(f"{key_prefix}{col}_range")
+        if rng and col in fdf.columns:
+            s = pd.to_numeric(fdf[col], errors="coerce")
+            fdf = fdf[(s >= rng[0]) & (s <= rng[1]) | s.isna()]
+    for col in meta["date_cols"]:
+        rng = filters.get(f"{key_prefix}{col}_daterange")
+        if rng and isinstance(rng, (tuple, list)) and len(rng) == 2 and col in fdf.columns:
+            d = pd.to_datetime(fdf[col], errors="coerce")
+            fdf = fdf[(d.dt.date >= rng[0]) & (d.dt.date <= rng[1]) | d.isna()]
+    return fdf
+
+
+SLICER_STYLES = ["Dropdown", "Vertical list", "Tile"]
+
+
+def render_slicers(df, meta, key_prefix=""):
+    """Power-BI style slicers: unlike the generic 'Filters' expander above
+    (which always lists every column, tucked away collapsed), a slicer is a
+    report element YOU explicitly add for one chosen field, in a chosen visual
+    style, and it stays visible on the dashboard itself. Returns the further-
+    filtered dataframe (applied on top of whatever render_filters() already
+    narrowed down)."""
+    slicers = st.session_state.dashboard_slicers
+    all_cols = list(df.columns)
+
+    with st.expander("🎚️ Manage Slicers (pick which fields show as filter widgets on this dashboard)", expanded=False):
+        if not can_edit():
+            st.caption("View-only account — slicer setup is managed by your admin/client.")
+        else:
+            used_fields = [s["field"] for s in slicers]
+            available = [c for c in all_cols if c not in used_fields]
+            if available:
+                ac1, ac2, ac3 = st.columns([3, 2, 1])
+                with ac1:
+                    new_field = st.selectbox("Field", available, key=f"{key_prefix}slicer_new_field")
+                with ac2:
+                    new_style = st.selectbox("Style", SLICER_STYLES, key=f"{key_prefix}slicer_new_style")
+                with ac3:
+                    st.write("")
+                    st.write("")
+                    if st.button("➕ Add slicer", key=f"{key_prefix}slicer_add", use_container_width=True):
+                        slicers.append({"field": new_field, "style": new_style})
+                        st.rerun()
+            else:
+                st.caption("Every column already has a slicer.")
+
+            if slicers:
+                st.divider()
+                st.caption("Slicers on this dashboard:")
+                for i, s in enumerate(list(slicers)):
+                    r1, r2, r3 = st.columns([3, 2, 1])
+                    with r1:
+                        st.write(f"**{s['field']}**")
+                    with r2:
+                        if s["field"] in (meta.get("categorical_cols", []) + meta.get("status_cols", [])):
+                            s["style"] = st.selectbox("Style", SLICER_STYLES,
+                                                       index=SLICER_STYLES.index(s["style"]) if s["style"] in SLICER_STYLES else 0,
+                                                       key=f"{key_prefix}slicer_style_{i}", label_visibility="collapsed")
+                        else:
+                            st.caption("range widget")
+                    with r3:
+                        if st.button("🗑️", key=f"{key_prefix}slicer_rm_{i}", help="Remove this slicer"):
+                            slicers.pop(i)
+                            st.rerun()
+
+    if not slicers:
+        return df
+
+    st.markdown("##### 🎚️ Slicers")
+    view = df.copy()
+    n = len(slicers)
+    cols = st.columns(min(n, 4))
+    for i, s in enumerate(slicers):
+        field, style = s["field"], s["style"]
+        if field not in df.columns:
+            continue
+        with cols[i % len(cols)]:
+            st.caption(field)
+            skey = f"{key_prefix}slicer_val_{field}"
+            if field in meta.get("numeric_cols", []):
+                series = pd.to_numeric(df[field], errors="coerce").dropna()
+                if series.empty:
+                    continue
+                lo, hi = float(series.min()), float(series.max())
+                if lo == hi:
+                    continue
+                rng = st.slider(field, lo, hi, (lo, hi), key=skey, label_visibility="collapsed")
+                s_num = pd.to_numeric(view[field], errors="coerce")
+                view = view[(s_num >= rng[0]) & (s_num <= rng[1])]
+            elif field in meta.get("date_cols", []):
+                d = pd.to_datetime(df[field], errors="coerce").dropna()
+                if d.empty:
+                    continue
+                lo, hi = d.min().date(), d.max().date()
+                rng = st.date_input(field, (lo, hi), key=skey, label_visibility="collapsed")
+                if isinstance(rng, (tuple, list)) and len(rng) == 2:
+                    d_col = pd.to_datetime(view[field], errors="coerce")
+                    view = view[(d_col.dt.date >= rng[0]) & (d_col.dt.date <= rng[1])]
+            else:
+                opts = sorted([str(x) for x in df[field].dropna().unique()])[:200]
+                if not opts:
+                    continue
+                sel = []
+                if style == "Dropdown":
+                    sel = st.multiselect(field, opts, key=skey, label_visibility="collapsed")
+                elif style == "Vertical list":
+                    with st.container(border=True):
+                        for opt in opts:
+                            if st.checkbox(opt, key=f"{skey}_{opt}"):
+                                sel.append(opt)
+                else:  # Tile
+                    with st.container(border=True):
+                        tile_cols = st.columns(3)
+                        for oi, opt in enumerate(opts):
+                            with tile_cols[oi % 3]:
+                                if st.checkbox(opt, key=f"{skey}_{opt}"):
+                                    sel.append(opt)
+                if sel:
+                    view = view[view[field].astype(str).isin(sel)]
+    return view
+
+
+def kpi_cards(kpis, pinnable=False, key_prefix="", df=None, filterable=False, number_format="auto"):
+    """Renders KPI cards in a responsive grid. If pinnable, shows a pin checkbox per card.
+    If filterable (needs `df`), every card that represents a plain column aggregation
+    (has "column"/"agg" set — see de.compute_kpis) gets its OWN "➕ Filter this card"
+    popover, independent of every other card and independent of the page-level filter."""
+    n_cols = 4
+    store = st.session_state.p1_kpi_filters
+    for row_start in range(0, len(kpis), n_cols):
+        cols = st.columns(n_cols)
+        for j, k in enumerate(kpis[row_start:row_start + n_cols]):
+            with cols[j]:
+                label = k["label"]
+                value, sub = k["value"], k.get("sub")
+                if filterable and df is not None and k.get("column") and k.get("agg"):
+                    card_filters = store.get(label, [])
+                    if card_filters:
+                        fdf = ms.apply_filters(df, card_filters)
+                        col, agg = k["column"], k["agg"]
+                        s = pd.to_numeric(fdf[col], errors="coerce") if agg in ("sum", "mean") else fdf[col]
+                        if agg == "sum":
+                            value = de._fmt_num(s.sum(), number_format)
+                        elif agg == "mean":
+                            value = de._fmt_num(s.mean(), number_format)
+                        elif agg == "nunique":
+                            value = f"{s.nunique():,}"
+                        sub = f"{sub} · {len(fdf):,} rows after this card's filter"
+                    st.metric(label, value, help=sub)
+                    with st.popover("➕ Filter this card", use_container_width=True):
+                        new_filters = be.render_filter_builder(df, card_filters, key_prefix=f"{key_prefix}kpi_{label}_")
+                        store[label] = new_filters
+                else:
+                    st.metric(label, value, help=sub)
+                if pinnable:
+                    pinned = label in st.session_state.pinned_kpis
+                    new_val = st.checkbox("⭐ pin to dashboard", value=pinned, key=f"{key_prefix}pin_{label}_{row_start}_{j}")
+                    if new_val and label not in st.session_state.pinned_kpis:
+                        st.session_state.pinned_kpis.append(label)
+                    if not new_val and label in st.session_state.pinned_kpis:
+                        st.session_state.pinned_kpis.remove(label)
+
+
+def chart_in_dashboard(family, variant_id):
+    return any(c["family"] == family and c["variant"]["id"] == variant_id for c in st.session_state.dashboard_charts)
+
+
+def add_to_dashboard(family, variant):
+    # Only replaces an EXACT same (family, variant id) match - so pinning a second,
+    # different Bar variant no longer knocks the first Bar chart off the dashboard.
+    # As many variants per family as you like can be pinned side by side.
+    vid = variant["id"]
+    st.session_state.dashboard_charts = [
+        c for c in st.session_state.dashboard_charts
+        if not (c["family"] == family and c["variant"]["id"] == vid)
+    ]
+    st.session_state.dashboard_charts.append({"family": family, "variant": copy.deepcopy(variant)})
+
+
+def remove_from_dashboard(family, variant_id):
+    st.session_state.dashboard_charts = [
+        c for c in st.session_state.dashboard_charts
+        if not (c["family"] == family and c["variant"]["id"] == variant_id)
+    ]
+
+
+def _safe_index(options, value, fallback=0):
+    try:
+        return options.index(value)
+    except (ValueError, TypeError):
+        return fallback if options else 0
+
+
+def customize_variant(fam, variant, meta, key_prefix):
+    """Draws an '⚙️ Customize' expander under a chart with the right X / Y /
+    measure / aggregation / split controls for that chart family, built from
+    whatever columns exist in the current dataset (nothing hard-coded).
+    Returns a (possibly edited) COPY of the variant - if anything was changed,
+    it gets its own unique id so pinning it to the Boss Dashboard never clashes
+    with the original auto-generated version of this chart."""
+    cats = meta["categorical_cols"] or []
+    nums = meta["numeric_cols"] or []
+    dates = meta["date_cols"] or []
+    v = copy.deepcopy(variant)
+    changed = False
+    NONE_LABEL = "(none)"
+    COUNT_LABEL = "(count of rows)"
+
+    with st.expander("⚙️ Customize X / Y / measure / filter"):
+        if fam == "Bar":
+            dim = st.selectbox("Category (X)", cats, index=_safe_index(cats, v.get("dim")), key=f"{key_prefix}dim") if cats else v.get("dim")
+            m_opts = [COUNT_LABEL] + nums
+            cur = v.get("measure") or COUNT_LABEL
+            m = st.selectbox("Measure (Y)", m_opts, index=_safe_index(m_opts, cur), key=f"{key_prefix}measure")
+            agg = st.selectbox("Aggregation", ["sum", "mean", "median", "max", "min"],
+                                index=_safe_index(["sum", "mean", "median", "max", "min"], v.get("agg", "sum")),
+                                key=f"{key_prefix}agg")
+            m = None if m == COUNT_LABEL else m
+            if (dim, m, agg) != (v.get("dim"), v.get("measure"), v.get("agg")):
+                v["dim"], v["measure"], v["agg"] = dim, m, agg
+                v["title"] = f"{agg.title()} {m or 'Records'} by {dim}"
+                changed = True
+
+        elif fam in ("Line", "Area"):
+            date_opts = [NONE_LABEL] + dates
+            cur_d = v.get("date_col") or NONE_LABEL
+            dcol = st.selectbox("Date (X)", date_opts, index=_safe_index(date_opts, cur_d), key=f"{key_prefix}date")
+            dcol = None if dcol == NONE_LABEL else dcol
+            m = st.selectbox("Measure (Y)", nums, index=_safe_index(nums, v.get("measure")), key=f"{key_prefix}measure") if nums else v.get("measure")
+            gran = st.selectbox("Granularity", ["D", "W", "ME"], format_func=lambda x: {"D": "Daily", "W": "Weekly", "ME": "Monthly"}[x],
+                                 index=_safe_index(["D", "W", "ME"], v.get("gran", "D")), key=f"{key_prefix}gran") if dcol else v.get("gran")
+            split_opts = [NONE_LABEL] + cats
+            cur_split = v.get("split_by") or NONE_LABEL
+            split_by = st.selectbox("Split by (color)", split_opts, index=_safe_index(split_opts, cur_split), key=f"{key_prefix}split")
+            split_by = None if split_by == NONE_LABEL else split_by
+            new_vals = {"date_col": dcol, "measure": m, "gran": gran, "split_by": split_by}
+            if fam == "Area":
+                cum = st.checkbox("Cumulative", value=v.get("cum", False), key=f"{key_prefix}cum")
+                new_vals["cum"] = cum
+            if any(new_vals.get(k) != v.get(k) for k in new_vals):
+                v.update(new_vals)
+                v["title"] = f"{'Cumulative ' if v.get('cum') else ''}{m} over time" + (f" by {split_by}" if split_by else "")
+                changed = True
+
+        elif fam == "Pie":
+            dim = st.selectbox("Category", cats, index=_safe_index(cats, v.get("dim")), key=f"{key_prefix}dim") if cats else v.get("dim")
+            m_opts = [COUNT_LABEL] + nums
+            cur = v.get("measure") or COUNT_LABEL
+            m = st.selectbox("Measure", m_opts, index=_safe_index(m_opts, cur), key=f"{key_prefix}measure")
+            m = None if m == COUNT_LABEL else m
+            if (dim, m) != (v.get("dim"), v.get("measure")):
+                v["dim"], v["measure"] = dim, m
+                v["title"] = f"Share of {m or 'Records'} by {dim}"
+                changed = True
+
+        elif fam == "Comparison":
+            dim1 = st.selectbox("Category 1", cats, index=_safe_index(cats, v.get("dim1")), key=f"{key_prefix}dim1") if cats else v.get("dim1")
+            dim2_opts = [c for c in cats if c != dim1] or cats
+            dim2 = st.selectbox("Category 2", dim2_opts, index=_safe_index(dim2_opts, v.get("dim2")), key=f"{key_prefix}dim2") if dim2_opts else v.get("dim2")
+            m = st.selectbox("Measure", nums, index=_safe_index(nums, v.get("measure")), key=f"{key_prefix}measure") if nums else v.get("measure")
+            if (dim1, dim2, m) != (v.get("dim1"), v.get("dim2"), v.get("measure")):
+                v["dim1"], v["dim2"], v["measure"] = dim1, dim2, m
+                v["title"] = f"{m or 'Records'}: {dim1} vs {dim2}"
+                changed = True
+
+        elif fam == "Scatter":
+            x = st.selectbox("X axis", nums, index=_safe_index(nums, v.get("x")), key=f"{key_prefix}x") if nums else v.get("x")
+            y_opts = [n for n in nums if n != x] or nums
+            y = st.selectbox("Y axis", y_opts, index=_safe_index(y_opts, v.get("y")), key=f"{key_prefix}y") if y_opts else v.get("y")
+            color_opts = [NONE_LABEL] + cats
+            cur_c = v.get("color") or NONE_LABEL
+            color = st.selectbox("Color by", color_opts, index=_safe_index(color_opts, cur_c), key=f"{key_prefix}color")
+            color = None if color == NONE_LABEL else color
+            if (x, y, color) != (v.get("x"), v.get("y"), v.get("color")):
+                v["x"], v["y"], v["color"] = x, y, color
+                v["title"] = f"{x} vs {y}" + (f" by {color}" if color else "")
+                changed = True
+
+        elif fam == "Box":
+            dim = st.selectbox("Category (X)", cats, index=_safe_index(cats, v.get("dim")), key=f"{key_prefix}dim") if cats else v.get("dim")
+            m = st.selectbox("Measure (Y)", nums, index=_safe_index(nums, v.get("measure")), key=f"{key_prefix}measure") if nums else v.get("measure")
+            if (dim, m) != (v.get("dim"), v.get("measure")):
+                v["dim"], v["measure"] = dim, m
+                v["title"] = f"Distribution of {m} across {dim}"
+                changed = True
+
+        elif fam == "Histogram":
+            m = st.selectbox("Measure", nums, index=_safe_index(nums, v.get("measure")), key=f"{key_prefix}measure") if nums else v.get("measure")
+            bins = st.slider("Bins", 5, 100, v.get("bins", 30), key=f"{key_prefix}bins")
+            facet_opts = [NONE_LABEL] + cats
+            cur_f = v.get("facet") or NONE_LABEL
+            facet = st.selectbox("Split by", facet_opts, index=_safe_index(facet_opts, cur_f), key=f"{key_prefix}facet")
+            facet = None if facet == NONE_LABEL else facet
+            if (m, bins, facet) != (v.get("measure"), v.get("bins"), v.get("facet")):
+                v["measure"], v["bins"], v["facet"] = m, bins, facet
+                v["title"] = f"Distribution of {m} ({bins} bins)" + (f" split by {facet}" if facet else "")
+                changed = True
+
+        elif fam == "Treemap":
+            path = st.multiselect("Hierarchy (in order)", cats, default=v.get("path", cats[:1]), key=f"{key_prefix}path")
+            m = st.selectbox("Measure", nums, index=_safe_index(nums, v.get("measure")), key=f"{key_prefix}measure") if nums else v.get("measure")
+            if path and (path, m) != (v.get("path"), v.get("measure")):
+                v["path"], v["measure"] = path, m
+                v["title"] = f"{m or 'Records'} Treemap - " + " > ".join(path)
+                changed = True
+
+        elif fam == "Heatmap" and v.get("kind") == "cross":
+            dim1 = st.selectbox("Rows", cats, index=_safe_index(cats, v.get("dim1")), key=f"{key_prefix}dim1") if cats else v.get("dim1")
+            dim2_opts = [c for c in cats if c != dim1] or cats
+            dim2 = st.selectbox("Columns", dim2_opts, index=_safe_index(dim2_opts, v.get("dim2")), key=f"{key_prefix}dim2") if dim2_opts else v.get("dim2")
+            m_opts = [COUNT_LABEL] + nums
+            cur = v.get("measure") or COUNT_LABEL
+            m = st.selectbox("Measure", m_opts, index=_safe_index(m_opts, cur), key=f"{key_prefix}measure")
+            m = None if m == COUNT_LABEL else m
+            if (dim1, dim2, m) != (v.get("dim1"), v.get("dim2"), v.get("measure")):
+                v["dim1"], v["dim2"], v["measure"] = dim1, dim2, m
+                v["title"] = f"{m or 'Records'} Heatmap: {dim1} x {dim2}"
+                changed = True
+
+    if changed:
+        sig = hashlib.md5(repr(sorted(v.items(), key=lambda kv: kv[0])).encode()).hexdigest()[:10]
+        v["id"] = f"{fam}_custom_{sig}"
+    return v
+
+
+# ==================================================================================
+# SIDEBAR NAV
+# ==================================================================================
+with st.sidebar:
+    _b = st.session_state.app_brand
+    st.markdown(
+        f"<div style='font-size:{_b['font_size']}px; color:{_b['color']}; "
+        f"font-weight:{'700' if _b['bold'] else '400'}; "
+        f"font-style:{'italic' if _b['italic'] else 'normal'}; "
+        f"font-family:{_b['font_family']}; margin-bottom:0.2rem;'>{_b['text']}</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(f"Logged in as **{st.session_state.username}** ({st.session_state.role})")
+
+    # ---- Admin-only: "View as" a client/viewer workspace ------------------------
+    # Admin has no data of its own - it borrows whichever account's workspace is
+    # picked here for the rest of this run (Raw Analysis, Boss Dashboard, Data
+    # Table all follow this pick). Clears back to "(My own data)" on next login.
+    if st.session_state.role == auth.ROLE_ADMIN:
+        all_users = auth.list_users()
+        # one entry per distinct workspace_id, labelled with everyone sharing it
+        ws_to_accounts = {}
+        for u in all_users:
+            if u["role"] == auth.ROLE_ADMIN:
+                continue
+            ws_to_accounts.setdefault(u["workspace_id"], []).append(f"{u['username']} ({u['role']})")
+        ws_labels = {wsid: f"{wsid}  —  {', '.join(names)}" for wsid, names in ws_to_accounts.items()}
+        options = ["(My own data)"] + list(ws_labels.keys())
+        current = st.session_state.get("view_as_workspace") or "(My own data)"
+        chosen = st.selectbox(
+            "👁️ View as", options, index=options.index(current) if current in options else 0,
+            format_func=lambda x: ws_labels.get(x, x),
+            help="Pick a client/viewer's workspace to view and manage their data. Nothing here affects any other client.",
+        )
+        st.session_state.view_as_workspace = None if chosen == "(My own data)" else chosen
+        if st.session_state.view_as_workspace:
+            st.info(f"👁️ Viewing as: **{st.session_state.view_as_workspace}**")
+        st.divider()
+
+    sync_workspace_from_disk()
+
+    nav_options = ["📥 Connect Data", "📊 Raw Analysis", "🧩 Custom Builder", "⭐ Boss Dashboard", "🗂 Data Table",
+                    "🤖 AI Assistant", "⚙️ Settings"]
+    if st.session_state.role == auth.ROLE_ADMIN:
+        nav_options.append("🔐 Admin Panel")
+    page = st.radio("Navigate", nav_options, label_visibility="collapsed")
+    st.session_state.page = page
+    st.divider()
+    if st.session_state.data_source_name:
+        st.success(f"Loaded: {st.session_state.data_source_name}")
+        if st.session_state.df_raw is not None:
+            st.caption(f"{len(st.session_state.df_raw):,} rows × {len(st.session_state.df_raw.columns)} cols")
+    else:
+        st.info("No data loaded yet.")
+    if not can_edit():
+        st.caption("👁️ View-only account — you can look at reports here but not upload data or change dashboards.")
+    st.divider()
+    if st.button("🚪 Logout", use_container_width=True):
+        st.session_state.authenticated = False
+        st.session_state.username = None
+        st.session_state.role = None
+        st.session_state.workspace_id = None
+        st.session_state.view_as_workspace = None
+        st.session_state._loaded_workspace_id = None
+        st.rerun()
+
+
+# ==================================================================================
+# PAGE 0: CONNECT DATA (always the first step — file upload OR live database)
+# ==================================================================================
+if page == "📥 Connect Data":
+    st.title("📥 Connect Data")
+    st.caption("Every other page (Raw Analysis, Boss Dashboard, Data Table) works off whatever dataset is "
+               "loaded here. Pick a source, load it once, then go build your analysis.")
+
+    if st.session_state.df_raw is not None:
+        st.success(f"🟢 Currently loaded: **{st.session_state.data_source_name}** "
+                   f"({len(st.session_state.df_raw):,} rows × {len(st.session_state.df_raw.columns)} cols)")
+
+    if can_edit():
+        src_tab_file, src_tab_db = st.tabs(["📁 Upload File", "🔌 Connect Database"])
+
+        # ---------------- FILE UPLOAD ----------------
+        with src_tab_file:
+            up_col, sample_col = st.columns([3, 1])
+            with up_col:
+                uploaded = st.file_uploader(
+                    "Import data (CSV, XLSX, JSON, PDF) — pick multiple files to combine them into one dataset",
+                    type=["csv", "tsv", "xlsx", "xls", "json", "pdf"], accept_multiple_files=True,
+                )
+                if uploaded:
+                    if len(uploaded) > 1:
+                        combine_label = st.radio(
+                            "How should these files be combined?",
+                            ["Stack rows (append — e.g. Jan.csv + Feb.csv + Mar.csv)",
+                             "Paste side-by-side (same rows, different columns per file)"],
+                            key="combine_mode_choice",
+                        )
+                        combine_mode = "stack" if combine_label.startswith("Stack") else "columns"
+                        if st.button(f"🔗 Combine & Load {len(uploaded)} files", type="primary"):
+                            if load_files(uploaded, combine_mode=combine_mode) is not None:
+                                st.rerun()
+                    else:
+                        if load_file(uploaded[0]) is not None:
+                            st.rerun()
+            with sample_col:
+                st.write("")
+                st.write("")
+                if st.button("🎯 Load Sample Data", use_container_width=True):
+                    load_sample()
+                    st.rerun()
+
+        # ---------------- DATABASE CONNECT ----------------
+        with src_tab_db:
+            st.caption("Connect to a live SQL database and pick a table to load as your working dataset. "
+                       "Read-only — only SELECT is ever run against your database.")
+            if not dbc.SQLALCHEMY_AVAILABLE:
+                st.warning("SQLAlchemy isn't installed in this environment yet. Add `sqlalchemy` (plus a driver "
+                           "like `psycopg2-binary` for Postgres or `pymysql` for MySQL) to requirements.txt and reinstall.")
+
+            with st.expander("🔌 Connection", expanded=not st.session_state.db_connected):
+                db_type = st.selectbox("Database type", list(dbc.DB_TYPES.keys()),
+                                        index=list(dbc.DB_TYPES.keys()).index(st.session_state.db_conn_type)
+                                        if st.session_state.db_conn_type in dbc.DB_TYPES else 0,
+                                        key="cd_db_type_pick")
+                st.session_state.db_conn_type = db_type
+
+                if db_type == "Custom SQLAlchemy URI":
+                    uri = st.text_input("SQLAlchemy URI", placeholder="postgresql+psycopg2://user:pass@host:5432/dbname",
+                                         key="cd_db_raw_uri")
+                elif db_type == "SQLite (local file path)":
+                    sqlite_path = st.text_input("SQLite file path", placeholder="/path/to/database.db", key="cd_db_sqlite_path")
+                    uri = dbc.build_uri(db_type, database=sqlite_path)
+                else:
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        host = st.text_input("Host", placeholder="localhost", key="cd_db_host")
+                    with c2:
+                        port = st.text_input("Port", placeholder=str(dbc.DB_TYPES[db_type]["default_port"]), key="cd_db_port")
+                    with c3:
+                        database = st.text_input("Database name", key="cd_db_name")
+                    c4, c5 = st.columns(2)
+                    with c4:
+                        username = st.text_input("Username", key="cd_db_user")
+                    with c5:
+                        password = st.text_input("Password", type="password", key="cd_db_pass")
+                    odbc_driver = ""
+                    if db_type == "SQL Server":
+                        odbc_driver = st.text_input("ODBC driver name", value="ODBC Driver 17 for SQL Server", key="cd_db_odbc")
+                    uri = dbc.build_uri(db_type, host=host, port=port, database=database,
+                                         username=username, password=password, odbc_driver=odbc_driver)
+
+                cc1, cc2 = st.columns([1, 3])
+                with cc1:
+                    if st.button("🔗 Test & Connect", type="primary", use_container_width=True, key="cd_db_connect_btn"):
+                        try:
+                            dbc.test_connection(uri)
+                            st.session_state.db_conn_uri = uri
+                            st.session_state.db_connected = True
+                            st.success("Connected successfully.")
+                        except dbc.ConnectionError as e:
+                            st.session_state.db_connected = False
+                            st.error(f"Could not connect: {e}")
+                with cc2:
+                    if st.session_state.db_connected and st.button("🔌 Disconnect", key="cd_db_disconnect_btn"):
+                        st.session_state.db_connected = False
+                        st.session_state.db_conn_uri = ""
+                        st.rerun()
+
+            if st.session_state.db_connected:
+                st.success(f"🟢 Connected — {st.session_state.db_conn_type}")
+                tables = dbc.list_tables(st.session_state.db_conn_uri)
+                if tables:
+                    pick_table = st.selectbox("Table to load", tables, key="cd_db_table_pick")
+                    load_mode = st.radio("Load", [f"Whole table ({pick_table})", "Custom SQL"], horizontal=True, key="cd_db_load_mode")
+                    if load_mode.startswith("Custom"):
+                        custom_sql = st.text_area("SQL query", value=f"SELECT * FROM {pick_table} LIMIT 5000", key="cd_db_custom_sql")
+                    else:
+                        custom_sql = f"SELECT * FROM {pick_table}"
+                    if st.button("📥 Load this as my dataset", type="primary", key="cd_db_load_btn"):
+                        try:
+                            result_df = dbc.run_query(st.session_state.db_conn_uri, custom_sql)
+                            cleaned = de.clean_dataframe(result_df)
+                            _apply_loaded_df(cleaned, f"{st.session_state.db_conn_type}: {pick_table}")
+                            st.success(f"Loaded {len(cleaned):,} rows from **{pick_table}**.")
+                            st.rerun()
+                        except dbc.QueryError as e:
+                            st.error(f"Query failed: {e}")
+                else:
+                    st.info("No tables found in this database.")
+    elif st.session_state.df_raw is None:
+        st.info("No data has been uploaded for this account yet. Ask your admin/client to upload it or connect a database.")
+
+    if st.session_state.df_raw is None:
+        st.info("⬆️ Upload a file, connect a database, or click **Load Sample Data** to get started.")
+        st.stop()
+    else:
+        st.divider()
+        st.caption("Data loaded — head to **📊 Raw Analysis** in the sidebar to explore it.")
+        st.stop()
+
+
+# ==================================================================================
+# PAGE 1: RAW ANALYSIS
+# ==================================================================================
+if page == "📊 Raw Analysis":
+    st.title("📊 Raw Analysis")
+    st.caption("Every KPI, chart and filter below is generated automatically from your loaded dataset's columns — nothing is hard-coded.")
+
+    if st.session_state.df_raw is None:
+        st.info("⬅️ No data loaded yet. Go to **📥 Connect Data** in the sidebar to upload a file or connect a database.")
+        st.stop()
+
+    df_raw = st.session_state.df_raw
+    meta = st.session_state.meta
+    df = render_filters(df_raw, meta, key_prefix="p1_")
+
+    if df.empty:
+        st.warning("No rows match the current filters.")
+        st.stop()
+
+    st.subheader("Key Performance Indicators")
+    if can_edit():
+        st.caption("Tick ⭐ under any card to pin it to the Boss Dashboard. Each card also has its own "
+                   "**➕ Filter this card** — independent of the page filter above and of every other card.")
+    with st.expander("🌐 Global number format (applies to every Total/Avg card at once)", expanded=False):
+        fmt_labels = {"auto": "Auto (Cr / L / K)", "full": "Full number (no abbreviation)", "compact": "Compact (K / M / B)"}
+        cur = st.session_state.p1_kpi_number_format
+        choice = st.selectbox("Number format", list(fmt_labels.keys()), format_func=lambda k: fmt_labels[k],
+                               index=list(fmt_labels.keys()).index(cur), key="p1_fmt_select")
+        st.session_state.p1_kpi_number_format = choice
+    kpis = de.compute_kpis(df, meta, number_format=st.session_state.p1_kpi_number_format)
+    kpi_cards(kpis, pinnable=can_edit(), key_prefix="p1_", df=df, filterable=True,
+              number_format=st.session_state.p1_kpi_number_format)
+
+    st.divider()
+    st.subheader("Chart Library — 10 variants per chart type")
+    st.caption("Pick the analysis you like best per chart type with **⭐ Add to Boss Dashboard**. You can change it any time.")
+
+    style = get_style_dict()
+    tabs = st.tabs([f"{FAMILY_ICONS.get(f,'')} {f}" for f in ce.FAMILIES])
+    for fam, tab in zip(ce.FAMILIES, tabs):
+        with tab:
+            variants = ce.generate_variants(df, meta, fam)
+            if not variants:
+                st.info(f"Not enough suitable columns in this dataset to build {fam} charts.")
+                continue
+            for row_start in range(0, len(variants), 2):
+                cols = st.columns(2)
+                for j, v in enumerate(variants[row_start:row_start + 2]):
+                    with cols[j]:
+                        v = customize_variant(fam, v, meta, key_prefix=f"p1_cz_{fam}_{v['id']}_")
+                        fig, insight = ce.build_figure(df, v, style)
+                        st.plotly_chart(fig, use_container_width=True, key=f"p1_{fam}_{v['id']}", config=ce.PLOTLY_CONFIG)
+                        st.caption(f"💡 {insight}")
+                        if can_edit():
+                            already = chart_in_dashboard(fam, v["id"])
+                            btn_label = "✅ On Dashboard" if already else "⭐ Add to Boss Dashboard"
+                            if st.button(btn_label, key=f"p1_add_{fam}_{v['id']}", use_container_width=True, disabled=already):
+                                add_to_dashboard(fam, v)
+                                st.rerun()
+
+
+# ==================================================================================
+# PAGE 1.5: CUSTOM BUILDER (Power-BI style: pick your own column + measure + filters)
+# ==================================================================================
+elif page == "🧩 Custom Builder":
+    st.title("🧩 Custom Builder")
+    st.caption("Build your own KPI cards and charts — pick the column, the measure "
+               "(Sum / Average / Count / Distinct Count / Min / Max ...), and filters "
+               "that apply to that card or chart only. Just like Power BI field wells.")
+
+    if st.session_state.df_raw is None:
+        st.info("Load data on the **📥 Connect Data** page first.")
+        st.stop()
+
+    df_raw = st.session_state.df_raw
+    meta = st.session_state.meta
+    editable = can_edit()
+
+    tab_kpi, tab_chart = st.tabs(["📇 Custom KPI Cards", "📐 Custom Charts"])
+
+    # ---------------- CUSTOM KPI CARDS ----------------
+    with tab_kpi:
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            st.caption("Every card below has its own column, measure and (optional) filters.")
+        with c2:
+            if editable and st.button("➕ New Card", use_container_width=True, key="add_kpi_card"):
+                st.session_state.custom_kpis.append(be.new_kpi_card(df_raw))
+                st.rerun()
+
+        if editable and st.session_state.custom_kpis:
+            be.render_global_kpi_toolbar(df_raw, st.session_state.custom_kpis, key_prefix="gkpi_")
+
+        if not st.session_state.custom_kpis:
+            st.info("No custom KPI cards yet." if not editable else "No custom KPI cards yet — click **➕ New Card** to build one.")
+        else:
+            for row_start in range(0, len(st.session_state.custom_kpis), 3):
+                cols = st.columns(3)
+                for j, card in enumerate(st.session_state.custom_kpis[row_start:row_start + 3]):
+                    with cols[j]:
+                        box = st.container(border=True)
+                        with box:
+                            be.render_kpi_card_value(df_raw, card)
+                            if editable:
+                                with st.expander("⚙️ Edit this card"):
+                                    be.render_kpi_card_editor(df_raw, card, key_prefix="ckpi_")
+                                    bc1, bc2 = st.columns(2)
+                                    with bc1:
+                                        card["pinned"] = st.checkbox("⭐ Pin to Boss Dashboard", value=card.get("pinned", False),
+                                                                      key=f"ckpi_pin_{card['id']}")
+                                    with bc2:
+                                        if st.button("🗑️ Delete card", key=f"ckpi_del_{card['id']}"):
+                                            st.session_state.custom_kpis = [c for c in st.session_state.custom_kpis if c["id"] != card["id"]]
+                                            st.rerun()
+
+    # ---------------- CUSTOM CHARTS ----------------
+    with tab_chart:
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            st.caption("Pick chart type, X field, Y field + measure, an optional Color/Legend field, and per-chart filters.")
+        with c2:
+            if editable and st.button("➕ New Chart", use_container_width=True, key="add_chart"):
+                st.session_state.custom_charts.append(be.new_chart(df_raw))
+                st.rerun()
+
+        if not st.session_state.custom_charts:
+            st.info("No custom charts yet." if not editable else "No custom charts yet — click **➕ New Chart** to build one.")
+        else:
+            style = get_style_dict()
+            for chart in list(st.session_state.custom_charts):
+                box = st.container(border=True)
+                with box:
+                    top1, top2, top3 = st.columns([5, 2, 1])
+                    with top1:
+                        st.markdown(f"**{be.CHART_ICONS.get(chart['type'],'')} {chart['title']}**")
+                    with top2:
+                        if editable:
+                            chart["pinned"] = st.checkbox("⭐ Pin to Boss Dashboard", value=chart.get("pinned", False),
+                                                           key=f"cchart_pin_{chart['id']}")
+                    with top3:
+                        if editable and st.button("🗑️", key=f"cchart_del_{chart['id']}", help="Delete this chart"):
+                            st.session_state.custom_charts = [c for c in st.session_state.custom_charts if c["id"] != chart["id"]]
+                            st.rerun()
+
+                    if editable:
+                        with st.expander("⚙️ Field wells & filters", expanded=False):
+                            be.render_chart_editor(df_raw, chart, key_prefix="cchart_")
+
+                    fig, insight, table_df = be.build_custom_figure(df_raw, chart, style)
+                    if table_df is not None:
+                        st.dataframe(table_df, use_container_width=True, height=420)
+                    elif fig is not None:
+                        st.plotly_chart(fig, use_container_width=True, key=f"cchart_fig_{chart['id']}", config=ce.PLOTLY_CONFIG)
+                    st.caption(f"💡 {insight}")
+
+
+# ==================================================================================
+# PAGE 2: BOSS DASHBOARD
+# ==================================================================================
+elif page == "⭐ Boss Dashboard":
+    if can_edit():
+        name_col, _ = st.columns([3, 2])
+        with name_col:
+            new_name = st.text_input("Dashboard name", value=st.session_state.dashboard_name or "⭐ Boss Dashboard",
+                                      label_visibility="collapsed", key="dashboard_name_input")
+            if new_name and new_name.strip() and new_name != st.session_state.dashboard_name:
+                st.session_state.dashboard_name = new_name
+        st.title(st.session_state.dashboard_name or "⭐ Boss Dashboard")
+    else:
+        st.title(st.session_state.dashboard_name or "⭐ Boss Dashboard")
+    st.caption("Only what you picked shows up here. Style it, swap any chart, then export a clean PDF.")
+
+    if st.session_state.df_raw is None:
+        st.info("Load data on the **📥 Connect Data** page first.")
+        st.stop()
+
+    df_raw = st.session_state.df_raw
+    meta = st.session_state.meta
+
+    with st.expander("🎨 Dashboard Theme & Style", expanded=False):
+        th = st.session_state.theme
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            th["bg_color"] = st.color_picker("Page background", th["bg_color"])
+        with c2:
+            th["font_color"] = st.color_picker("Font color", th["font_color"])
+        with c3:
+            th["accent_color"] = st.color_picker("Accent / KPI color", th["accent_color"])
+        with c4:
+            th["palette_name"] = st.selectbox("Chart color palette", list(PALETTES.keys()),
+                                               index=list(PALETTES.keys()).index(th["palette_name"]))
+        c5, c6, c7, c8 = st.columns(4)
+        with c5:
+            th["font_family"] = st.selectbox("Chart font", ["Arial", "Helvetica", "Times New Roman", "Courier New", "Verdana"],
+                                              index=["Arial", "Helvetica", "Times New Roman", "Courier New", "Verdana"].index(th["font_family"]) if th["font_family"] in ["Arial", "Helvetica", "Times New Roman", "Courier New", "Verdana"] else 0)
+        with c6:
+            th["template"] = st.selectbox("Chart theme", ["plotly_white", "plotly_dark", "ggplot2", "seaborn", "simple_white"],
+                                           index=["plotly_white", "plotly_dark", "ggplot2", "seaborn", "simple_white"].index(th["template"]) if th["template"] in ["plotly_white", "plotly_dark", "ggplot2", "seaborn", "simple_white"] else 0)
+        with c7:
+            th["show_legend"] = st.checkbox("Show legend", th["show_legend"])
+        with c8:
+            th["show_labels"] = st.checkbox("Show data labels", th["show_labels"])
+        wallpaper = st.file_uploader("PDF background wallpaper (optional, PNG/JPG)", type=["png", "jpg", "jpeg"], key="wallpaper_up")
+        if wallpaper is not None:
+            th["wallpaper_bytes"] = wallpaper.read()
+        if th.get("wallpaper_bytes") and st.button("Remove wallpaper"):
+            th["wallpaper_bytes"] = None
+        st.session_state.theme = th
+
+    df = render_filters(df_raw, meta, key_prefix="p2_")
+    df = render_slicers(df, meta, key_prefix="p2_")
+    style = get_style_dict()
+
+    # ---- Pinned KPIs ----
+    st.subheader("Key Performance Indicators")
+    all_kpis = de.compute_kpis(df, meta)
+    pinned = [k for k in all_kpis if k["label"] in st.session_state.pinned_kpis]
+    pinned_custom_kpis = [c for c in st.session_state.custom_kpis if c.get("pinned")]
+    if not pinned and not pinned_custom_kpis:
+        st.info("No KPI cards pinned yet. Go to Raw Analysis and tick ⭐ under the KPI cards you want here, "
+                "or build your own on the Custom Builder page.")
+    else:
+        if pinned:
+            kpi_cards(pinned, pinnable=False)
+        if pinned_custom_kpis:
+            st.caption("🧩 Custom KPI cards")
+            for row_start in range(0, len(pinned_custom_kpis), 4):
+                cols = st.columns(4)
+                for j, card in enumerate(pinned_custom_kpis[row_start:row_start + 4]):
+                    with cols[j]:
+                        be.render_kpi_card_value(df, card)
+
+    st.divider()
+
+    # ---- Selected charts ----
+    st.subheader("Selected Charts")
+    pinned_custom_charts = [c for c in st.session_state.custom_charts if c.get("pinned")]
+    chart_png_items = []
+
+    if not st.session_state.dashboard_charts and not pinned_custom_charts:
+        st.info("No charts selected yet. Go to Raw Analysis and click ⭐ Add to Boss Dashboard on any chart, "
+                "or build & pin your own on the Custom Builder page.")
+    else:
+        for chart in pinned_custom_charts:
+            box = st.container(border=True)
+            with box:
+                top1, top3 = st.columns([8, 1])
+                with top1:
+                    st.markdown(f"**🧩 {be.CHART_ICONS.get(chart['type'],'')} {chart['title']}**")
+                with top3:
+                    if can_edit() and st.button("🗑️", key=f"rm_custom_{chart['id']}", help="Unpin from dashboard"):
+                        chart["pinned"] = False
+                        st.rerun()
+
+                fig, insight, table_df = be.build_custom_figure(df, chart, style)
+                png_bytes = None
+                if table_df is not None:
+                    st.dataframe(table_df, use_container_width=True, height=380)
+                elif fig is not None:
+                    st.plotly_chart(fig, use_container_width=True, key=f"p2_custom_{chart['id']}", config=ce.PLOTLY_CONFIG)
+                    try:
+                        png_bytes = fig.to_image(format="png", width=1400, height=700, scale=2)
+                    except Exception:
+                        png_bytes = None
+                st.caption(f"💡 {insight}")
+                chart_png_items.append({"title": chart.get("title", "Custom Chart"), "insight": insight,
+                                         "png_bytes": png_bytes, "type": chart.get("type", "Chart")})
+
+        for idx, entry in enumerate(list(st.session_state.dashboard_charts)):
+            fam = entry["family"]
+            variant = entry["variant"]
+            all_variants = ce.generate_variants(df, meta, fam)
+            id_to_variant = {v["id"]: v for v in all_variants}
+            options = list(id_to_variant.keys())
+            labels = {vid: id_to_variant[vid]["title"] for vid in options}
+            widget_key = f"{fam}_{idx}_{variant['id']}"
+
+            box = st.container(border=True)
+            with box:
+                top1, top2, top3 = st.columns([5, 3, 1])
+                with top1:
+                    st.markdown(f"**{FAMILY_ICONS.get(fam,'')} {fam}**")
+                with top2:
+                    if options and can_edit():
+                        default_idx = options.index(variant["id"]) if variant["id"] in options else 0
+                        chosen_id = st.selectbox("Swap analysis", options, index=default_idx,
+                                                  format_func=lambda x: labels.get(x, x),
+                                                  key=f"swap_{widget_key}", label_visibility="collapsed")
+                        variant = id_to_variant[chosen_id]
+                        entry["variant"] = variant
+                with top3:
+                    if can_edit() and st.button("🗑️", key=f"rm_{widget_key}", help="Remove from dashboard"):
+                        remove_from_dashboard(fam, entry["variant"]["id"])
+                        st.rerun()
+
+                fig, insight = ce.build_figure(df, variant, style)
+                st.plotly_chart(fig, use_container_width=True, key=f"p2_{widget_key}", config=ce.PLOTLY_CONFIG)
+                st.caption(f"💡 {insight}")
+
+                try:
+                    png_bytes = fig.to_image(format="png", width=1400, height=700, scale=2)
+                except Exception:
+                    png_bytes = None
+                chart_png_items.append({"title": variant.get("title", fam), "insight": insight,
+                                         "png_bytes": png_bytes, "type": fam})
+
+        st.divider()
+        st.subheader("📄 Export")
+        report_title = st.text_input("Report title", st.session_state.dashboard_name or "Sports Performance & Payments Report")
+        subtitle = st.text_input("Subtitle", f"Prepared for management review — {pd.Timestamp.today().date()}")
+        filters_summary = ", ".join(
+            [f"{k.replace('p2_','')}: {v}" for k, v in st.session_state.filters.items()
+             if k.startswith("p2_") and v not in (None, [], ())]
+        ) or "None"
+
+        if st.button("⬇️ Generate & Download PDF", type="primary"):
+            with st.spinner("Building PDF report..."):
+                pdf_theme = {
+                    "bg_color": st.session_state.theme["bg_color"],
+                    "font_color": st.session_state.theme["font_color"],
+                    "accent_color": st.session_state.theme["accent_color"],
+                    "font_name": st.session_state.theme["font_name"],
+                    "wallpaper_bytes": st.session_state.theme.get("wallpaper_bytes"),
+                }
+                custom_kpi_rows = []
+                for card in pinned_custom_kpis:
+                    fdf_card = ms.apply_filters(df, card.get("filters", []))
+                    value, sub = ms.compute_measure(fdf_card, card["column"], card["measure"])
+                    custom_kpi_rows.append({"label": card["title"], "value": ms.fmt_measure_value(value), "sub": sub})
+
+                pdf_kpis = (pinned if pinned else (all_kpis[:8] if not pinned_custom_kpis else []))
+                pdf_kpis = pdf_kpis + custom_kpi_rows
+
+                pdf_bytes = pe.build_pdf_report(
+                    report_title=report_title,
+                    subtitle=subtitle,
+                    kpis=pdf_kpis,
+                    chart_items=[c for c in chart_png_items if c["png_bytes"]],
+                    theme=pdf_theme,
+                    filters_summary=filters_summary,
+                )
+            st.download_button("📥 Click to download report.pdf", data=pdf_bytes,
+                                file_name="sports_analytics_report.pdf", mime="application/pdf",
+                                type="primary")
+
+
+# ==================================================================================
+# PAGE 3: DATA TABLE
+# ==================================================================================
+elif page == "🗂 Data Table":
+    st.title("🗂 Data Table")
+
+    if st.session_state.df_raw is None:
+        st.info("Load data on the **📥 Connect Data** page first.")
+        st.stop()
+
+    df_raw = st.session_state.df_raw
+    meta = st.session_state.meta
+
+    tab_simple, tab_sql, tab_db = st.tabs(["🖱️ Simple", "🖥️ SQL Query", "🔌 Database Connector"])
+
+    # ---------------- SIMPLE (column picker + filters + sort) ----------------
+    with tab_simple:
+        st.caption("Choose your columns, filter, sort — like a simple SQL SELECT — then export.")
+        df = render_filters(df_raw, meta, key_prefix="p3_")
+
+        all_cols = list(df.columns)
+        sel_cols = st.multiselect("Columns to display (SELECT ...)", all_cols, default=all_cols, key="p3_sel_cols")
+
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            query_str = st.text_input("Advanced filter — pandas query syntax (optional, like SQL WHERE)",
+                                       placeholder="e.g. Amount > 100000 and Status == 'Paid'", key="p3_query_str")
+        with c2:
+            sort_col = st.selectbox("Sort by", ["(none)"] + all_cols, key="p3_sort_col")
+        with c3:
+            sort_dir = st.selectbox("Direction", ["Descending", "Ascending"], key="p3_sort_dir")
+
+        row_limit = st.slider("Rows to display (for performance on very large files)", 100, 20000, 2000, step=100, key="p3_row_limit")
+
+        view = df[sel_cols] if sel_cols else df
+        if query_str:
+            try:
+                mask = df.eval(query_str)
+                view = view[mask]
+            except Exception as e:
+                st.warning(f"Could not apply that filter: {e}")
+
+        if sort_col != "(none)" and sort_col in df.columns:
+            view = view.assign(**{"_sortkey": df.loc[view.index, sort_col]}).sort_values(
+                "_sortkey", ascending=(sort_dir == "Ascending")).drop(columns=["_sortkey"])
+
+        st.caption(f"Showing {min(len(view), row_limit):,} of {len(view):,} matching rows (out of {len(df):,} total).")
+        st.dataframe(view.head(row_limit), use_container_width=True, height=560)
+
+        csv_bytes = view.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download filtered data as CSV", csv_bytes, file_name="filtered_data.csv",
+                            mime="text/csv", key="p3_simple_dl")
+
+    # ---------------- SQL QUERY (real SQL via DuckDB) ----------------
+    with tab_sql:
+        st.caption("Real SQL (SELECT, WHERE, GROUP BY, computed columns, ORDER BY, window functions, CTEs...) "
+                   "against the full loaded dataset — runs on its own, independent of the Simple tab's filters "
+                   "above. Read-only: no INSERT/UPDATE/DELETE/file access.")
+        st.code(f"Table name: {qe.DEFAULT_TABLE_NAME}   —   columns: {', '.join(df_raw.columns)}", language=None)
+
+        default_sql = f"SELECT * FROM {qe.DEFAULT_TABLE_NAME} LIMIT 100"
+        sql_text = st.text_area("SQL query", value=st.session_state.get("p3_sql_text", default_sql), height=140, key="p3_sql_text")
+
+        run_col, _ = st.columns([1, 5])
+        with run_col:
+            run_clicked = st.button("▶️ Run query", type="primary", use_container_width=True, key="p3_sql_run")
+
+        if run_clicked:
+            try:
+                result_df = qe.run_sql(df_raw, sql_text)
+                st.session_state["p3_sql_result"] = result_df
+                st.session_state["p3_sql_error"] = None
+            except qe.QueryError as e:
+                st.session_state["p3_sql_result"] = None
+                st.session_state["p3_sql_error"] = str(e)
+
+        if st.session_state.get("p3_sql_error"):
+            st.error(st.session_state["p3_sql_error"])
+        result_df = st.session_state.get("p3_sql_result")
+        if result_df is not None:
+            capped = len(result_df) >= qe.MAX_ROWS
+            st.caption(f"{len(result_df):,} row(s) returned" + (f" (capped at {qe.MAX_ROWS:,})" if capped else "."))
+            st.dataframe(result_df, use_container_width=True, height=560)
+            sql_csv_bytes = result_df.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Download query result as CSV", sql_csv_bytes, file_name="query_result.csv",
+                                mime="text/csv", key="p3_sql_dl")
+
+    # ---------------- EXTERNAL DATABASE CONNECTOR ----------------
+    with tab_db:
+        st.caption("Connect to ANY external SQL database (PostgreSQL, MySQL/MariaDB, SQL Server, SQLite, or a "
+                   "custom SQLAlchemy URI for anything else) — independent of the file loaded on Raw Analysis. "
+                   "Read-only: only SELECT/WITH queries are allowed. Connection details live only in this "
+                   "browser session and are never written to disk.")
+
+        if not dbc.SQLALCHEMY_AVAILABLE:
+            st.warning("SQLAlchemy isn't installed in this environment yet. Add `sqlalchemy` (plus a driver "
+                       "like `psycopg2-binary` for Postgres or `pymysql` for MySQL) to requirements.txt and reinstall.")
+
+        if not can_edit():
+            st.caption("👁️ View-only account — database connections are managed by your admin/client.")
+
+        with st.expander("🔌 Connection", expanded=not st.session_state.db_connected):
+            if can_edit():
+                db_type = st.selectbox("Database type", list(dbc.DB_TYPES.keys()),
+                                        index=list(dbc.DB_TYPES.keys()).index(st.session_state.db_conn_type)
+                                        if st.session_state.db_conn_type in dbc.DB_TYPES else 0,
+                                        key="db_type_pick")
+                st.session_state.db_conn_type = db_type
+
+                if db_type == "Custom SQLAlchemy URI":
+                    raw_uri = st.text_input("SQLAlchemy URI", placeholder="postgresql+psycopg2://user:pass@host:5432/dbname",
+                                             key="db_raw_uri")
+                    uri = raw_uri
+                elif db_type == "SQLite (local file path)":
+                    sqlite_path = st.text_input("SQLite file path", placeholder="/path/to/database.db", key="db_sqlite_path")
+                    uri = dbc.build_uri(db_type, database=sqlite_path)
+                else:
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        host = st.text_input("Host", placeholder="localhost", key="db_host")
+                    with c2:
+                        port = st.text_input("Port", placeholder=str(dbc.DB_TYPES[db_type]["default_port"]), key="db_port")
+                    with c3:
+                        database = st.text_input("Database name", key="db_name")
+                    c4, c5 = st.columns(2)
+                    with c4:
+                        username = st.text_input("Username", key="db_user")
+                    with c5:
+                        password = st.text_input("Password", type="password", key="db_pass")
+                    odbc_driver = ""
+                    if db_type == "SQL Server":
+                        odbc_driver = st.text_input("ODBC driver name", value="ODBC Driver 17 for SQL Server", key="db_odbc")
+                    uri = dbc.build_uri(db_type, host=host, port=port, database=database,
+                                         username=username, password=password, odbc_driver=odbc_driver)
+
+                cc1, cc2 = st.columns([1, 3])
+                with cc1:
+                    if st.button("🔗 Test & Connect", type="primary", use_container_width=True, key="db_connect_btn"):
+                        try:
+                            dbc.test_connection(uri)
+                            st.session_state.db_conn_uri = uri
+                            st.session_state.db_connected = True
+                            if not st.session_state.db_queries:
+                                st.session_state.db_queries = [dbc.new_query_tab("Query 1")]
+                            st.success("Connected successfully.")
+                        except dbc.ConnectionError as e:
+                            st.session_state.db_connected = False
+                            st.error(f"Could not connect: {e}")
+                with cc2:
+                    if st.session_state.db_connected and st.button("🔌 Disconnect", key="db_disconnect_btn"):
+                        st.session_state.db_connected = False
+                        st.session_state.db_conn_uri = ""
+                        st.session_state.db_queries = []
+                        st.session_state.db_query_results = {}
+                        st.rerun()
+
+                if st.session_state.db_connected:
+                    tables = dbc.list_tables(st.session_state.db_conn_uri)
+                    if tables:
+                        st.caption("Tables available: " + ", ".join(tables[:40]) + (" ..." if len(tables) > 40 else ""))
+            else:
+                st.caption("Connected." if st.session_state.db_connected else "No database connected yet.")
+
+        if not st.session_state.db_connected:
+            st.info("Connect to a database above to run live SQL queries against it.")
+        else:
+            st.success(f"🟢 Connected — {st.session_state.db_conn_type}")
+
+            if can_edit():
+                add_col, _ = st.columns([1, 4])
+                with add_col:
+                    if st.button("➕ New query tab", key="db_add_query_tab"):
+                        n = len(st.session_state.db_queries) + 1
+                        st.session_state.db_queries.append(dbc.new_query_tab(f"Query {n}"))
+                        st.rerun()
+
+            if not st.session_state.db_queries:
+                st.info("No query tabs yet — click **➕ New query tab** to add one.")
+            else:
+                q_tabs = st.tabs([q["name"] for q in st.session_state.db_queries])
+                for q, q_tab in zip(st.session_state.db_queries, q_tabs):
+                    with q_tab:
+                        qid = q["id"]
+                        if can_edit():
+                            hc1, hc2 = st.columns([4, 1])
+                            with hc1:
+                                q["name"] = st.text_input("Tab name", q["name"], key=f"db_qname_{qid}")
+                            with hc2:
+                                st.write("")
+                                if len(st.session_state.db_queries) > 1 and st.button("🗑️ Remove tab", key=f"db_qdel_{qid}"):
+                                    st.session_state.db_queries = [x for x in st.session_state.db_queries if x["id"] != qid]
+                                    st.session_state.db_query_results.pop(qid, None)
+                                    st.rerun()
+
+                            q["sql"] = st.text_area("SQL query", value=q["sql"], height=120, key=f"db_qsql_{qid}")
+
+                            rc1, rc2, rc3 = st.columns([1, 1, 2])
+                            with rc1:
+                                run_now = st.button("▶️ Run", type="primary", key=f"db_qrun_{qid}", use_container_width=True)
+                            with rc2:
+                                q["auto_refresh"] = st.checkbox("Auto-refresh", value=q.get("auto_refresh", False), key=f"db_qauto_{qid}")
+                            with rc3:
+                                q["refresh_interval_sec"] = st.slider("Interval (seconds)", 5, 300,
+                                                                       q.get("refresh_interval_sec", 30),
+                                                                       key=f"db_qint_{qid}", disabled=not q["auto_refresh"])
+                        else:
+                            run_now = False
+                            st.code(q["sql"], language="sql")
+
+                        # Auto-refresh: re-runs this script on the chosen interval while this tab's
+                        # toggle is on, so the query result stays live without any manual clicking.
+                        if q.get("auto_refresh") and AUTOREFRESH_AVAILABLE:
+                            st_autorefresh(interval=q.get("refresh_interval_sec", 30) * 1000, key=f"db_ar_{qid}")
+                        elif q.get("auto_refresh") and not AUTOREFRESH_AVAILABLE:
+                            st.caption("⚠️ Install `streamlit-autorefresh` to enable live auto-refresh — running once for now.")
+
+                        due_for_auto_run = q.get("auto_refresh") and (time.time() - q.get("last_run_ts", 0) >= q.get("refresh_interval_sec", 30))
+                        if run_now or due_for_auto_run:
+                            try:
+                                result_df = dbc.run_query(st.session_state.db_conn_uri, q["sql"])
+                                st.session_state.db_query_results[qid] = result_df
+                                q["error"] = None
+                                q["last_run_ts"] = time.time()
+                                q["row_count"] = len(result_df)
+                            except dbc.QueryError as e:
+                                q["error"] = str(e)
+
+                        if q.get("error"):
+                            st.error(q["error"])
+                        result_df = st.session_state.db_query_results.get(qid)
+                        if result_df is not None:
+                            last_run = time.strftime("%H:%M:%S", time.localtime(q.get("last_run_ts", time.time())))
+                            st.caption(f"{len(result_df):,} row(s) · last run at {last_run}"
+                                       + (" · 🔄 auto-refreshing" if q.get("auto_refresh") else ""))
+                            st.dataframe(result_df, use_container_width=True, height=420)
+                            st.download_button("⬇️ Download as CSV", result_df.to_csv(index=False).encode("utf-8"),
+                                                file_name=f"{q['name'].replace(' ', '_')}.csv", mime="text/csv",
+                                                key=f"db_qdl_{qid}")
+                        elif not q.get("error"):
+                            st.caption("Not run yet — click ▶️ Run.")
+
+
+# ==================================================================================
+# PAGE 3.5: AI ASSISTANT — free chat with your data (OpenRouter free tier)
+# ==================================================================================
+elif page == "🤖 AI Assistant":
+    st.title("🤖 AI Assistant")
+    st.caption("Ask questions in plain language about your data, KPIs, and dashboard charts. Answers are "
+               "grounded in real SQL run against your dataset — not guesses — and shown with proof below each reply.")
+
+    if st.session_state.df_raw is None:
+        st.info("Load data on the **📥 Connect Data** page first.")
+        st.stop()
+
+    df_raw = st.session_state.df_raw
+    meta = st.session_state.meta
+    api_key = ac.get_api_key() or st.session_state.ai_groq_key
+
+    if not api_key:
+        if st.session_state.role == auth.ROLE_ADMIN:
+            # Only the admin ever sees a way to type a key in the UI — clients/viewers
+            # never see this box, never see the key, and can't set their own.
+            st.warning("No free OpenRouter API key configured yet.")
+            with st.expander("🆓 How to get a free key (2 minutes, no credit card)", expanded=True):
+                st.markdown(
+                    "1. Go to **[openrouter.ai](https://openrouter.ai)** and sign up (free).\n"
+                    "2. Open **Keys** → **Create Key** → copy it (starts with `sk-or-v1-...`).\n"
+                    "3. Paste it below to test it now — kept only in this browser session, never saved to disk.\n\n"
+                    "**To turn the chatbot on for every client permanently** (so they never see this screen "
+                    "or the key), set it once on the server as an environment variable `OPENROUTER_API_KEY`, or add "
+                    "it to `.streamlit/secrets.toml` — see README. Clients then just get a working chatbot, "
+                    "with no key ever shown or editable on their side.\n\n"
+                    "*(Switched from Groq to OpenRouter because Groq's free tier blocks requests from "
+                    "cloud-hosted servers like Streamlit Cloud — OpenRouter doesn't have that restriction.)*"
+                )
+            typed_key = st.text_input("OpenRouter API key (admin only, this session)", type="password", key="ai_key_input")
+            if st.button("Save key for this session", type="primary") and typed_key:
+                st.session_state.ai_groq_key = typed_key
+                st.rerun()
+        else:
+            st.info("🤖 AI Assistant abhi enable nahi hai. Please contact your admin to turn this on.")
+        st.stop()
+
+    kpis = de.compute_kpis(df_raw, meta)
+
+    for turn in st.session_state.ai_chat_history:
+        with st.chat_message(turn["role"]):
+            st.markdown(turn["content"])
+            if turn.get("proof_df") is not None:
+                with st.expander("🔍 Proof (SQL + data used)"):
+                    st.code(turn["sql_used"], language="sql")
+                    st.dataframe(turn["proof_df"], use_container_width=True)
+
+    question = st.chat_input("e.g. \"Which record is number 5?\" or \"What's the trend over the last 3 months?\"")
+    if question:
+        st.session_state.ai_chat_history.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+        with st.chat_message("assistant"):
+            with st.spinner("Analysing your data..."):
+                result = ac.ask(question, df_raw, meta, kpis, st.session_state.dashboard_charts,
+                                 api_key, history=st.session_state.ai_chat_history[:-1])
+            if result["error"]:
+                st.error(result["error"])
+            else:
+                st.markdown(result["answer"])
+                if result["proof_df"] is not None:
+                    with st.expander("🔍 Proof (SQL + data used)"):
+                        st.code(result["sql_used"], language="sql")
+                        st.dataframe(result["proof_df"], use_container_width=True)
+                st.session_state.ai_chat_history.append({
+                    "role": "assistant", "content": result["answer"],
+                    "sql_used": result["sql_used"], "proof_df": result["proof_df"],
+                })
+
+    if st.session_state.ai_chat_history and st.button("🗑️ Clear chat"):
+        st.session_state.ai_chat_history = []
+        st.rerun()
+
+
+# ==================================================================================
+# PAGE 4: SETTINGS
+# ==================================================================================
+elif page == "⚙️ Settings":
+    st.title("⚙️ Settings")
+
+    tab_defaults, tab_about = st.tabs(["🎨 Defaults", "ℹ️ How This Tool Works"])
+
+    with tab_defaults:
+        if st.session_state.role == auth.ROLE_ADMIN:
+            st.subheader("App Branding")
+            st.caption("The title shown at the top of the sidebar for **every account** on this app "
+                       "(not per-workspace - admin-only).")
+            b = st.session_state.app_brand
+            bc1, bc2 = st.columns([2, 1])
+            with bc1:
+                b["text"] = st.text_input("Brand text", b["text"], key="brand_text")
+            with bc2:
+                b["color"] = st.color_picker("Text color", b["color"], key="brand_color")
+            bc3, bc4, bc5, bc6 = st.columns(4)
+            with bc3:
+                b["font_size"] = st.slider("Font size (px)", 12, 40, b["font_size"], key="brand_font_size")
+            with bc4:
+                font_opts = ["sans-serif", "serif", "monospace"]
+                b["font_family"] = st.selectbox("Font family", font_opts,
+                                                 index=font_opts.index(b["font_family"]) if b["font_family"] in font_opts else 0,
+                                                 key="brand_font_family")
+            with bc5:
+                b["bold"] = st.checkbox("Bold", b["bold"], key="brand_bold")
+            with bc6:
+                b["italic"] = st.checkbox("Italic", b["italic"], key="brand_italic")
+
+            st.markdown(
+                f"<div style='font-size:{b['font_size']}px; color:{b['color']}; "
+                f"font-weight:{'700' if b['bold'] else '400'}; "
+                f"font-style:{'italic' if b['italic'] else 'normal'}; "
+                f"font-family:{b['font_family']};'>Preview: {b['text']}</div>",
+                unsafe_allow_html=True,
+            )
+            bcol_save, bcol_reset = st.columns([1, 1])
+            with bcol_save:
+                if st.button("💾 Save branding for everyone", type="primary", key="brand_save"):
+                    st.session_state.app_brand = b
+                    ws.save_branding(b)
+                    st.success("Branding saved - every account will see it from their next run.")
+            with bcol_reset:
+                if st.button("Reset branding to default", key="brand_reset"):
+                    st.session_state.app_brand = copy.deepcopy(DEFAULT_BRAND)
+                    ws.save_branding(st.session_state.app_brand)
+                    st.rerun()
+            st.divider()
+
+        st.subheader("Default Theme")
+        st.caption("These are the starting values used on the Boss Dashboard — you can still override anything per-report. "
+                   "(This used to be a raw JSON dump — every value below is now a normal, editable control.)")
+        if st.button("Reset theme to factory defaults"):
+            st.session_state.theme = copy.deepcopy(DEFAULT_THEME)
+            st.rerun()
+
+        th = st.session_state.theme
+        d1, d2, d3, d4 = st.columns(4)
+        with d1:
+            th["bg_color"] = st.color_picker("Page background", th["bg_color"], key="set_bg_color")
+        with d2:
+            th["panel_color"] = st.color_picker("Panel background", th["panel_color"], key="set_panel_color")
+        with d3:
+            th["font_color"] = st.color_picker("Font color", th["font_color"], key="set_font_color")
+        with d4:
+            th["accent_color"] = st.color_picker("Accent / KPI color", th["accent_color"], key="set_accent_color")
+
+        d5, d6, d7, d8 = st.columns(4)
+        font_choices = ["Arial", "Helvetica", "Times New Roman", "Courier New", "Verdana"]
+        with d5:
+            th["font_family"] = st.selectbox("Chart font", font_choices,
+                                              index=font_choices.index(th["font_family"]) if th["font_family"] in font_choices else 0,
+                                              key="set_font_family")
+        with d6:
+            th["font_name"] = st.selectbox("PDF font", ["Helvetica", "Times-Roman", "Courier"],
+                                            index=["Helvetica", "Times-Roman", "Courier"].index(th["font_name"]) if th["font_name"] in ["Helvetica", "Times-Roman", "Courier"] else 0,
+                                            key="set_font_name")
+        with d7:
+            th["font_size"] = st.slider("Chart font size", 8, 24, th["font_size"], key="set_font_size")
+        with d8:
+            th["palette_name"] = st.selectbox("Chart color palette", list(PALETTES.keys()),
+                                               index=list(PALETTES.keys()).index(th["palette_name"]),
+                                               key="set_palette_name")
+
+        d9, d10, d11, d12 = st.columns(4)
+        template_choices = ["plotly_white", "plotly_dark", "ggplot2", "seaborn", "simple_white"]
+        with d9:
+            th["template"] = st.selectbox("Chart theme", template_choices,
+                                           index=template_choices.index(th["template"]) if th["template"] in template_choices else 0,
+                                           key="set_template")
+        with d10:
+            th["show_legend"] = st.checkbox("Show legend", th["show_legend"], key="set_show_legend")
+        with d11:
+            th["show_labels"] = st.checkbox("Show data labels", th["show_labels"], key="set_show_labels")
+        with d12:
+            st.write("")
+
+        st.caption("🎨 Palette preview:")
+        st.markdown(
+            " ".join(f"<span style='background:{c};padding:6px 14px;border-radius:4px;margin-right:4px;'>&nbsp;</span>"
+                     for c in PALETTES.get(th["palette_name"], PALETTES["Set2"])),
+            unsafe_allow_html=True,
+        )
+
+        if th.get("wallpaper_bytes"):
+            st.info("A PDF background wallpaper is currently set (manage it from the Boss Dashboard page).")
+
+        st.session_state.theme = th
+
+    with tab_about:
+        st.subheader("What this tool does")
+        st.markdown("""
+**Sports Analytics Platform** turns any spreadsheet-shaped file into a boardroom-ready
+report, without you writing a single formula.
+
+**📊 Raw Analysis (Page 1)**
+- Import CSV, XLSX, JSON or PDF (table-based PDFs). Works on *any* dataset — sports,
+  sales, HR, finance — because columns are detected automatically, not hard-coded.
+- KPI cards are generated from whatever numeric/date/ID columns exist: totals,
+  averages, unique counts, top category share, date range, growth rate, per-record
+  average, and more.
+- 10 chart families are available: Bar, Line, Pie, Comparison, Area, Scatter, Box,
+  Histogram, Treemap, Heatmap. Each family auto-generates up to **10 different
+  variants** (different dimensions/measures/aggregations) so you can explore every
+  angle of the data.
+- Every chart comes with a one-line **auto-generated insight** (e.g. leader, trend
+  direction, correlation, skew).
+- Filters are available for every column (category, numeric range, date range) and
+  apply to the KPIs and all charts at once.
+- Click **⭐ Add to Boss Dashboard** on any chart, or tick the pin under a KPI card,
+  to send it to Page 3.
+
+**🧩 Custom Builder (Page 1.5) — Power BI style**
+- Build your own **KPI cards**: pick any column + a measure (Sum, Average, Count,
+  Distinct Count, Min, Max, Median, Std Dev, Mode, Earliest/Latest date...) and,
+  optionally, filters that apply to that card only.
+- Build your own **charts**: choose the chart type, an X field, a Y field + measure,
+  and an optional Color/Legend field — exactly like Power BI's field wells.
+- Every card and every chart carries its **own independent filters** (Basic mode —
+  quick dropdown/slider — or Advanced mode — operators like contains, >, between,
+  is blank...), built from **every column** in the dataset, not just a fixed subset.
+- Tick **⭐ Pin to Boss Dashboard** on any card or chart to send it to Page 3.
+
+**⭐ Boss Dashboard (Page 3)**
+- Shows only what you picked — clean and presentation-ready.
+- Full style control: background color, font color, accent color, chart color
+  palette, chart theme, font, legend on/off, data labels on/off, and an optional
+  wallpaper image for the exported PDF.
+- Any chart can be **swapped** for another variant of the same family without
+  going back to Page 1.
+- **Download PDF**: produces a clean, print-ready report with only the finished
+  KPIs, charts and insights — no buttons, no settings panels, nothing that would
+  look unprofessional in front of your boss.
+
+**🗂 Data Table (Page 4)**
+- SQL-style access to the raw data: pick which columns to `SELECT`, add a filter
+  in pandas/SQL-like syntax (e.g. `Amount > 100000 and Status == 'Paid'`), sort,
+  and export the exact slice you need as CSV.
+
+**⚙️ Settings**
+- Reset the default look of the Boss Dashboard.
+- This page. Login/user management now lives in the separate **🔐 Admin Panel**
+  (visible to admin accounts only).
+
+**🔐 Admin Panel (admin accounts only)**
+- Create new report-user (viewer) accounts, reset anyone's password, delete
+  accounts, and change your own admin password.
+- Report-users can never see or reach this page - it isn't in their sidebar
+  at all, and their login has no path to it.
+
+**Performance note:** column detection, KPI math and chart aggregation are all
+done with vectorized pandas/NumPy operations, so the same tool comfortably
+handles datasets from a few hundred rows up to several million rows. For very
+large files, use the row-limit slider on the Data Table page and the filters on
+every page to narrow down what's rendered on screen.
+
+**Security note:** credentials are stored as SHA-256 hashes in `credentials.json`
+next to this app — never in plain text. Only accounts with the "admin" role can
+create/delete users or reset passwords; report-user (viewer) accounts have no
+access to any credential screen.
+        """)
+
+
+elif page == "🔐 Admin Panel":
+    if st.session_state.role != auth.ROLE_ADMIN:
+        st.error("You don't have access to this page.")
+        st.stop()
+
+    st.title("🔐 Admin Panel")
+    st.caption("Visible to admin accounts only — report-users never see this page.")
+
+    tab_users, tab_mypw, tab_reset = st.tabs(
+        ["👥 Manage Accounts", "🔑 Change My Own Password", "🗑️ Reset Workspace Data"]
+    )
+
+    with tab_users:
+        st.subheader("Existing accounts")
+        users = auth.list_users()
+        st.table([{"Username": u["username"], "Role": u["role"], "Data workspace": u["workspace_id"]} for u in users])
+
+        st.divider()
+        st.subheader("Create a new account")
+        st.caption(
+            "**Client** — a business/customer account with its own independent data workspace: they "
+            "can upload data, build dashboards, everything except the Admin Panel.  \n"
+            "**Viewer** — read-only. Can look at reports but never upload/change anything. Either gets "
+            "its own empty workspace, or you link it to an existing client's data below.  \n"
+            "**Admin** — full control, same as your own account (use sparingly)."
+        )
+        with st.form("create_account"):
+            nu = st.text_input("Username")
+            np1 = st.text_input("Password", type="password")
+            np2 = st.text_input("Confirm password", type="password")
+            role_choice = st.radio("Role", ["Client", "Viewer", "Admin"], horizontal=True)
+
+            client_options = auth.list_client_usernames()
+            link_choice = None
+            if role_choice == "Viewer" and client_options:
+                link_choice = st.selectbox(
+                    "Data access for this viewer",
+                    ["Give this viewer their own independent (empty) data workspace"] +
+                    [f"Share data with client: {c}" for c in client_options],
+                )
+
+            submitted = st.form_submit_button("Create / update account", type="primary")
+            if submitted:
+                if not nu.strip() or not np1:
+                    st.error("Username and password cannot be empty.")
+                elif np1 != np2:
+                    st.error("Passwords do not match.")
+                else:
+                    role_map = {"Client": auth.ROLE_CLIENT, "Viewer": auth.ROLE_VIEWER, "Admin": auth.ROLE_ADMIN}
+                    role = role_map[role_choice]
+                    workspace_id = None  # defaults to the account's own username
+                    if role == auth.ROLE_VIEWER and link_choice and link_choice.startswith("Share data with client: "):
+                        workspace_id = link_choice.replace("Share data with client: ", "")
+                    auth.create_or_update_user(nu.strip(), np1, role, workspace_id=workspace_id)
+                    st.success(f"Account '{nu.strip()}' saved as {role_choice}"
+                               + (f", sharing data with '{workspace_id}'." if workspace_id else ", with its own data workspace."))
+                    st.rerun()
+
+        st.divider()
+        st.subheader("Reset a password / delete an account")
+        other_users = [u["username"] for u in users]
+        if other_users:
+            sel_user = st.selectbox("Account", other_users)
+            c1, c2 = st.columns(2)
+            with c1:
+                with st.form("reset_pw_form"):
+                    rp1 = st.text_input("New password", type="password", key="rp1")
+                    rp2 = st.text_input("Confirm new password", type="password", key="rp2")
+                    reset_submit = st.form_submit_button("Reset this account's password")
+                    if reset_submit:
+                        if not rp1 or rp1 != rp2:
+                            st.error("Passwords are empty or don't match.")
+                        else:
+                            auth.change_password(sel_user, rp1)
+                            st.success(f"Password reset for '{sel_user}'.")
+            with c2:
+                st.write("")
+                st.write("")
+                if st.button(f"🗑️ Delete '{sel_user}'", use_container_width=True):
+                    try:
+                        auth.delete_user(sel_user, st.session_state.username)
+                        st.success(f"Deleted '{sel_user}'.")
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+
+    with tab_mypw:
+        st.subheader("Change my own admin password")
+        with st.form("change_own_pw"):
+            cur_pw = st.text_input("Current password", type="password")
+            new_pw1 = st.text_input("New password", type="password", key="my_new1")
+            new_pw2 = st.text_input("Confirm new password", type="password", key="my_new2")
+            submit = st.form_submit_button("Update my password")
+            if submit:
+                if not auth.verify_admin_login(st.session_state.username, cur_pw):
+                    st.error("Current password is incorrect.")
+                elif not new_pw1 or new_pw1 != new_pw2:
+                    st.error("New passwords are empty or don't match.")
+                else:
+                    auth.change_password(st.session_state.username, new_pw1)
+                    st.success("Password updated. Use the new password next time you log in.")
+
+    with tab_reset:
+        st.subheader("Clear a client's dataset")
+        st.caption("The loaded dataset, Boss Dashboard layout, pinned KPIs and Custom Builder "
+                   "content stay saved on disk permanently, across restarts, until you clear them "
+                   "here yourself - nothing auto-deletes or auto-refreshes on its own.")
+
+        ws_to_accounts = {}
+        for u in users:
+            ws_to_accounts.setdefault(u["workspace_id"], []).append(f"{u['username']} ({u['role']})")
+        ws_ids = sorted(ws_to_accounts.keys())
+        if not ws_ids:
+            st.info("No client/viewer workspaces exist yet.")
+        else:
+            default_idx = ws_ids.index(st.session_state.view_as_workspace) if st.session_state.view_as_workspace in ws_ids else 0
+            target_ws = st.selectbox(
+                "Which client's workspace to reset?", ws_ids,
+                index=default_idx,
+                format_func=lambda w: f"{w}  —  used by: {', '.join(ws_to_accounts[w])}",
+            )
+            if ws.has_saved_data(target_ws):
+                st.info(f"'{target_ws}' currently has data saved.")
+            else:
+                st.info(f"'{target_ws}' has nothing loaded right now.")
+            st.warning(f"Resetting removes the data for **every account sharing workspace '{target_ws}'** "
+                       f"({', '.join(ws_to_accounts[target_ws])}) - do this only when intentionally "
+                       f"starting that client over with a new dataset.")
+            confirm_reset = st.checkbox("Yes, I understand - clear this workspace's dataset and dashboard.", key="confirm_ws_reset")
+            if st.button("🗑️ Reset this workspace now", disabled=not confirm_reset, type="primary"):
+                ws.clear(target_ws)
+                if effective_workspace_id() == target_ws:
+                    for k in ws.PERSISTED_KEYS:
+                        st.session_state[k] = [] if isinstance(st.session_state.get(k), list) else None
+                    st.session_state.filters = {}
+                    st.session_state.dashboard_name = "⭐ Boss Dashboard"
+                st.success(f"Workspace '{target_ws}' cleared.")
+                st.rerun()
+
+
+# ==================================================================================
+# AUTO-SAVE WORKSPACE TO DISK
+# ==================================================================================
+# Runs at the end of every script run (Streamlit reruns this whole file on every
+# click/upload/etc.), so whatever is in session_state right now is always what's
+# on disk too. This is the only thing that makes data survive an app.py restart -
+# it is intentionally NOT tied to any particular button or page.
+if st.session_state.authenticated and st.session_state.df_raw is not None:
+    ws.save(st.session_state, effective_workspace_id())
+
+
+# footer
+st.markdown(
+    """
+    <style>
+    footer {visibility: hidden;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)

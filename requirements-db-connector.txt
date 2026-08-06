@@ -1,0 +1,9 @@
+# OPTIONAL — only needed for the "🔌 Database Connector" tab (Data Table page).
+# The app runs fine WITHOUT these; that tab just shows a friendly "not installed"
+# message instead of connecting. Install this file separately once you have
+# working internet/pypi access:
+#     pip install -r requirements-db-connector.txt
+sqlalchemy             # generic external Database Connector (Data Table page)
+psycopg2-binary        # PostgreSQL driver for the Database Connector
+pymysql                # MySQL / MariaDB driver for the Database Connector
+streamlit-autorefresh  # powers the auto-refresh toggle on Database Connector query tabs

@@ -1,0 +1,10 @@
+streamlit
+duckdb        # SQL query engine (Phase 5) — real SELECT/WHERE/GROUP BY over the loaded dataset
+pandas
+numpy
+plotly
+reportlab
+openpyxl      # needed to read/write .xlsx files (pd.ExcelFile)
+kaleido       # needed for fig.to_image(...) -> chart PNGs used in the PDF export
+pdfplumber    # optional: only needed if you upload PDFs as a data source on Raw Analysis
+requests      # needed for the 🤖 AI Assistant page (talks to the free OpenRouter API)
