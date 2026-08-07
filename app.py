@@ -47,7 +47,7 @@ except ImportError:
 # ==================================================================================
 # PAGE CONFIG
 # ==================================================================================
-st.set_page_config(page_title="Report_Gen_Ai Platform By Ankit SOlanki", page_icon="🏆", layout="wide")
+st.set_page_config(page_title="Sports Analytics Platform", page_icon="🏆", layout="wide")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SAMPLE_PATH = os.path.join(APP_DIR, "sample_data", "sample_sports_payments.csv")
@@ -1226,6 +1226,7 @@ elif page == "⭐ Boss Dashboard":
     st.subheader("Selected Charts")
     pinned_custom_charts = [c for c in st.session_state.custom_charts if c.get("pinned")]
     chart_png_items = []
+    st.session_state._pdf_render_errors = []
 
     if not st.session_state.dashboard_charts and not pinned_custom_charts:
         st.info("No charts selected yet. Go to Raw Analysis and click ⭐ Add to Boss Dashboard on any chart, "
@@ -1250,8 +1251,10 @@ elif page == "⭐ Boss Dashboard":
                     st.plotly_chart(fig, use_container_width=True, key=f"p2_custom_{chart['id']}", config=ce.PLOTLY_CONFIG)
                     try:
                         png_bytes = fig.to_image(format="png", width=1400, height=700, scale=2)
-                    except Exception:
+                    except Exception as e:
                         png_bytes = None
+                        st.session_state.setdefault("_pdf_render_errors", [])
+                        st.session_state._pdf_render_errors.append(f"{chart.get('title','Custom Chart')}: {e}")
                 st.caption(f"💡 {insight}")
                 chart_png_items.append({"title": chart.get("title", "Custom Chart"), "insight": insight,
                                          "png_bytes": png_bytes, "type": chart.get("type", "Chart")})
@@ -1289,13 +1292,20 @@ elif page == "⭐ Boss Dashboard":
 
                 try:
                     png_bytes = fig.to_image(format="png", width=1400, height=700, scale=2)
-                except Exception:
+                except Exception as e:
                     png_bytes = None
+                    st.session_state.setdefault("_pdf_render_errors", [])
+                    st.session_state._pdf_render_errors.append(f"{variant.get('title', fam)}: {e}")
                 chart_png_items.append({"title": variant.get("title", fam), "insight": insight,
                                          "png_bytes": png_bytes, "type": fam})
 
         st.divider()
         st.subheader("📄 Export")
+        if st.session_state.get("_pdf_render_errors"):
+            with st.expander(f"⚠️ {len(st.session_state._pdf_render_errors)} chart(s) could not be rendered "
+                              f"as images and will be missing from the PDF — click to see why"):
+                for msg in st.session_state._pdf_render_errors:
+                    st.caption(msg)
         report_title = st.text_input("Report title", st.session_state.dashboard_name or "Sports Performance & Payments Report")
         subtitle = st.text_input("Subtitle", f"Prepared for management review — {pd.Timestamp.today().date()}")
         filters_summary = ", ".join(
