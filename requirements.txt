@@ -2,7 +2,12 @@ streamlit
 duckdb        # SQL query engine (Phase 5) — real SELECT/WHERE/GROUP BY over the loaded dataset
 pandas
 numpy
-plotly
+plotly==6.8.0  # PINNED — was unpinned before, so Streamlit Cloud silently installed
+               # whatever the newest Plotly release happened to be on every redeploy.
+               # A newer release changed how the library validates styling calls
+               # (see chart_engine.py build_figure), which is what caused the
+               # "ValueError" crash on every Line/Area chart. Pinning stops that
+               # from happening again on a future redeploy.
 reportlab
 openpyxl      # needed to read/write .xlsx files (pd.ExcelFile)
 kaleido==0.2.1  # PINNED — newer kaleido (1.x) needs a headless Chrome browser that
