@@ -258,23 +258,44 @@ SESSION_COOKIE_NAME = "app_session"
 
 
 def _set_session_cookie(token: str):
+    """Sets the 'stay logged in' cookie, then reloads the page from JS itself
+    (never st.rerun() right after this - see the note below) so the very
+    next request the browser makes actually carries the freshly-set cookie.
+
+    Why not st.rerun(): components.html() injects an iframe whose <script>
+    the BROWSER has to receive and execute - that happens a moment after
+    Python moves on. Calling st.rerun() immediately after this call races
+    that: Streamlit can tear the whole page down and re-render before the
+    iframe's script ever ran, so the cookie never actually got written. That
+    race is exactly what was causing 'log in, then refresh -> bounced back
+    to the login page' - every login effectively lost its cookie. Doing the
+    reload in the SAME script tag, after the document.cookie line, guarantees
+    the write happens first."""
     import streamlit.components.v1 as components
     components.html(
         f"""<script>
         document.cookie = "{SESSION_COOKIE_NAME}={token}; path=/; max-age={auth.SESSION_LIFETIME_SECONDS}; SameSite=Lax";
+        window.parent.location.reload();
         </script>""",
         height=0, width=0,
     )
+    st.stop()  # don't let this run keep going (and re-render the login form) - the JS reload above takes over
 
 
 def _clear_session_cookie():
+    """Same reasoning as _set_session_cookie() above, in reverse: clear the
+    cookie and reload from the SAME script tag, so Logout can't leave a
+    stale cookie behind that would silently log the person back in on their
+    next visit."""
     import streamlit.components.v1 as components
     components.html(
         f"""<script>
         document.cookie = "{SESSION_COOKIE_NAME}=; path=/; max-age=0; SameSite=Lax";
+        window.parent.location.reload();
         </script>""",
         height=0, width=0,
     )
+    st.stop()
 
 
 def _get_session_cookie():
@@ -303,7 +324,6 @@ def login_screen():
                     _token = auth.create_session(u.strip())
                     st.session_state._session_token = _token
                     _set_session_cookie(_token)  # survives a browser refresh, but not copy-paste into another browser
-                    st.rerun()
                 else:
                     st.error("Invalid username or password.")
 
@@ -347,7 +367,6 @@ def login_screen():
                         _token = auth.create_session(au.strip())
                         st.session_state._session_token = _token
                         _set_session_cookie(_token)
-                        st.rerun()
                     else:
                         st.error("Invalid admin username or password.")
 
@@ -988,7 +1007,6 @@ with st.sidebar:
     st.divider()
     if st.button("🚪 Logout", use_container_width=True):
         auth.destroy_session(st.session_state.get("_session_token") or _get_session_cookie())  # invalidate server-side
-        _clear_session_cookie()
         st.session_state.authenticated = False
         st.session_state.username = None
         st.session_state.role = None
@@ -996,7 +1014,7 @@ with st.sidebar:
         st.session_state.view_as_workspace = None
         st.session_state._loaded_workspace_id = None
         st.session_state._session_token = None
-        st.rerun()
+        _clear_session_cookie()  # clears the cookie + reloads the page itself; nothing to do after this call
 
 
 # ==================================================================================
@@ -1340,17 +1358,12 @@ elif page == "⭐ Boss Dashboard":
         st.title(st.session_state.dashboard_name or "⭐ Boss Dashboard")
     st.caption("Only what you picked shows up here. Style it, swap any chart, then export a clean PDF.")
 
+    # Auto-sync so a client and their linked report-viewer(s) - separate browser
+    # sessions sharing this workspace - always see each other's latest changes
+    # (pinned/swapped charts, slicers, theme...) without anyone touching a
+    # button. No user-facing controls for this on purpose - it's just always on.
     if AUTOREFRESH_AVAILABLE:
-        ar_col1, ar_col2 = st.columns([1, 3])
-        with ar_col1:
-            live_sync = st.checkbox("🔄 Live sync", value=False,
-                                     help="Automatically pull in changes made by anyone else viewing/editing "
-                                          "this same dashboard (client ↔ their report-viewers), without you "
-                                          "needing to click anything.")
-        if live_sync:
-            with ar_col2:
-                live_interval = st.slider("Every (seconds)", 5, 60, 10, key="boss_live_sync_interval")
-            st_autorefresh(interval=live_interval * 1000, key="boss_dashboard_live_sync")
+        st_autorefresh(interval=1000, key="boss_dashboard_live_sync")
 
     if st.session_state.df_raw is None:
         st.info("Load data on the **📥 Connect Data** page first.")
