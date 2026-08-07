@@ -49,7 +49,7 @@ except ImportError:
 # ==================================================================================
 # PAGE CONFIG
 # ==================================================================================
-st.set_page_config(page_title="RA-I - Research& analytics Intelligence", page_icon="", layout="wide")
+st.set_page_config(page_title="RA-Intelligence By Ankit_Solanki", page_icon="🕵️‍♀️", layout="wide")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SAMPLE_PATH = os.path.join(APP_DIR, "sample_data", "sample_sports_payments.csv")
@@ -95,7 +95,7 @@ def _load_asset_bytes(filename: str):
 
 
 DEFAULT_BRAND = {
-    "text": "🏆 Sports Analytics",
+    "text": "RA-I - Research & Analytics Intelligence",
     "font_size": 22,       # px, sidebar heading
     "color": "#F5F5F5",
     "bold": True,
@@ -447,7 +447,7 @@ def login_screen():
     # generic "Sports Analytics Platform" text heading underneath it as well
     # would be redundant. Only fall back to that text title when no logo is set.
     if not (_b.get("hide_login_title", True) and has_brand_logo(_b)):
-        st.markdown("<h1 style='text-align:center;'>🏆 Sports Analytics Platform</h1>", unsafe_allow_html=True)
+        st.markdown("<h1 style='text-align:center;'> RA-I </h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
