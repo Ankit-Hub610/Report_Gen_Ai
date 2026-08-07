@@ -193,6 +193,22 @@ def sync_workspace_from_disk(force: bool = False):
         ss["filters"] = {}
         ss["p3_sql_result"] = None  # SQL Query tab result belongs to the previous workspace — drop it on switch
         ss["p3_sql_error"] = None
+    else:
+        # Same workspace, just refreshing (force=True path). Several buttons on
+        # this page (Remove/pin/unpin/etc.) call st.rerun() immediately after
+        # changing session_state, which SKIPS the normal end-of-script
+        # auto-save for that run entirely (it lives at the very bottom of
+        # this file, which an immediate rerun never reaches). Without this,
+        # the very next run's reload below would load a stale pre-change
+        # copy from disk and silently undo whatever was just clicked - that
+        # was making Remove/pin/etc. look broken.
+        # Fix: flush THIS session's current state to disk FIRST, then read
+        # back. If this session made the latest change, that's a no-op (we
+        # just read back what we wrote). If a DIFFERENT session (e.g. a
+        # linked report-viewer, in another browser) saved something even
+        # more recently, we correctly pick up THEIR newer version instead.
+        if ss.get("df_raw") is not None:
+            ws.save(ss, wsid)
     saved = ws.load(wsid)
     if saved:
         for k, v in saved.items():
