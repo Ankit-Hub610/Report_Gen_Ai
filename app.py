@@ -79,6 +79,21 @@ PALETTES = {
     "Mono Green": ["#013220", "#0B6E4F", "#08A045", "#6BCB77", "#A6E3A1", "#D4F1D4"],
 }
 
+def _load_asset_bytes(filename: str):
+    """Reads a file from the assets/ folder next to app.py (committed to the
+    git repo, unlike workspace_state/ which is gitignored runtime data) —
+    used so the default logo is baked into the deploy itself and survives
+    every redeploy, with no admin action needed. Returns None (never raises)
+    if the file isn't there, so a missing asset just means no default logo
+    instead of crashing the app."""
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", filename)
+        with open(path, "rb") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
 DEFAULT_BRAND = {
     "text": "🏆 Sports Analytics",
     "font_size": 22,       # px, sidebar heading
@@ -86,9 +101,14 @@ DEFAULT_BRAND = {
     "bold": True,
     "italic": False,
     "font_family": "sans-serif",  # sans-serif / serif / monospace
-    "logo_light_bytes": None,  # shown when the app is in LIGHT theme (upload takes priority over URL below)
+    # Baked-in default logo (assets/logo_light.png, assets/logo_dark.png — ship these
+    # two files in the repo). An admin can still override either from Settings → App
+    # Branding; that override is saved to workspace_state/ instead (see save_branding()
+    # below) and — unlike these baked-in defaults — won't survive a future redeploy
+    # unless workspace_state/ is on persistent storage, so re-upload there if needed.
+    "logo_light_bytes": _load_asset_bytes("logo_light.png"),  # shown when the app is in LIGHT theme
     "logo_light_url": "",
-    "logo_dark_bytes": None,   # shown when the app is in DARK theme
+    "logo_dark_bytes": _load_asset_bytes("logo_dark.png"),    # shown when the app is in DARK theme
     "logo_dark_url": "",
     "logo_width": 220,     # px — used on the login page; sidebar shows it smaller automatically
     "logo_glow": True,     # pulsing blue glow on the logo's edges
@@ -153,21 +173,28 @@ def _render_brand_logo(brand: dict, width: int = None, centered: bool = False):
     """Renders the logo, automatically swapping between the light-theme and
     dark-theme image so it looks right either way, with an optional pulsing
     blue glow. Never raises - a bad/expired URL or corrupt upload should
-    never take down the login page or sidebar, just show no logo."""
+    never take down the login page or sidebar, just show no logo.
+
+    IMPORTANT: every line handed to st.markdown() here is built with ZERO
+    leading whitespace. Markdown treats any line indented 4+ spaces as a
+    preformatted code block - a natural-looking indented triple-quoted
+    f-string (matching the surrounding Python code's indentation) renders
+    as literal visible text instead of an actual <img>/<style>, which is
+    exactly the bug this replaced (raw `<div>...` tags showing up on the
+    login page instead of the logo)."""
     light_src, dark_src = _brand_logo_srcs(brand)
     if not light_src and not dark_src:
         return
     w = width or brand.get("logo_width", 220)
     justify = "center" if centered else "flex-start"
-    glow_css = "filter:drop-shadow(0 0 3px rgba(70,150,255,.4));animation:raiLogoGlow 2.4s ease-in-out infinite;" \
-        if brand.get("logo_glow", True) else ""
-    keyframes = f"""
-        @keyframes raiLogoGlow {{
-            0%   {{ filter: drop-shadow(0 0 2px rgba(70,150,255,.35)) drop-shadow(0 0 5px rgba(70,150,255,.15)); }}
-            50%  {{ filter: drop-shadow(0 0 8px rgba(70,150,255,.9)) drop-shadow(0 0 18px rgba(70,150,255,.55)); }}
-            100% {{ filter: drop-shadow(0 0 2px rgba(70,150,255,.35)) drop-shadow(0 0 5px rgba(70,150,255,.15)); }}
-        }}
-    """ if brand.get("logo_glow", True) else ""
+    glow = brand.get("logo_glow", True)
+    glow_css = ("filter:drop-shadow(0 0 3px rgba(70,150,255,.4));"
+                "animation:raiLogoGlow 2.4s ease-in-out infinite;") if glow else ""
+    keyframes = ("@keyframes raiLogoGlow {"
+                 "0%{filter:drop-shadow(0 0 2px rgba(70,150,255,.35)) drop-shadow(0 0 5px rgba(70,150,255,.15));}"
+                 "50%{filter:drop-shadow(0 0 8px rgba(70,150,255,.9)) drop-shadow(0 0 18px rgba(70,150,255,.55));}"
+                 "100%{filter:drop-shadow(0 0 2px rgba(70,150,255,.35)) drop-shadow(0 0 5px rgba(70,150,255,.15));}"
+                 "}") if glow else ""
     try:
         theme = _detected_theme_type()
         if theme == "dark":
@@ -178,24 +205,20 @@ def _render_brand_logo(brand: dict, width: int = None, centered: bool = False):
             src = None  # unknown server-side - use the CSS media-query fallback below
 
         if src:
-            html = f"""<style>{keyframes}</style>
-            <div style="display:flex;justify-content:{justify};margin-bottom:0.3rem;">
-                <img src="{src}" style="width:{w}px;height:auto;{glow_css}" />
-            </div>"""
+            html = (f'<style>{keyframes}</style>'
+                     f'<div style="display:flex;justify-content:{justify};margin-bottom:0.3rem;">'
+                     f'<img src="{src}" style="width:{w}px;height:auto;{glow_css}" />'
+                     f'</div>')
         else:
-            html = f"""<style>
-            {keyframes}
-            .rai-logo-l, .rai-logo-d {{ width:{w}px; height:auto; {glow_css} }}
-            .rai-logo-d {{ display:none; }}
-            @media (prefers-color-scheme: dark) {{
-                .rai-logo-l {{ display:none; }}
-                .rai-logo-d {{ display:inline-block; }}
-            }}
-            </style>
-            <div style="display:flex;justify-content:{justify};margin-bottom:0.3rem;">
-                <img class="rai-logo-l" src="{light_src}" />
-                <img class="rai-logo-d" src="{dark_src}" />
-            </div>"""
+            html = (f'<style>{keyframes}'
+                     f'.rai-logo-l,.rai-logo-d{{width:{w}px;height:auto;{glow_css}}}'
+                     f'.rai-logo-d{{display:none;}}'
+                     f'@media (prefers-color-scheme: dark) {{.rai-logo-l{{display:none;}} .rai-logo-d{{display:inline-block;}}}}'
+                     f'</style>'
+                     f'<div style="display:flex;justify-content:{justify};margin-bottom:0.3rem;">'
+                     f'<img class="rai-logo-l" src="{light_src}" />'
+                     f'<img class="rai-logo-d" src="{dark_src}" />'
+                     f'</div>')
         st.markdown(html, unsafe_allow_html=True)
     except Exception:
         pass
