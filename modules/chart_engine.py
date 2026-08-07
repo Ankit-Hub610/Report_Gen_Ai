@@ -442,9 +442,12 @@ def build_figure(df, variant, style):
             # Without this, values only ever show up on hover - the whole point of
             # "show data labels" is that they're visible on the chart itself, with
             # or without the cursor on it.
+            # NOTE: cliponaxis is a Bar-only property in Plotly — passing it to a
+            # Scatter-based trace (which is what Line/Area charts are) raised a
+            # ValueError and crashed the whole page whenever data labels were on.
             if show_labels:
                 fig.update_traces(mode="lines+markers+text", texttemplate="%{y:,.2s}",
-                                   textposition="top center", cliponaxis=False)
+                                   textposition="top center")
             else:
                 fig.update_traces(mode="lines+markers")
 
