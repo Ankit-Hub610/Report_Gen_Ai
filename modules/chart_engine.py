@@ -329,7 +329,11 @@ def build_figure(df, variant, style):
             g.columns = [dim, measure or "Count"]
             val_col = measure or "Count"
             fig = px.pie(g, names=dim, values=val_col, color_discrete_sequence=palette, hole=0.35)
-            fig.update_traces(textinfo="label+percent" if show_labels else "none")
+            try:
+                fig.update_traces(textinfo="label+percent" if show_labels else "none",
+                                   selector=dict(type="pie"))
+            except Exception:
+                pass
             insight = _insight_bar(g, dim, val_col)
 
         elif family == "Comparison":
@@ -436,17 +440,41 @@ def build_figure(df, variant, style):
             paper_bgcolor=style.get("chart_bg", "rgba(0,0,0,0)"),
             plot_bgcolor=style.get("plot_bg", "rgba(0,0,0,0)"),
         )
+        # NOTE: every update_traces() call below is wrapped in its own try/except.
+        # These calls only add cosmetic styling (data-label text) on top of a chart
+        # that already built successfully above - they should never be able to take
+        # the whole page down. Before this fix, an update_traces() call with no
+        # `selector` applies its kwargs to EVERY trace in the figure; if the
+        # installed Plotly version (unpinned in requirements.txt, so Streamlit
+        # Cloud can silently pull a newer release on every redeploy) rejects one of
+        # those kwargs for a trace it produced, the ValueError propagated all the
+        # way up and crashed the entire chart tab. Now we scope the update to the
+        # trace type it's meant for and swallow (log-free, silent) any styling
+        # failure so the chart still renders - just without that particular touch.
         if family == "Bar" or family == "Comparison":
-            fig.update_traces(textposition="outside" if show_labels else None)
+            try:
+                fig.update_traces(textposition="outside" if show_labels else None,
+                                   selector=dict(type="bar"))
+            except Exception:
+                pass
         if family in ("Line", "Area"):
             # Without this, values only ever show up on hover - the whole point of
             # "show data labels" is that they're visible on the chart itself, with
             # or without the cursor on it.
-            if show_labels:
-                fig.update_traces(mode="lines+markers+text", texttemplate="%{y:,.2s}",
-                                   textposition="top center", cliponaxis=False)
-            else:
-                fig.update_traces(mode="lines+markers")
+            try:
+                if show_labels:
+                    fig.update_traces(mode="lines+markers+text", texttemplate="%{y:,.2s}",
+                                       textposition="top center", cliponaxis=False,
+                                       selector=dict(type="scatter"))
+                else:
+                    fig.update_traces(mode="lines+markers", selector=dict(type="scatter"))
+            except Exception:
+                # Fall back to a plain line/area with no text labels rather than
+                # blow up the whole page - the chart itself is still valid.
+                try:
+                    fig.update_traces(mode="lines+markers", selector=dict(type="scatter"))
+                except Exception:
+                    pass
 
     variant["insight"] = insight
     return fig, insight
