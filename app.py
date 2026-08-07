@@ -258,44 +258,48 @@ SESSION_COOKIE_NAME = "app_session"
 
 
 def _set_session_cookie(token: str):
-    """Sets the 'stay logged in' cookie, then reloads the page from JS itself
-    (never st.rerun() right after this - see the note below) so the very
-    next request the browser makes actually carries the freshly-set cookie.
+    """Sets the 'stay logged in' cookie, then reruns - but only AFTER giving
+    the browser a moment to actually execute the cookie-setting script below.
 
-    Why not st.rerun(): components.html() injects an iframe whose <script>
-    the BROWSER has to receive and execute - that happens a moment after
-    Python moves on. Calling st.rerun() immediately after this call races
-    that: Streamlit can tear the whole page down and re-render before the
-    iframe's script ever ran, so the cookie never actually got written. That
-    race is exactly what was causing 'log in, then refresh -> bounced back
-    to the login page' - every login effectively lost its cookie. Doing the
-    reload in the SAME script tag, after the document.cookie line, guarantees
-    the write happens first."""
+    Why the delay: components.html() renders an iframe; the browser has to
+    receive it and run its <script> before the cookie exists. Calling
+    st.rerun() immediately (no delay) used to race that - Streamlit could
+    tear the page down before the script ran, so the cookie was silently
+    never set (refresh -> bounced back to login).
+
+    An earlier version of this fix tried to reload via
+    `window.parent.location.reload()` from inside that same script instead
+    of a delay. That's WRONG: Streamlit's component iframe is sandboxed, and
+    a sandboxed iframe cannot navigate its parent's top-level page unless
+    the iframe is explicitly given that permission - browsers silently block
+    it. That's why login stopped working entirely after that attempt: the
+    cookie script ran, but the page reload it tried to trigger never
+    happened, so the app just sat there. A short server-side sleep before a
+    normal st.rerun() sidesteps that restriction completely - no navigation
+    is attempted from inside the iframe at all."""
     import streamlit.components.v1 as components
     components.html(
         f"""<script>
         document.cookie = "{SESSION_COOKIE_NAME}={token}; path=/; max-age={auth.SESSION_LIFETIME_SECONDS}; SameSite=Lax";
-        window.parent.location.reload();
         </script>""",
         height=0, width=0,
     )
-    st.stop()  # don't let this run keep going (and re-render the login form) - the JS reload above takes over
+    time.sleep(0.2)
+    st.rerun()
 
 
 def _clear_session_cookie():
-    """Same reasoning as _set_session_cookie() above, in reverse: clear the
-    cookie and reload from the SAME script tag, so Logout can't leave a
-    stale cookie behind that would silently log the person back in on their
-    next visit."""
+    """Same reasoning as _set_session_cookie() above - a short delay before
+    rerunning, no iframe-triggered navigation."""
     import streamlit.components.v1 as components
     components.html(
         f"""<script>
         document.cookie = "{SESSION_COOKIE_NAME}=; path=/; max-age=0; SameSite=Lax";
-        window.parent.location.reload();
         </script>""",
         height=0, width=0,
     )
-    st.stop()
+    time.sleep(0.2)
+    st.rerun()
 
 
 def _get_session_cookie():
