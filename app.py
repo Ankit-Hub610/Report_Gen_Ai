@@ -207,6 +207,53 @@ def sync_workspace_from_disk():
 ADMIN_URL_KEY = "admin"
 ADMIN_URL_SECRET = "SET-YOUR-OWN-SECRET-HERE"
 
+# --------------------------------------------------------------------------------
+# "STAY LOGGED IN" TOKEN STORAGE: a real browser cookie, not a URL query param.
+# --------------------------------------------------------------------------------
+# The token used to be put in the URL as ?s=<token>. That "worked" for
+# surviving a refresh, but it meant the LOGIN ITSELF was embedded in the
+# address bar text — copy that URL and paste it into a different browser,
+# a different device, or send it to someone else, and THEY were instantly
+# logged in as you, no password asked. That's exactly the leak that was
+# reported.
+#
+# A real cookie fixes this: it's still remembered by THIS browser across a
+# refresh/reopen (via st.context.cookies, which reflects whatever cookies
+# the browser actually sent with the page request), but it is never part of
+# the URL text, so copy-pasting the link into another browser/device carries
+# no credential at all — that browser has to log in for real. Opening a
+# second TAB in the *same* browser will still be logged in, same as any
+# normal website (Gmail, etc.) — that's expected, not a leak, since it's
+# still the same physical browser holding the cookie.
+SESSION_COOKIE_NAME = "app_session"
+
+
+def _set_session_cookie(token: str):
+    import streamlit.components.v1 as components
+    components.html(
+        f"""<script>
+        document.cookie = "{SESSION_COOKIE_NAME}={token}; path=/; max-age={auth.SESSION_LIFETIME_SECONDS}; SameSite=Lax";
+        </script>""",
+        height=0, width=0,
+    )
+
+
+def _clear_session_cookie():
+    import streamlit.components.v1 as components
+    components.html(
+        f"""<script>
+        document.cookie = "{SESSION_COOKIE_NAME}=; path=/; max-age=0; SameSite=Lax";
+        </script>""",
+        height=0, width=0,
+    )
+
+
+def _get_session_cookie():
+    try:
+        return st.context.cookies.get(SESSION_COOKIE_NAME)
+    except Exception:
+        return None  # older Streamlit without st.context.cookies — fails safe (just asks to log in again)
+
 
 def login_screen():
     st.markdown("<h1 style='text-align:center;'>🏆 Sports Analytics Platform</h1>", unsafe_allow_html=True)
@@ -224,7 +271,9 @@ def login_screen():
                     st.session_state.username = u.strip()
                     st.session_state.role = role
                     st.session_state.workspace_id = auth.get_workspace_id(u.strip())
-                    st.query_params["s"] = auth.create_session(u.strip())  # survives a browser refresh
+                    _token = auth.create_session(u.strip())
+                    st.session_state._session_token = _token
+                    _set_session_cookie(_token)  # survives a browser refresh, but not copy-paste into another browser
                     st.rerun()
                 else:
                     st.error("Invalid username or password.")
@@ -266,7 +315,9 @@ def login_screen():
                         st.session_state.username = au.strip()
                         st.session_state.role = auth.ROLE_ADMIN
                         st.session_state.workspace_id = auth.get_workspace_id(au.strip())
-                        st.query_params["s"] = auth.create_session(au.strip())
+                        _token = auth.create_session(au.strip())
+                        st.session_state._session_token = _token
+                        _set_session_cookie(_token)
                         st.rerun()
                     else:
                         st.error("Invalid admin username or password.")
@@ -313,13 +364,14 @@ if _reset_token and not st.session_state.authenticated:
 # token Streamlit kept in the URL across that reload — if it's still valid, log
 # the person back in silently instead of making them type their password again.
 if not st.session_state.authenticated:
-    _session_token = st.query_params.get("s")
+    _session_token = _get_session_cookie()
     _resolved_user = auth.resolve_session(_session_token) if _session_token else None
     if _resolved_user and auth.user_exists(_resolved_user):
         st.session_state.authenticated = True
         st.session_state.username = _resolved_user
         st.session_state.role = auth.get_role(_resolved_user)
         st.session_state.workspace_id = auth.get_workspace_id(_resolved_user)
+        st.session_state._session_token = _session_token
 
 if not st.session_state.authenticated:
     login_screen()
@@ -890,7 +942,7 @@ with st.sidebar:
     nav_options = ["📥 Connect Data", "📊 Raw Analysis", "🧩 Custom Builder", "⭐ Boss Dashboard", "🗂 Data Table",
                     "🤖 AI Assistant", "⚙️ Settings"]
     if st.session_state.role == auth.ROLE_REPORT_VIEWER:
-        nav_options = ["⭐ Boss Dashboard", "⚙️ Settings"]   # nothing else exists for this account
+        nav_options = ["⭐ Boss Dashboard"]   # nothing else exists for this account, not even Settings
     if st.session_state.role == auth.ROLE_ADMIN:
         nav_options.append("🔐 Admin Panel")
     page = st.radio("Navigate", nav_options, label_visibility="collapsed")
@@ -906,15 +958,15 @@ with st.sidebar:
         st.caption("👁️ View-only account — you can look at reports here but not upload data or change dashboards.")
     st.divider()
     if st.button("🚪 Logout", use_container_width=True):
-        auth.destroy_session(st.query_params.get("s"))   # invalidate the "stay logged in" link server-side
-        if "s" in st.query_params:
-            del st.query_params["s"]
+        auth.destroy_session(st.session_state.get("_session_token") or _get_session_cookie())  # invalidate server-side
+        _clear_session_cookie()
         st.session_state.authenticated = False
         st.session_state.username = None
         st.session_state.role = None
         st.session_state.workspace_id = None
         st.session_state.view_as_workspace = None
         st.session_state._loaded_workspace_id = None
+        st.session_state._session_token = None
         st.rerun()
 
 
@@ -1975,6 +2027,10 @@ elif page == "⚙️ Settings":
 
     with tab_about:
         st.subheader("What this tool does")
+        # NOTE: this tab is shown to every role (client / viewer / report
+        # viewer / admin). Nothing about the Admin Panel - or that one even
+        # exists - belongs here. That description lives ONLY inside the
+        # Admin Panel page itself, gated to role == admin. Keep it that way.
         st.markdown("""
 **Sports Analytics Platform** turns any spreadsheet-shaped file into a boardroom-ready
 report, without you writing a single formula.
@@ -2024,15 +2080,8 @@ report, without you writing a single formula.
   and export the exact slice you need as CSV.
 
 **⚙️ Settings**
-- Reset the default look of the Boss Dashboard.
-- This page. Login/user management now lives in the separate **🔐 Admin Panel**
-  (visible to admin accounts only).
-
-**🔐 Admin Panel (admin accounts only)**
-- Create new report-user (viewer) accounts, reset anyone's password, delete
-  accounts, and change your own admin password.
-- Report-users can never see or reach this page - it isn't in their sidebar
-  at all, and their login has no path to it.
+- Reset the default look of the Boss Dashboard, change your own password, and
+  (for client accounts) create Report Viewer logins for your own team.
 
 **Performance note:** column detection, KPI math and chart aggregation are all
 done with vectorized pandas/NumPy operations, so the same tool comfortably
@@ -2040,10 +2089,7 @@ handles datasets from a few hundred rows up to several million rows. For very
 large files, use the row-limit slider on the Data Table page and the filters on
 every page to narrow down what's rendered on screen.
 
-**Security note:** credentials are stored as SHA-256 hashes in `credentials.json`
-next to this app — never in plain text. Only accounts with the "admin" role can
-create/delete users or reset passwords; report-user (viewer) accounts have no
-access to any credential screen.
+**Security note:** your login credentials are never stored in plain text.
         """)
 
 
@@ -2055,8 +2101,8 @@ elif page == "🔐 Admin Panel":
     st.title("🔐 Admin Panel")
     st.caption("Visible to admin accounts only — report-users never see this page.")
 
-    tab_users, tab_mypw, tab_reset = st.tabs(
-        ["👥 Manage Accounts", "🔑 Change My Own Password", "🗑️ Reset Workspace Data"]
+    tab_users, tab_mypw, tab_reset, tab_admin_about = st.tabs(
+        ["👥 Manage Accounts", "🔑 Change My Own Password", "🗑️ Reset Workspace Data", "ℹ️ About This Panel"]
     )
 
     with tab_users:
@@ -2200,6 +2246,35 @@ elif page == "🔐 Admin Panel":
                     st.session_state.dashboard_name = "⭐ Boss Dashboard"
                 st.success(f"Workspace '{target_ws}' cleared.")
                 st.rerun()
+
+    with tab_admin_about:
+        st.subheader("Admin Panel — what only you can see")
+        st.caption("This information is only ever shown here, inside the Admin Panel — "
+                   "client, viewer and report-viewer accounts never see any mention of this page, "
+                   "not even that it exists.")
+        st.markdown("""
+**⚙️ Settings (client/viewer-facing page)**
+- The "How This Tool Works" tab that non-admin accounts see deliberately says nothing
+  about this Admin Panel, the admin login link, or the `?admin=...` URL secret —
+  they have no way to discover it exists from inside the app.
+
+**🔐 Admin Panel (this page — admin accounts only)**
+- **👥 Manage Accounts** — create new client / viewer / report-viewer accounts, reset
+  anyone's password, delete accounts, and link a viewer to an existing client's data
+  workspace.
+- **🔑 Change My Own Password** — update your own admin login.
+- **🗑️ Reset Workspace Data** — wipe a client's loaded dataset/dashboard so they
+  can start over with fresh data.
+- Client, viewer and report-viewer accounts can never see or reach this page — it
+  isn't in their sidebar at all, and their normal login has no path to it. The
+  hidden admin login form only appears when this app is opened with the secret
+  `?admin=...` URL value set in `app.py` (`ADMIN_URL_SECRET`).
+
+**Security note:** credentials are stored as SHA-256 hashes in `credentials.json`
+next to this app — never in plain text. Only accounts with the "admin" role can
+create/delete users or reset passwords; client, viewer and report-viewer accounts
+have no access to any credential screen, and never see this tab.
+        """)
 
 
 # ==================================================================================
