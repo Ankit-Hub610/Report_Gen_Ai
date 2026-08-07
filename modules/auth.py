@@ -59,7 +59,13 @@ SESSION_LIFETIME_SECONDS = 7 * 24 * 60 * 60   # 7 days of inactivity before a "s
 ROLE_ADMIN = "admin"
 ROLE_CLIENT = "client"
 ROLE_VIEWER = "viewer"
-ALL_ROLES = (ROLE_ADMIN, ROLE_CLIENT, ROLE_VIEWER)
+ROLE_REPORT_VIEWER = "report_viewer"   # restricted viewer a CLIENT can self-serve create for
+                                        # their own boss/manager — Boss Dashboard page ONLY
+                                        # (full access there: view, PDF export, manage slicers),
+                                        # nothing else in the app. Different from ROLE_VIEWER,
+                                        # which an admin creates and which can look at every
+                                        # page (read-only) — kept as-is for backward compatibility.
+ALL_ROLES = (ROLE_ADMIN, ROLE_CLIENT, ROLE_VIEWER, ROLE_REPORT_VIEWER)
 
 
 def _hash(pw: str) -> str:
