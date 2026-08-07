@@ -53,13 +53,8 @@ import secrets
 import time
 
 CRED_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "credentials.json")
-SESSION_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sessions.json")
-
-# How long a "remember me" login survives a browser refresh / tab reopen with
-# no explicit logout. Long on purpose (Streamlit reruns the whole script on
-# every browser tab refresh, which used to wipe st.session_state and bounce
-# people back to the login screen even though they never clicked Logout).
-SESSION_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days
+SESSIONS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sessions.json")
+SESSION_LIFETIME_SECONDS = 7 * 24 * 60 * 60   # 7 days of inactivity before a "stay logged in" link expires
 
 ROLE_ADMIN = "admin"
 ROLE_CLIENT = "client"
@@ -159,9 +154,15 @@ def get_workspace_id(username: str) -> str:
 def list_users():
     store = _load_store()
     return [
-        {"username": u, "role": info["role"], "workspace_id": info.get("workspace_id", u)}
+        {"username": u, "role": info["role"], "workspace_id": info.get("workspace_id", u), "email": info.get("email", "")}
         for u, info in store["users"].items()
     ]
+
+
+def get_role(username: str):
+    store = _load_store()
+    info = store["users"].get((username or "").strip())
+    return info["role"] if info else None
 
 
 def list_client_usernames():
@@ -170,21 +171,56 @@ def list_client_usernames():
     return [u["username"] for u in list_users() if u["role"] == ROLE_CLIENT]
 
 
-def create_or_update_user(username: str, password_plain: str, role: str, workspace_id: str = None):
+def create_or_update_user(username: str, password_plain: str, role: str, workspace_id: str = None, email: str = None):
     """Creates a new account or updates an existing one's password/role/link.
     workspace_id: which data workspace this account should read/write.
       - If omitted/blank, defaults to the account's own username (a fresh,
         fully independent workspace - the normal case for admin & client
         accounts, and for a standalone viewer).
       - For a viewer account, pass an existing CLIENT's username here to
-        link the viewer to that client's live data instead."""
+        link the viewer to that client's live data instead.
+    email: optional, but required if the account should be able to use
+      "Forgot password" (the reset link goes to this address)."""
     username = (username or "").strip()
     if not username or not password_plain or role not in ALL_ROLES:
         raise ValueError("Username, password and a valid role are required.")
     store = _load_store()
     ws_id = (workspace_id or "").strip() or username
-    store["users"][username] = {"password_hash": _hash(password_plain), "role": role, "workspace_id": ws_id}
+    entry = {"password_hash": _hash(password_plain), "role": role, "workspace_id": ws_id}
+    if email:
+        entry["email"] = email.strip().lower()
+    elif username in store["users"] and store["users"][username].get("email"):
+        entry["email"] = store["users"][username]["email"]   # keep existing email on an update that didn't touch it
+    store["users"][username] = entry
     _save_store(store)
+
+
+def set_email(username: str, email: str):
+    store = _load_store()
+    if username not in store["users"]:
+        raise ValueError(f"User '{username}' does not exist.")
+    store["users"][username]["email"] = (email or "").strip().lower()
+    _save_store(store)
+
+
+def get_email(username: str):
+    store = _load_store()
+    return store["users"].get((username or "").strip(), {}).get("email")
+
+
+def find_username_by_email(email: str):
+    """Case-insensitive lookup. Returns the username, or None if no account
+    uses that email — callers should NOT reveal which case happened (always
+    show the same generic message either way), to avoid leaking who has an
+    account here."""
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+    store = _load_store()
+    for uname, info in store["users"].items():
+        if (info.get("email") or "").lower() == email:
+            return uname
+    return None
 
 
 def change_password(username: str, new_password_plain: str):
@@ -215,81 +251,121 @@ def user_exists(username: str) -> bool:
     return (username or "").strip() in store["users"]
 
 
-# --------------------------------------------------------------------------------
-# PERSISTENT LOGIN SESSIONS (survive a browser tab refresh, without logging
-# anyone in forever). A random token is put in the page's URL query string
-# on login. On every script run (including the rerun caused by hitting the
-# browser's Refresh button) app.py checks that token against this file and,
-# if it's still valid, silently restores the session instead of showing the
-# login screen. The token is only removed - and the session only ends -
-# when the user clicks Logout, or after SESSION_TTL_SECONDS of not being
-# used at all.
-# --------------------------------------------------------------------------------
+# ==================================================================================
+# "STAY LOGGED IN" SESSION TOKENS
+# ----------------------------------------------------------------------------------
+# Streamlit wipes st.session_state on a genuine browser refresh/reload (a new
+# in-memory session starts from scratch), which is why a plain "if not
+# session_state.authenticated: show login" was kicking people back to the
+# login screen just from hitting refresh. To fix that WITHOUT weakening
+# security (i.e. without keeping people logged in forever), we hand out a
+# random, unguessable token on successful login, put it in the page's URL
+# (?s=<token>) so the browser keeps re-sending it on every reload, and look
+# it up here — a token only proves who you are for SESSION_LIFETIME_SECONDS
+# and gets deleted immediately on logout or password change.
+# ==================================================================================
+
 def _load_sessions() -> dict:
-    if not os.path.exists(SESSION_FILE):
+    if not os.path.exists(SESSIONS_FILE):
         return {}
     try:
-        with open(SESSION_FILE, "r") as f:
-            return json.load(f)
+        with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
     except Exception:
         return {}
+    now = time.time()
+    return {tok: v for tok, v in data.items() if v.get("expires", 0) > now}   # drop expired on every read
 
 
 def _save_sessions(sessions: dict):
-    try:
-        with open(SESSION_FILE, "w") as f:
-            json.dump(sessions, f, indent=2)
-    except Exception:
-        pass
+    with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
+        json.dump(sessions, f, indent=2)
 
 
-def _prune_expired(sessions: dict) -> dict:
-    now = time.time()
-    return {tok: s for tok, s in sessions.items() if s.get("expires_at", 0) > now}
-
-
-def create_session(username: str, role: str, workspace_id: str) -> str:
-    """Called right after a successful login. Returns a random token that the
-    caller should stash in st.query_params so it survives a page refresh."""
-    sessions = _prune_expired(_load_sessions())
-    token = secrets.token_urlsafe(32)
-    sessions[token] = {
-        "username": username,
-        "role": role,
-        "workspace_id": workspace_id,
-        "expires_at": time.time() + SESSION_TTL_SECONDS,
-    }
+def create_session(username: str) -> str:
+    """Called right after a successful login. Returns a token to put in the URL."""
+    sessions = _load_sessions()
+    token = secrets.token_urlsafe(24)
+    sessions[token] = {"username": username, "expires": time.time() + SESSION_LIFETIME_SECONDS}
     _save_sessions(sessions)
     return token
 
 
-def validate_session(token: str):
-    """Returns {"username","role","workspace_id"} if the token is a live
-    session, else None. Also re-checks the account still exists (in case it
-    was deleted by an admin since the token was issued) and refreshes the
-    token's expiry so an actively-used tab never gets logged out mid-session."""
+def resolve_session(token: str):
+    """Given a token from the URL, returns the username it belongs to (and
+    silently refreshes its expiry, so an active user's link keeps working),
+    or None if the token is missing/expired/was logged out."""
     if not token:
         return None
-    sessions = _prune_expired(_load_sessions())
-    sess = sessions.get(token)
-    if not sess:
+    sessions = _load_sessions()
+    entry = sessions.get(token)
+    if not entry:
         return None
-    if not user_exists(sess["username"]):
-        del sessions[token]
-        _save_sessions(sessions)
-        return None
-    sess["expires_at"] = time.time() + SESSION_TTL_SECONDS
-    sessions[token] = sess
+    entry["expires"] = time.time() + SESSION_LIFETIME_SECONDS   # sliding expiry: still-active users don't get logged out
     _save_sessions(sessions)
-    return {"username": sess["username"], "role": sess["role"], "workspace_id": sess["workspace_id"]}
+    return entry["username"]
 
 
 def destroy_session(token: str):
-    """Called on explicit Logout - this is the only normal way a session ends
-    before it naturally expires."""
+    """Called on explicit Logout — invalidates the link immediately."""
     if not token:
         return
     sessions = _load_sessions()
     if token in sessions:
         del sessions[token]
         _save_sessions(sessions)
+
+
+# ==================================================================================
+# "FORGOT PASSWORD" RESET TOKENS
+# ----------------------------------------------------------------------------------
+# Same idea as session tokens above, but much shorter-lived (30 minutes) and
+# single-use: a client who forgot their password gets emailed a link
+# containing one of these; visiting it lets them set a new password ONE
+# time, then the token is deleted immediately so the same email link can't
+# be reused later.
+# ==================================================================================
+RESET_LIFETIME_SECONDS = 30 * 60
+RESETS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "password_resets.json")
+
+
+def _load_resets() -> dict:
+    if not os.path.exists(RESETS_FILE):
+        return {}
+    try:
+        with open(RESETS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    now = time.time()
+    return {tok: v for tok, v in data.items() if v.get("expires", 0) > now}
+
+
+def _save_resets(resets: dict):
+    with open(RESETS_FILE, "w", encoding="utf-8") as f:
+        json.dump(resets, f, indent=2)
+
+
+def create_password_reset_token(username: str) -> str:
+    resets = _load_resets()
+    token = secrets.token_urlsafe(24)
+    resets[token] = {"username": username, "expires": time.time() + RESET_LIFETIME_SECONDS}
+    _save_resets(resets)
+    return token
+
+
+def resolve_password_reset_token(token: str):
+    """Returns the username the token belongs to, or None if it's
+    missing/expired/already used. Does NOT delete it — call
+    consume_password_reset_token() only after the new password is
+    successfully set."""
+    if not token:
+        return None
+    return _load_resets().get(token, {}).get("username")
+
+
+def consume_password_reset_token(token: str):
+    resets = _load_resets()
+    if token in resets:
+        del resets[token]
+        _save_resets(resets)
