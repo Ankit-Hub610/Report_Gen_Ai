@@ -1705,15 +1705,13 @@ elif page == "🤖 AI Assistant":
 elif page == "⚙️ Settings":
     st.title("⚙️ Settings")
 
-    # "How This Tool Works" is admin-only — it documents the whole tool including
-    # things clients/viewers shouldn't need (or see) in their day-to-day use, so it
-    # must never be shown to non-admin roles. Only build that tab at all when the
-    # logged-in role is admin; other roles just get the Defaults tab.
+    # "How This Tool Works" is shown to every role — but the CONTENT is scoped to
+    # what that role can actually see/do: everyone gets the walkthrough of the
+    # normal pages (Raw Analysis, Custom Builder, Boss Dashboard, Data Table,
+    # Settings); the Admin Panel section is only appended when the logged-in
+    # role is admin, so client/viewer accounts never learn it exists.
     is_admin_settings = st.session_state.role == auth.ROLE_ADMIN
-    if is_admin_settings:
-        tab_defaults, tab_about = st.tabs(["🎨 Defaults", "ℹ️ How This Tool Works"])
-    else:
-        tab_defaults = st.container()
+    tab_defaults, tab_about = st.tabs(["🎨 Defaults", "ℹ️ How This Tool Works"])
 
     with tab_defaults:
         if st.session_state.role == auth.ROLE_ADMIN:
@@ -1819,13 +1817,13 @@ elif page == "⚙️ Settings":
 
         st.session_state.theme = th
 
-    if is_admin_settings:
-      with tab_about:
+    with tab_about:
         st.subheader("What this tool does")
-        # NOTE: this tab is now admin-only (see is_admin_settings above) - it is
-        # never shown to client/viewer roles. Nothing about the Admin Panel - or
-        # that one even exists - belongs here either; that description lives
-        # ONLY inside the Admin Panel page itself. Keep it that way.
+        # NOTE: shown to every role, but content only ever covers pages every
+        # role can see (Raw Analysis, Custom Builder, Boss Dashboard, Data
+        # Table, Settings). Nothing about the Admin Panel belongs in this
+        # shared text - that section is appended separately below, only when
+        # is_admin_settings is True, so client/viewer never see it.
         st.markdown("""
 **Sports Analytics Platform** turns any spreadsheet-shaped file into a boardroom-ready
 report, without you writing a single formula.
@@ -1885,6 +1883,20 @@ every page to narrow down what's rendered on screen.
 
 **Security note:** your login credentials are never stored in plain text.
         """)
+
+        # Admin-only addendum — client/viewer accounts stop at the section above
+        # and never see that an Admin Panel page even exists.
+        if is_admin_settings:
+            st.divider()
+            st.markdown("""
+**🔐 Admin Panel** *(admin accounts only — not visible to client/viewer)*
+- Manage accounts: create/remove client and viewer logins, assign them to a
+  workspace, reset passwords.
+- Reset a workspace's data (loaded file, Boss Dashboard layout, pinned KPIs,
+  Custom Builder cards) back to empty.
+- See the **ℹ️ About This Panel** tab on the Admin Panel page itself for full
+  details.
+            """)
 
 
 elif page == "🔐 Admin Panel":
