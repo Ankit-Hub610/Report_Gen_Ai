@@ -5,7 +5,11 @@ numpy
 plotly
 reportlab
 openpyxl      # needed to read/write .xlsx files (pd.ExcelFile)
-kaleido       # needed for fig.to_image(...) -> chart PNGs used in the PDF export
+kaleido==0.2.1  # PINNED — newer kaleido (1.x) needs a headless Chrome browser that
+                   # isn't available on Streamlit Cloud by default, so fig.to_image()
+                   # was silently failing and every chart was disappearing from the
+                   # exported PDF. 0.2.1 is the old self-contained static-binary
+                   # version that just works, no Chrome needed.
 pdfplumber    # optional: only needed if you upload PDFs as a data source on Raw Analysis
 requests      # needed for the 🤖 AI Assistant page (talks to the free OpenRouter API)
 sqlalchemy             # 🔌 Database Connector tab — connect to an external SQL database
