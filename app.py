@@ -47,7 +47,7 @@ except ImportError:
 # ==================================================================================
 # PAGE CONFIG
 # ==================================================================================
-st.set_page_config(page_title="Report Gen AI By Ankit Solanki", page_icon="🏆", layout="wide")
+st.set_page_config(page_title="Sports Analytics Platform", page_icon="🏆", layout="wide")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SAMPLE_PATH = os.path.join(APP_DIR, "sample_data", "sample_sports_payments.csv")
@@ -258,6 +258,22 @@ def get_style_dict():
     }
 
 
+def _read_upload(uploaded_file):
+    """Safely reads bytes out of a Streamlit UploadedFile.
+
+    UploadedFile behaves like a one-shot stream: the FIRST time something
+    calls .read() on it you get the real bytes, but on every later Streamlit
+    rerun (every click anywhere on the page re-runs this whole script) the
+    SAME object is handed back already at end-of-stream, so a second
+    .read() silently returns b"" — which then made pandas/Excel parsing
+    blow up with a confusing ValueError, and separately made the PDF
+    wallpaper "disappear" after navigating away and back. seek(0) first,
+    every time, fixes both.
+    """
+    uploaded_file.seek(0)
+    return uploaded_file.read()
+
+
 @st.cache_data(show_spinner=False)
 def _load_and_clean(file_bytes, file_name):
     class _F:
@@ -273,7 +289,7 @@ def _load_and_clean(file_bytes, file_name):
 
 def load_file(uploaded_file):
     """Single-file load (kept for backward compatibility / the sample loader)."""
-    file_bytes = uploaded_file.read()
+    file_bytes = _read_upload(uploaded_file)
     sheets = _load_and_clean(file_bytes, uploaded_file.name)
     if len(sheets) > 1:
         sheet_name = st.selectbox("Multiple sheets found — pick one", list(sheets.keys()), key="sheet_pick")
@@ -309,7 +325,7 @@ def load_files(uploaded_files, combine_mode="stack"):
 
     named_dfs = []
     for f in uploaded_files:
-        file_bytes = f.read()
+        file_bytes = _read_upload(f)
         sheets = _load_and_clean(file_bytes, f.name)
         # if a file itself has multiple sheets, stack/union all of them under that file's name
         for sheet_name, sdf in sheets.items():
@@ -337,7 +353,7 @@ def load_sample():
         st.error("Sample file not found.")
         return
     with open(SAMPLE_PATH, "rb") as f:
-        data = f.read()
+        data = _read_upload(f)
     sheets = _load_and_clean(data, "sample_sports_payments.csv")
     df = sheets["Sheet1"]
     st.session_state.df_raw = df
@@ -527,11 +543,14 @@ def render_slicers(df, meta, key_prefix=""):
     return view
 
 
-def kpi_cards(kpis, pinnable=False, key_prefix="", df=None, filterable=False, number_format="auto"):
+def kpi_cards(kpis, pinnable=False, key_prefix="", df=None, filterable=False, number_format="auto", removable=False):
     """Renders KPI cards in a responsive grid. If pinnable, shows a pin checkbox per card.
     If filterable (needs `df`), every card that represents a plain column aggregation
     (has "column"/"agg" set — see de.compute_kpis) gets its OWN "➕ Filter this card"
-    popover, independent of every other card and independent of the page-level filter."""
+    popover, independent of every other card and independent of the page-level filter.
+    If removable, shows a 🗑️ button that unpins the card right here (e.g. on the Boss
+    Dashboard) — same effect as un-ticking its ⭐ back on Raw Analysis, but without
+    having to leave the page to do it."""
     n_cols = 4
     store = st.session_state.p1_kpi_filters
     for row_start in range(0, len(kpis), n_cols):
@@ -566,6 +585,12 @@ def kpi_cards(kpis, pinnable=False, key_prefix="", df=None, filterable=False, nu
                         st.session_state.pinned_kpis.append(label)
                     if not new_val and label in st.session_state.pinned_kpis:
                         st.session_state.pinned_kpis.remove(label)
+                if removable:
+                    if st.button("🗑️ Remove", key=f"{key_prefix}rm_{label}_{row_start}_{j}",
+                                  help="Unpin this card from the dashboard", use_container_width=True):
+                        if label in st.session_state.pinned_kpis:
+                            st.session_state.pinned_kpis.remove(label)
+                        st.rerun()
 
 
 def chart_in_dashboard(family, variant_id):
@@ -801,13 +826,31 @@ with st.sidebar:
 # PAGE 0: CONNECT DATA (always the first step — file upload OR live database)
 # ==================================================================================
 if page == "📥 Connect Data":
-    st.title("📥 Connect Data")
-    st.caption("Every other page (Raw Analysis, Boss Dashboard, Data Table) works off whatever dataset is "
-               "loaded here. Pick a source, load it once, then go build your analysis.")
+    top_l, top_r = st.columns([5, 1])
+    with top_l:
+        st.title("📥 Connect Data")
+        st.caption("Every other page (Raw Analysis, Boss Dashboard, Data Table) works off whatever dataset is "
+                   "loaded here. Pick a source, load it once, then go build your analysis.")
+    with top_r:
+        st.write("")
+        if st.button("🔄 Refresh", help="Re-check the currently loaded dataset / clear a stuck upload and start over",
+                     use_container_width=True):
+            st.session_state._last_upload_sig = None
+            st.rerun()
 
     if st.session_state.df_raw is not None:
         st.success(f"🟢 Currently loaded: **{st.session_state.data_source_name}** "
                    f"({len(st.session_state.df_raw):,} rows × {len(st.session_state.df_raw.columns)} cols)")
+        if can_edit() and st.button("🗑️ Clear loaded data (start over with a new file/database)"):
+            st.session_state.df_raw = None
+            st.session_state.meta = None
+            st.session_state.data_source_name = None
+            st.session_state.filters = {}
+            st.session_state.dashboard_charts = []
+            st.session_state.pinned_kpis = []
+            st.session_state.dashboard_slicers = []
+            st.session_state._last_upload_sig = None
+            st.rerun()
 
     if can_edit():
         src_tab_file, src_tab_db = st.tabs(["📁 Upload File", "🔌 Connect Database"])
@@ -831,10 +874,19 @@ if page == "📥 Connect Data":
                         combine_mode = "stack" if combine_label.startswith("Stack") else "columns"
                         if st.button(f"🔗 Combine & Load {len(uploaded)} files", type="primary"):
                             if load_files(uploaded, combine_mode=combine_mode) is not None:
+                                st.session_state._last_upload_sig = None  # multi-file combos aren't cheaply re-checked; just don't re-trigger single-file path
                                 st.rerun()
                     else:
-                        if load_file(uploaded[0]) is not None:
-                            st.rerun()
+                        # Streamlit re-runs this whole script on every click anywhere on the page,
+                        # and `uploaded` still holds the same file as long as it's sitting in the
+                        # uploader — so without this guard, load_file() re-ran (and errored, since
+                        # the file's stream was already consumed) on every single interaction, not
+                        # just right after a genuine new upload.
+                        sig = (uploaded[0].name, uploaded[0].size)
+                        if st.session_state.get("_last_upload_sig") != sig:
+                            if load_file(uploaded[0]) is not None:
+                                st.session_state._last_upload_sig = sig
+                                st.rerun()
             with sample_col:
                 st.write("")
                 st.write("")
@@ -1136,7 +1188,7 @@ elif page == "⭐ Boss Dashboard":
             th["show_labels"] = st.checkbox("Show data labels", th["show_labels"])
         wallpaper = st.file_uploader("PDF background wallpaper (optional, PNG/JPG)", type=["png", "jpg", "jpeg"], key="wallpaper_up")
         if wallpaper is not None:
-            th["wallpaper_bytes"] = wallpaper.read()
+            th["wallpaper_bytes"] = _read_upload(wallpaper)
         if th.get("wallpaper_bytes") and st.button("Remove wallpaper"):
             th["wallpaper_bytes"] = None
         st.session_state.theme = th
@@ -1155,7 +1207,7 @@ elif page == "⭐ Boss Dashboard":
                 "or build your own on the Custom Builder page.")
     else:
         if pinned:
-            kpi_cards(pinned, pinnable=False)
+            kpi_cards(pinned, pinnable=False, removable=can_edit(), key_prefix="p2_")
         if pinned_custom_kpis:
             st.caption("🧩 Custom KPI cards")
             for row_start in range(0, len(pinned_custom_kpis), 4):
@@ -1163,6 +1215,10 @@ elif page == "⭐ Boss Dashboard":
                 for j, card in enumerate(pinned_custom_kpis[row_start:row_start + 4]):
                     with cols[j]:
                         be.render_kpi_card_value(df, card)
+                        if can_edit() and st.button("🗑️ Remove", key=f"p2_rm_custom_kpi_{card['id']}",
+                                                      help="Unpin this card from the dashboard", use_container_width=True):
+                            card["pinned"] = False
+                            st.rerun()
 
     st.divider()
 
