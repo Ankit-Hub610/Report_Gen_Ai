@@ -165,21 +165,34 @@ def can_edit_dashboard() -> bool:
     return st.session_state.role in (auth.ROLE_ADMIN, auth.ROLE_CLIENT, auth.ROLE_REPORT_VIEWER)
 
 
-def sync_workspace_from_disk():
+def sync_workspace_from_disk(force: bool = False):
     """Call once near the top of every run, AFTER the effective workspace_id
     for this run is known. If it's different from what's currently sitting
     in session_state (first login, or an admin just switched 'view as'),
     load that workspace's saved data from disk - never invents empty state
-    for a workspace, and never bleeds one workspace's data into another."""
+    for a workspace, and never bleeds one workspace's data into another.
+
+    force=True re-pulls the latest saved copy even when the workspace_id
+    hasn't changed. Used on the Boss Dashboard page so that a client and
+    their linked report-viewer(s) - who are two separate browser sessions
+    sharing the SAME workspace - each see the other's changes (pinned/
+    swapped charts, slicer picks, theme tweaks...) the moment they next
+    interact with that page, instead of only after logging in fresh.
+    Safe to do: auto-save (bottom of this file) writes the full current
+    state to disk after EVERY single interaction in EVERY session sharing
+    this workspace, so what's on disk is always at most a few hundred ms
+    behind the most recent change from anyone."""
     ss = st.session_state
     wsid = effective_workspace_id()
-    if ss.get("_loaded_workspace_id") == wsid:
+    workspace_changed = ss.get("_loaded_workspace_id") != wsid
+    if not workspace_changed and not force:
         return
-    for k in ws.PERSISTED_KEYS:
-        ss[k] = [] if isinstance(ss.get(k), list) else None
-    ss["filters"] = {}
-    ss["p3_sql_result"] = None  # SQL Query tab result belongs to the previous workspace — drop it on switch
-    ss["p3_sql_error"] = None
+    if workspace_changed:
+        for k in ws.PERSISTED_KEYS:
+            ss[k] = [] if isinstance(ss.get(k), list) else None
+        ss["filters"] = {}
+        ss["p3_sql_result"] = None  # SQL Query tab result belongs to the previous workspace — drop it on switch
+        ss["p3_sql_error"] = None
     saved = ws.load(wsid)
     if saved:
         for k, v in saved.items():
@@ -1292,6 +1305,13 @@ elif page == "🧩 Custom Builder":
 # PAGE 2: BOSS DASHBOARD
 # ==================================================================================
 elif page == "⭐ Boss Dashboard":
+    # Pull the latest saved state for this workspace every time this page runs -
+    # a client and their linked report-viewer(s) are separate browser sessions
+    # sharing one workspace, so this is what makes one person's change (pinned/
+    # swapped charts, slicers, theme...) show up for the other. See the
+    # docstring on sync_workspace_from_disk() for why this is safe.
+    sync_workspace_from_disk(force=True)
+
     if can_edit_dashboard():
         name_col, _ = st.columns([3, 2])
         with name_col:
@@ -1303,6 +1323,18 @@ elif page == "⭐ Boss Dashboard":
     else:
         st.title(st.session_state.dashboard_name or "⭐ Boss Dashboard")
     st.caption("Only what you picked shows up here. Style it, swap any chart, then export a clean PDF.")
+
+    if AUTOREFRESH_AVAILABLE:
+        ar_col1, ar_col2 = st.columns([1, 3])
+        with ar_col1:
+            live_sync = st.checkbox("🔄 Live sync", value=False,
+                                     help="Automatically pull in changes made by anyone else viewing/editing "
+                                          "this same dashboard (client ↔ their report-viewers), without you "
+                                          "needing to click anything.")
+        if live_sync:
+            with ar_col2:
+                live_interval = st.slider("Every (seconds)", 5, 60, 10, key="boss_live_sync_interval")
+            st_autorefresh(interval=live_interval * 1000, key="boss_dashboard_live_sync")
 
     if st.session_state.df_raw is None:
         st.info("Load data on the **📥 Connect Data** page first.")
