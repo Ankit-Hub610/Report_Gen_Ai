@@ -154,6 +154,17 @@ def can_edit() -> bool:
     return st.session_state.role in (auth.ROLE_ADMIN, auth.ROLE_CLIENT)
 
 
+def can_edit_dashboard() -> bool:
+    """Like can_edit(), but ALSO true for a 'report_viewer' (a restricted
+    account a client can self-serve create for their own boss/manager —
+    see Settings → My Report Viewers). A report_viewer only ever sees the
+    Boss Dashboard page at all (everything else is hidden from their
+    sidebar), but gets FULL control of what they do see there: pin/unpin
+    cards, manage slicers, tweak the theme, export PDF — same as a client,
+    just scoped to that one page."""
+    return st.session_state.role in (auth.ROLE_ADMIN, auth.ROLE_CLIENT, auth.ROLE_REPORT_VIEWER)
+
+
 def sync_workspace_from_disk():
     """Call once near the top of every run, AFTER the effective workspace_id
     for this run is known. If it's different from what's currently sitting
@@ -511,18 +522,23 @@ def render_filters(df, meta, key_prefix=""):
 SLICER_STYLES = ["Dropdown", "Vertical list", "Tile"]
 
 
-def render_slicers(df, meta, key_prefix=""):
+def render_slicers(df, meta, key_prefix="", editable=None):
     """Power-BI style slicers: unlike the generic 'Filters' expander above
     (which always lists every column, tucked away collapsed), a slicer is a
     report element YOU explicitly add for one chosen field, in a chosen visual
     style, and it stays visible on the dashboard itself. Returns the further-
     filtered dataframe (applied on top of whatever render_filters() already
-    narrowed down)."""
+    narrowed down).
+    `editable` lets the caller override the default can_edit() gate — Boss
+    Dashboard passes can_edit_dashboard() so a report_viewer (who can only
+    ever reach that one page) gets full slicer control there too."""
+    if editable is None:
+        editable = can_edit()
     slicers = st.session_state.dashboard_slicers
     all_cols = list(df.columns)
 
     with st.expander("🎚️ Manage Slicers (pick which fields show as filter widgets on this dashboard)", expanded=False):
-        if not can_edit():
+        if not editable:
             st.caption("View-only account — slicer setup is managed by your admin/client.")
         else:
             used_fields = [s["field"] for s in slicers]
@@ -873,6 +889,8 @@ with st.sidebar:
 
     nav_options = ["📥 Connect Data", "📊 Raw Analysis", "🧩 Custom Builder", "⭐ Boss Dashboard", "🗂 Data Table",
                     "🤖 AI Assistant", "⚙️ Settings"]
+    if st.session_state.role == auth.ROLE_REPORT_VIEWER:
+        nav_options = ["⭐ Boss Dashboard", "⚙️ Settings"]   # nothing else exists for this account
     if st.session_state.role == auth.ROLE_ADMIN:
         nav_options.append("🔐 Admin Panel")
     page = st.radio("Navigate", nav_options, label_visibility="collapsed")
@@ -1222,7 +1240,7 @@ elif page == "🧩 Custom Builder":
 # PAGE 2: BOSS DASHBOARD
 # ==================================================================================
 elif page == "⭐ Boss Dashboard":
-    if can_edit():
+    if can_edit_dashboard():
         name_col, _ = st.columns([3, 2])
         with name_col:
             new_name = st.text_input("Dashboard name", value=st.session_state.dashboard_name or "⭐ Boss Dashboard",
@@ -1272,7 +1290,7 @@ elif page == "⭐ Boss Dashboard":
         st.session_state.theme = th
 
     df = render_filters(df_raw, meta, key_prefix="p2_")
-    df = render_slicers(df, meta, key_prefix="p2_")
+    df = render_slicers(df, meta, key_prefix="p2_", editable=can_edit_dashboard())
     style = get_style_dict()
 
     # ---- Pinned KPIs ----
@@ -1285,7 +1303,7 @@ elif page == "⭐ Boss Dashboard":
                 "or build your own on the Custom Builder page.")
     else:
         if pinned:
-            kpi_cards(pinned, pinnable=False, removable=can_edit(), key_prefix="p2_")
+            kpi_cards(pinned, pinnable=False, removable=can_edit_dashboard(), key_prefix="p2_")
         if pinned_custom_kpis:
             st.caption("🧩 Custom KPI cards")
             for row_start in range(0, len(pinned_custom_kpis), 4):
@@ -1293,7 +1311,7 @@ elif page == "⭐ Boss Dashboard":
                 for j, card in enumerate(pinned_custom_kpis[row_start:row_start + 4]):
                     with cols[j]:
                         be.render_kpi_card_value(df, card)
-                        if can_edit() and st.button("🗑️ Remove", key=f"p2_rm_custom_kpi_{card['id']}",
+                        if can_edit_dashboard() and st.button("🗑️ Remove", key=f"p2_rm_custom_kpi_{card['id']}",
                                                       help="Unpin this card from the dashboard", use_container_width=True):
                             card["pinned"] = False
                             st.rerun()
@@ -1317,7 +1335,7 @@ elif page == "⭐ Boss Dashboard":
                 with top1:
                     st.markdown(f"**🧩 {be.CHART_ICONS.get(chart['type'],'')} {chart['title']}**")
                 with top3:
-                    if can_edit() and st.button("🗑️", key=f"rm_custom_{chart['id']}", help="Unpin from dashboard"):
+                    if can_edit_dashboard() and st.button("🗑️", key=f"rm_custom_{chart['id']}", help="Unpin from dashboard"):
                         chart["pinned"] = False
                         st.rerun()
 
@@ -1352,7 +1370,7 @@ elif page == "⭐ Boss Dashboard":
                 with top1:
                     st.markdown(f"**{FAMILY_ICONS.get(fam,'')} {fam}**")
                 with top2:
-                    if options and can_edit():
+                    if options and can_edit_dashboard():
                         default_idx = options.index(variant["id"]) if variant["id"] in options else 0
                         chosen_id = st.selectbox("Swap analysis", options, index=default_idx,
                                                   format_func=lambda x: labels.get(x, x),
@@ -1360,7 +1378,7 @@ elif page == "⭐ Boss Dashboard":
                         variant = id_to_variant[chosen_id]
                         entry["variant"] = variant
                 with top3:
-                    if can_edit() and st.button("🗑️", key=f"rm_{widget_key}", help="Remove from dashboard"):
+                    if can_edit_dashboard() and st.button("🗑️", key=f"rm_{widget_key}", help="Remove from dashboard"):
                         remove_from_dashboard(fam, entry["variant"]["id"])
                         st.rerun()
 
@@ -1748,7 +1766,14 @@ elif page == "🤖 AI Assistant":
 elif page == "⚙️ Settings":
     st.title("⚙️ Settings")
 
-    tab_defaults, tab_account, tab_about = st.tabs(["🎨 Defaults", "🔑 My Account", "ℹ️ How This Tool Works"])
+    tab_names = ["🎨 Defaults", "🔑 My Account"]
+    if st.session_state.role == auth.ROLE_CLIENT:
+        tab_names.append("👥 My Report Viewers")
+    tab_names.append("ℹ️ How This Tool Works")
+    tabs = st.tabs(tab_names)
+    tab_defaults, tab_account = tabs[0], tabs[1]
+    tab_report_viewers = tabs[2] if st.session_state.role == auth.ROLE_CLIENT else None
+    tab_about = tabs[-1]
 
     with tab_account:
         st.subheader("Change my password")
@@ -1778,6 +1803,71 @@ elif page == "⚙️ Settings":
             if st.form_submit_button("Save email"):
                 auth.set_email(st.session_state.username, new_email)
                 st.success("Email saved.")
+
+    if tab_report_viewers is not None:
+        with tab_report_viewers:
+            st.subheader("Give your boss/manager their own login")
+            st.caption(
+                "Creates a **Report Viewer** account, locked to only your data. They can log in from "
+                "anywhere (no need to be in the same room as you) and will see **only the Boss "
+                "Dashboard** — nothing else in this app. There they get full control: view everything, "
+                "**export PDF**, and **manage slicers** (add/remove/change which filter fields show). "
+                "They can never see your other data, other clients' data, or reach any other page. "
+                "Your admin can always see and manage these accounts too."
+            )
+            my_report_viewers = [u for u in auth.list_users()
+                                  if u["role"] == auth.ROLE_REPORT_VIEWER
+                                  and u["workspace_id"] == st.session_state.workspace_id]
+            if my_report_viewers:
+                st.table([{"Username": u["username"], "Email": u["email"] or "—"} for u in my_report_viewers])
+
+            st.divider()
+            st.subheader("Create a new Report Viewer login")
+            with st.form("client_create_report_viewer"):
+                rv_u = st.text_input("Username")
+                rv_p1 = st.text_input("Password", type="password")
+                rv_p2 = st.text_input("Confirm password", type="password")
+                rv_email = st.text_input("Their email (optional, needed only for their own 'Forgot password')")
+                if st.form_submit_button("Create login", type="primary"):
+                    if not rv_u.strip() or not rv_p1:
+                        st.error("Username and password cannot be empty.")
+                    elif rv_p1 != rv_p2:
+                        st.error("Passwords do not match.")
+                    elif auth.user_exists(rv_u.strip()):
+                        st.error(f"'{rv_u.strip()}' is already taken — pick another username.")
+                    else:
+                        # workspace_id is forced to YOUR OWN workspace — a client can never grant
+                        # a report-viewer login access to anyone else's data, even by mistake.
+                        auth.create_or_update_user(rv_u.strip(), rv_p1, auth.ROLE_REPORT_VIEWER,
+                                                    workspace_id=st.session_state.workspace_id, email=rv_email.strip())
+                        st.success(f"'{rv_u.strip()}' can now log in and will see your Boss Dashboard.")
+                        st.rerun()
+
+            if my_report_viewers:
+                st.divider()
+                st.subheader("Reset a password / remove access")
+                sel_rv = st.selectbox("Account", [u["username"] for u in my_report_viewers])
+                rc1, rc2 = st.columns(2)
+                with rc1:
+                    with st.form("client_reset_rv_pw"):
+                        nrp1 = st.text_input("New password", type="password", key="nrp1")
+                        nrp2 = st.text_input("Confirm new password", type="password", key="nrp2")
+                        if st.form_submit_button("Reset their password"):
+                            if not nrp1 or nrp1 != nrp2:
+                                st.error("Passwords are empty or don't match.")
+                            else:
+                                auth.change_password(sel_rv, nrp1)
+                                st.success(f"Password reset for '{sel_rv}'.")
+                with rc2:
+                    st.write("")
+                    st.write("")
+                    if st.button(f"🗑️ Remove '{sel_rv}' access", use_container_width=True):
+                        try:
+                            auth.delete_user(sel_rv, st.session_state.username)
+                            st.success(f"'{sel_rv}' can no longer log in.")
+                            st.rerun()
+                        except ValueError as e:
+                            st.error(str(e))
 
     with tab_defaults:
         if st.session_state.role == auth.ROLE_ADMIN:
@@ -1980,8 +2070,13 @@ elif page == "🔐 Admin Panel":
         st.caption(
             "**Client** — a business/customer account with its own independent data workspace: they "
             "can upload data, build dashboards, everything except the Admin Panel.  \n"
-            "**Viewer** — read-only. Can look at reports but never upload/change anything. Either gets "
-            "its own empty workspace, or you link it to an existing client's data below.  \n"
+            "**Viewer** — read-only, sees every page. Can look at reports but never upload/change "
+            "anything. Either gets its own empty workspace, or you link it to an existing client's "
+            "data below.  \n"
+            "**Report Viewer** — restricted to ONLY the Boss Dashboard page (nothing else in the app "
+            "even shows in their sidebar) but gets full control there: view, export PDF, manage "
+            "slicers. Meant for a client's own boss/manager — clients can also create these "
+            "themselves from their own Settings page, without needing you.  \n"
             "**Admin** — full control, same as your own account (use sparingly)."
         )
         with st.form("create_account"):
@@ -1989,14 +2084,14 @@ elif page == "🔐 Admin Panel":
             np1 = st.text_input("Password", type="password")
             np2 = st.text_input("Confirm password", type="password")
             nu_email = st.text_input("Email (optional, but needed for this account's 'Forgot password' to work)")
-            role_choice = st.radio("Role", ["Client", "Viewer", "Admin"], horizontal=True)
+            role_choice = st.radio("Role", ["Client", "Viewer", "Report Viewer", "Admin"], horizontal=True)
 
             client_options = auth.list_client_usernames()
             link_choice = None
-            if role_choice == "Viewer" and client_options:
+            if role_choice in ("Viewer", "Report Viewer") and client_options:
                 link_choice = st.selectbox(
-                    "Data access for this viewer",
-                    ["Give this viewer their own independent (empty) data workspace"] +
+                    "Data access for this account",
+                    ["Give it its own independent (empty) data workspace"] +
                     [f"Share data with client: {c}" for c in client_options],
                 )
 
@@ -2007,10 +2102,11 @@ elif page == "🔐 Admin Panel":
                 elif np1 != np2:
                     st.error("Passwords do not match.")
                 else:
-                    role_map = {"Client": auth.ROLE_CLIENT, "Viewer": auth.ROLE_VIEWER, "Admin": auth.ROLE_ADMIN}
+                    role_map = {"Client": auth.ROLE_CLIENT, "Viewer": auth.ROLE_VIEWER,
+                                "Report Viewer": auth.ROLE_REPORT_VIEWER, "Admin": auth.ROLE_ADMIN}
                     role = role_map[role_choice]
                     workspace_id = None  # defaults to the account's own username
-                    if role == auth.ROLE_VIEWER and link_choice and link_choice.startswith("Share data with client: "):
+                    if role in (auth.ROLE_VIEWER, auth.ROLE_REPORT_VIEWER) and link_choice and link_choice.startswith("Share data with client: "):
                         workspace_id = link_choice.replace("Share data with client: ", "")
                     auth.create_or_update_user(nu.strip(), np1, role, workspace_id=workspace_id, email=nu_email.strip())
                     st.success(f"Account '{nu.strip()}' saved as {role_choice}"
