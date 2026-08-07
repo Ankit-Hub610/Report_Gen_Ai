@@ -37,6 +37,7 @@ from modules import workspace_store as ws
 from modules import query_engine as qe
 from modules import db_connector as dbc
 from modules import ai_chat as ac
+from modules import email_service as es
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -47,7 +48,7 @@ except ImportError:
 # ==================================================================================
 # PAGE CONFIG
 # ==================================================================================
-st.set_page_config(page_title="Report Gen AI By Ankit_Solanki", page_icon="🏆", layout="wide")
+st.set_page_config(page_title="Sports Analytics Platform", page_icon="🏆", layout="wide")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SAMPLE_PATH = os.path.join(APP_DIR, "sample_data", "sample_sports_payments.csv")
@@ -111,7 +112,6 @@ def init_state():
     ss.setdefault("pinned_kpis", [])        # list of kpi labels pinned to dashboard
     ss.setdefault("p1_kpi_filters", {})     # {kpi_label: [filter,...]} — per-card filters, Raw Analysis KPI cards
     ss.setdefault("p1_kpi_number_format", "auto")  # global number format toolbar, Raw Analysis KPI cards
-    ss.setdefault("p2_kpi_number_format", "auto")  # global number format toolbar, Boss Dashboard KPI cards
     ss.setdefault("page", "Connect Data")
     ss.setdefault("data_source_name", None)
     ss.setdefault("custom_kpis", [])        # list of user-built KPI card dicts (Custom Builder)
@@ -197,30 +197,8 @@ ADMIN_URL_KEY = "admin"
 ADMIN_URL_SECRET = "SET-YOUR-OWN-SECRET-HERE"
 
 
-def _start_session(username: str, role: str):
-    """Call right after a successful login: creates a persistent session
-    token, puts it in the URL (so a browser refresh doesn't log the person
-    out) and remembers it in session_state (so Logout can invalidate it)."""
-    workspace_id = auth.get_workspace_id(username)
-    token = auth.create_session(username, role, workspace_id)
-    st.session_state.authenticated = True
-    st.session_state.username = username
-    st.session_state.role = role
-    st.session_state.workspace_id = workspace_id
-    st.session_state._session_token = token
-    st.query_params["stoken"] = token
-
-
 def login_screen():
-    st.markdown("""
-<h1 style='text-align:center; margin-bottom:0;'>
-A | R - Analytics Resarch Platform
-</h1>
-
-<h4 style='text-align:center; color:gray; margin-top:5px; font-weight:normal;'>
-Powered by <b>Ankit Solanki</b>
-</h4>
-""", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align:center;'>🏆 Sports Analytics Platform</h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
@@ -231,10 +209,37 @@ Powered by <b>Ankit Solanki</b>
             if submitted:
                 role = auth.verify_login(u, p)
                 if role:
-                    _start_session(u.strip(), role)
+                    st.session_state.authenticated = True
+                    st.session_state.username = u.strip()
+                    st.session_state.role = role
+                    st.session_state.workspace_id = auth.get_workspace_id(u.strip())
+                    st.query_params["s"] = auth.create_session(u.strip())  # survives a browser refresh
                     st.rerun()
                 else:
                     st.error("Invalid username or password.")
+
+        with st.expander("Forgot password?"):
+            with st.form("forgot_pw_form"):
+                fp_email = st.text_input("Your account's email address")
+                fp_submit = st.form_submit_button("Send reset link")
+                if fp_submit:
+                    uname = auth.find_username_by_email(fp_email)
+                    if uname:
+                        token = auth.create_password_reset_token(uname)
+                        try:
+                            base_url = st.secrets.get("APP_BASE_URL", "")
+                        except Exception:
+                            base_url = ""
+                        if not base_url:
+                            base_url = "https://reportgenai-2uk4jqmjulsachx5vgg6wz.streamlit.app/"  # fallback if APP_BASE_URL secret isn't set
+                        reset_url = f"{base_url.rstrip('/')}/?reset={token}"
+                        ok, msg = es.send_password_reset_email(fp_email.strip(), uname, reset_url)
+                        if not ok:
+                            st.error(msg)   # a real send failure (e.g. not configured) - safe to show, no account info leaked
+                    # Same message whether or not the email matched an account, on purpose -
+                    # otherwise this box could be used to check who has an account here.
+                    st.success("If that email is on an account here, a reset link has been sent "
+                               "(check spam too). It expires in 30 minutes.")
 
         admin_link_used = st.query_params.get(ADMIN_URL_KEY) == ADMIN_URL_SECRET
         if admin_link_used:
@@ -246,29 +251,68 @@ Powered by <b>Ankit Solanki</b>
                 admin_submitted = st.form_submit_button("Admin Login", use_container_width=True)
                 if admin_submitted:
                     if auth.verify_admin_login(au, ap):
-                        _start_session(au.strip(), auth.ROLE_ADMIN)
+                        st.session_state.authenticated = True
+                        st.session_state.username = au.strip()
+                        st.session_state.role = auth.ROLE_ADMIN
+                        st.session_state.workspace_id = auth.get_workspace_id(au.strip())
+                        st.query_params["s"] = auth.create_session(au.strip())
                         st.rerun()
                     else:
                         st.error("Invalid admin username or password.")
 
 
+def reset_password_screen(token: str):
+    """Shown instead of the normal login screen when the URL has ?reset=<token>
+    (i.e. the person clicked the link from their "forgot password" email)."""
+    st.markdown("<h1 style='text-align:center;'>🔑 Set a new password</h1>", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col2:
+        uname = auth.resolve_password_reset_token(token)
+        if not uname:
+            st.error("This reset link is invalid or has expired (links only work for 30 minutes "
+                      "and only once). Go back and request a new one.")
+            if st.button("← Back to login"):
+                del st.query_params["reset"]
+                st.rerun()
+            return
+        st.caption(f"Setting a new password for **{uname}**.")
+        with st.form("forgot_reset_pw_form"):
+            np1 = st.text_input("New password", type="password")
+            np2 = st.text_input("Confirm new password", type="password")
+            submit = st.form_submit_button("Set new password", use_container_width=True)
+            if submit:
+                if not np1 or np1 != np2:
+                    st.error("Passwords are empty or don't match.")
+                else:
+                    auth.change_password(uname, np1)
+                    auth.consume_password_reset_token(token)   # one-time use — dead now regardless of outcome
+                    del st.query_params["reset"]
+                    st.success("Password updated! You can log in with it now.")
+                    st.button("← Go to login")  # just a visual nudge; the query param is already cleared
+
+
+_reset_token = st.query_params.get("reset")
+if _reset_token and not st.session_state.authenticated:
+    reset_password_screen(_reset_token)
+    st.stop()
+
+# A genuine browser refresh wipes st.session_state (a brand-new Streamlit session
+# starts), which used to bounce people straight back to the login screen just for
+# hitting F5/reload. Before falling back to the login screen, check the ?s=...
+# token Streamlit kept in the URL across that reload — if it's still valid, log
+# the person back in silently instead of making them type their password again.
 if not st.session_state.authenticated:
-    # Before showing the login screen, see if this browser tab is carrying a
-    # still-valid "remember me" token in its URL (put there on a previous
-    # login by _start_session() below). If so, this is just a page refresh /
-    # reopened tab, not a real logout - restore the session silently instead
-    # of forcing the person to log in again.
-    _restore_tok = st.query_params.get("stoken")
-    _restored = auth.validate_session(_restore_tok) if _restore_tok else None
-    if _restored:
+    _session_token = st.query_params.get("s")
+    _resolved_user = auth.resolve_session(_session_token) if _session_token else None
+    if _resolved_user and auth.user_exists(_resolved_user):
         st.session_state.authenticated = True
-        st.session_state.username = _restored["username"]
-        st.session_state.role = _restored["role"]
-        st.session_state.workspace_id = _restored["workspace_id"]
-        st.session_state._session_token = _restore_tok
-    else:
-        login_screen()
-        st.stop()
+        st.session_state.username = _resolved_user
+        st.session_state.role = auth.get_role(_resolved_user)
+        st.session_state.workspace_id = auth.get_workspace_id(_resolved_user)
+
+if not st.session_state.authenticated:
+    login_screen()
+    st.stop()
 
 
 # ==================================================================================
@@ -798,8 +842,7 @@ with st.sidebar:
         f"font-family:{_b['font_family']}; margin-bottom:0.2rem;'>{_b['text']}</div>",
         unsafe_allow_html=True,
     )
-    st.caption(f"👤 **{st.session_state.username}**")
-    st.caption(f"📌 Platform Understanding :- click (⚙️Settings) | (❓How_this_tool_works)")
+    st.caption(f"Logged in as **{st.session_state.username}** ({st.session_state.role})")
 
     # ---- Admin-only: "View as" a client/viewer workspace ------------------------
     # Admin has no data of its own - it borrows whichever account's workspace is
@@ -845,16 +888,15 @@ with st.sidebar:
         st.caption("👁️ View-only account — you can look at reports here but not upload data or change dashboards.")
     st.divider()
     if st.button("🚪 Logout", use_container_width=True):
-        auth.destroy_session(st.session_state.get("_session_token"))
-        if "stoken" in st.query_params:
-            del st.query_params["stoken"]
+        auth.destroy_session(st.query_params.get("s"))   # invalidate the "stay logged in" link server-side
+        if "s" in st.query_params:
+            del st.query_params["s"]
         st.session_state.authenticated = False
         st.session_state.username = None
         st.session_state.role = None
         st.session_state.workspace_id = None
         st.session_state.view_as_workspace = None
         st.session_state._loaded_workspace_id = None
-        st.session_state._session_token = None
         st.rerun()
 
 
@@ -1235,14 +1277,7 @@ elif page == "⭐ Boss Dashboard":
 
     # ---- Pinned KPIs ----
     st.subheader("Key Performance Indicators")
-    if can_edit():
-        with st.expander("🌐 Global number format (applies to every Total/Avg card on this dashboard)", expanded=False):
-            fmt_labels = {"auto": "Auto (Cr / L / K)", "full": "Full number (no abbreviation)", "compact": "Compact (K / M / B)"}
-            cur = st.session_state.p2_kpi_number_format
-            choice = st.selectbox("Number format", list(fmt_labels.keys()), format_func=lambda k: fmt_labels[k],
-                                   index=list(fmt_labels.keys()).index(cur), key="p2_fmt_select")
-            st.session_state.p2_kpi_number_format = choice
-    all_kpis = de.compute_kpis(df, meta, number_format=st.session_state.p2_kpi_number_format)
+    all_kpis = de.compute_kpis(df, meta)
     pinned = [k for k in all_kpis if k["label"] in st.session_state.pinned_kpis]
     pinned_custom_kpis = [c for c in st.session_state.custom_kpis if c.get("pinned")]
     if not pinned and not pinned_custom_kpis:
@@ -1250,8 +1285,7 @@ elif page == "⭐ Boss Dashboard":
                 "or build your own on the Custom Builder page.")
     else:
         if pinned:
-            kpi_cards(pinned, pinnable=False, removable=can_edit(), key_prefix="p2_",
-                      number_format=st.session_state.p2_kpi_number_format)
+            kpi_cards(pinned, pinnable=False, removable=can_edit(), key_prefix="p2_")
         if pinned_custom_kpis:
             st.caption("🧩 Custom KPI cards")
             for row_start in range(0, len(pinned_custom_kpis), 4):
@@ -1714,13 +1748,36 @@ elif page == "🤖 AI Assistant":
 elif page == "⚙️ Settings":
     st.title("⚙️ Settings")
 
-    # "How This Tool Works" is shown to every role — but the CONTENT is scoped to
-    # what that role can actually see/do: everyone gets the walkthrough of the
-    # normal pages (Raw Analysis, Custom Builder, Boss Dashboard, Data Table,
-    # Settings); the Admin Panel section is only appended when the logged-in
-    # role is admin, so client/viewer accounts never learn it exists.
-    is_admin_settings = st.session_state.role == auth.ROLE_ADMIN
-    tab_defaults, tab_about = st.tabs(["🎨 Defaults", "ℹ️ How This Tool Works"])
+    tab_defaults, tab_account, tab_about = st.tabs(["🎨 Defaults", "🔑 My Account", "ℹ️ How This Tool Works"])
+
+    with tab_account:
+        st.subheader("Change my password")
+        st.caption("Only changes **your own** login — no one else's password or data is affected, "
+                   "and your admin can still reset your password if you ever get locked out.")
+        with st.form("self_change_pw"):
+            cur_pw = st.text_input("Current password", type="password", key="self_cur_pw")
+            np1 = st.text_input("New password", type="password", key="self_new_pw1")
+            np2 = st.text_input("Confirm new password", type="password", key="self_new_pw2")
+            submit = st.form_submit_button("Update my password")
+            if submit:
+                if not auth.verify_login(st.session_state.username, cur_pw):
+                    st.error("Current password is incorrect.")
+                elif not np1 or np1 != np2:
+                    st.error("New passwords are empty or don't match.")
+                else:
+                    auth.change_password(st.session_state.username, np1)
+                    st.success("Password updated. Use it next time you log in.")
+
+        st.divider()
+        st.subheader("My email (for 'Forgot password' recovery)")
+        cur_email = auth.get_email(st.session_state.username) or ""
+        st.caption("If you ever forget your password, a reset link is sent to this address — "
+                   "keep it up to date. Nobody but you gets emailed here.")
+        with st.form("self_set_email"):
+            new_email = st.text_input("Email address", value=cur_email)
+            if st.form_submit_button("Save email"):
+                auth.set_email(st.session_state.username, new_email)
+                st.success("Email saved.")
 
     with tab_defaults:
         if st.session_state.role == auth.ROLE_ADMIN:
@@ -1828,11 +1885,6 @@ elif page == "⚙️ Settings":
 
     with tab_about:
         st.subheader("What this tool does")
-        # NOTE: shown to every role, but content only ever covers pages every
-        # role can see (Raw Analysis, Custom Builder, Boss Dashboard, Data
-        # Table, Settings). Nothing about the Admin Panel belongs in this
-        # shared text - that section is appended separately below, only when
-        # is_admin_settings is True, so client/viewer never see it.
         st.markdown("""
 **Sports Analytics Platform** turns any spreadsheet-shaped file into a boardroom-ready
 report, without you writing a single formula.
@@ -1883,6 +1935,14 @@ report, without you writing a single formula.
 
 **⚙️ Settings**
 - Reset the default look of the Boss Dashboard.
+- This page. Login/user management now lives in the separate **🔐 Admin Panel**
+  (visible to admin accounts only).
+
+**🔐 Admin Panel (admin accounts only)**
+- Create new report-user (viewer) accounts, reset anyone's password, delete
+  accounts, and change your own admin password.
+- Report-users can never see or reach this page - it isn't in their sidebar
+  at all, and their login has no path to it.
 
 **Performance note:** column detection, KPI math and chart aggregation are all
 done with vectorized pandas/NumPy operations, so the same tool comfortably
@@ -1890,22 +1950,11 @@ handles datasets from a few hundred rows up to several million rows. For very
 large files, use the row-limit slider on the Data Table page and the filters on
 every page to narrow down what's rendered on screen.
 
-**Security note:** your login credentials are never stored in plain text.
+**Security note:** credentials are stored as SHA-256 hashes in `credentials.json`
+next to this app — never in plain text. Only accounts with the "admin" role can
+create/delete users or reset passwords; report-user (viewer) accounts have no
+access to any credential screen.
         """)
-
-        # Admin-only addendum — client/viewer accounts stop at the section above
-        # and never see that an Admin Panel page even exists.
-        if is_admin_settings:
-            st.divider()
-            st.markdown("""
-**🔐 Admin Panel** *(admin accounts only — not visible to client/viewer)*
-- Manage accounts: create/remove client and viewer logins, assign them to a
-  workspace, reset passwords.
-- Reset a workspace's data (loaded file, Boss Dashboard layout, pinned KPIs,
-  Custom Builder cards) back to empty.
-- See the **ℹ️ About This Panel** tab on the Admin Panel page itself for full
-  details.
-            """)
 
 
 elif page == "🔐 Admin Panel":
@@ -1916,14 +1965,15 @@ elif page == "🔐 Admin Panel":
     st.title("🔐 Admin Panel")
     st.caption("Visible to admin accounts only — report-users never see this page.")
 
-    tab_users, tab_mypw, tab_reset, tab_admin_about = st.tabs(
-        ["👥 Manage Accounts", "🔑 Change My Own Password", "🗑️ Reset Workspace Data", "ℹ️ About This Panel"]
+    tab_users, tab_mypw, tab_reset = st.tabs(
+        ["👥 Manage Accounts", "🔑 Change My Own Password", "🗑️ Reset Workspace Data"]
     )
 
     with tab_users:
         st.subheader("Existing accounts")
         users = auth.list_users()
-        st.table([{"Username": u["username"], "Role": u["role"], "Data workspace": u["workspace_id"]} for u in users])
+        st.table([{"Username": u["username"], "Role": u["role"], "Data workspace": u["workspace_id"],
+                    "Email": u["email"] or "—"} for u in users])
 
         st.divider()
         st.subheader("Create a new account")
@@ -1938,6 +1988,7 @@ elif page == "🔐 Admin Panel":
             nu = st.text_input("Username")
             np1 = st.text_input("Password", type="password")
             np2 = st.text_input("Confirm password", type="password")
+            nu_email = st.text_input("Email (optional, but needed for this account's 'Forgot password' to work)")
             role_choice = st.radio("Role", ["Client", "Viewer", "Admin"], horizontal=True)
 
             client_options = auth.list_client_usernames()
@@ -1961,7 +2012,7 @@ elif page == "🔐 Admin Panel":
                     workspace_id = None  # defaults to the account's own username
                     if role == auth.ROLE_VIEWER and link_choice and link_choice.startswith("Share data with client: "):
                         workspace_id = link_choice.replace("Share data with client: ", "")
-                    auth.create_or_update_user(nu.strip(), np1, role, workspace_id=workspace_id)
+                    auth.create_or_update_user(nu.strip(), np1, role, workspace_id=workspace_id, email=nu_email.strip())
                     st.success(f"Account '{nu.strip()}' saved as {role_choice}"
                                + (f", sharing data with '{workspace_id}'." if workspace_id else ", with its own data workspace."))
                     st.rerun()
@@ -1983,6 +2034,13 @@ elif page == "🔐 Admin Panel":
                         else:
                             auth.change_password(sel_user, rp1)
                             st.success(f"Password reset for '{sel_user}'.")
+                with st.form("edit_email_form"):
+                    sel_email = next((u["email"] for u in users if u["username"] == sel_user), "")
+                    re_email = st.text_input("Email (for their 'Forgot password')", value=sel_email, key="re_email")
+                    if st.form_submit_button("Save email"):
+                        auth.set_email(sel_user, re_email)
+                        st.success(f"Email updated for '{sel_user}'.")
+                        st.rerun()
             with c2:
                 st.write("")
                 st.write("")
@@ -2046,34 +2104,6 @@ elif page == "🔐 Admin Panel":
                     st.session_state.dashboard_name = "⭐ Boss Dashboard"
                 st.success(f"Workspace '{target_ws}' cleared.")
                 st.rerun()
-
-    with tab_admin_about:
-        st.subheader("Admin Panel — what only you can see")
-        st.caption("This information is only ever shown here, inside the Admin Panel — "
-                   "client and viewer accounts never see any mention of this page.")
-        st.markdown("""
-**⚙️ Settings (client-facing page)**
-- The "How This Tool Works" tab that clients/viewers see deliberately says nothing
-  about this Admin Panel, the admin login link, or the `?admin=...` URL secret —
-  they have no way to discover it exists from inside the app.
-
-**🔐 Admin Panel (this page — admin accounts only)**
-- **👥 Manage Accounts** — create new report-user (viewer) or client accounts,
-  reset anyone's password, delete accounts, and link a viewer to an existing
-  client's data workspace.
-- **🔑 Change My Own Password** — update your own admin login.
-- **🗑️ Reset Workspace Data** — wipe a client's loaded dataset/dashboard so
-  they can start over with fresh data.
-- Report-users and clients can never see or reach this page — it isn't in
-  their sidebar at all, and their normal login has no path to it. The hidden
-  admin login form only appears when this app is opened with the secret
-  `?admin=...` URL value set in `app.py` (`ADMIN_URL_SECRET`).
-
-**Security note:** credentials are stored as SHA-256 hashes in `credentials.json`
-next to this app — never in plain text. Only accounts with the "admin" role can
-create/delete users or reset passwords; client and viewer accounts have no
-access to any credential screen, and never see this tab.
-        """)
 
 
 # ==================================================================================
