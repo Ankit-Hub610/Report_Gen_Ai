@@ -212,7 +212,7 @@ def _start_session(username: str, role: str):
 
 
 def login_screen():
-    st.markdown("<h1 style='text-align:center;'>🏆 Sports Analytics Platform</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align:center;'>🏆 Report_Gen_Tool & AI</h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
