@@ -49,8 +49,17 @@ locked out by this upgrade.
 import hashlib
 import json
 import os
+import secrets
+import time
 
 CRED_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "credentials.json")
+SESSION_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sessions.json")
+
+# How long a "remember me" login survives a browser refresh / tab reopen with
+# no explicit logout. Long on purpose (Streamlit reruns the whole script on
+# every browser tab refresh, which used to wipe st.session_state and bounce
+# people back to the login screen even though they never clicked Logout).
+SESSION_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days
 
 ROLE_ADMIN = "admin"
 ROLE_CLIENT = "client"
@@ -204,3 +213,83 @@ def delete_user(username: str, acting_username: str):
 def user_exists(username: str) -> bool:
     store = _load_store()
     return (username or "").strip() in store["users"]
+
+
+# --------------------------------------------------------------------------------
+# PERSISTENT LOGIN SESSIONS (survive a browser tab refresh, without logging
+# anyone in forever). A random token is put in the page's URL query string
+# on login. On every script run (including the rerun caused by hitting the
+# browser's Refresh button) app.py checks that token against this file and,
+# if it's still valid, silently restores the session instead of showing the
+# login screen. The token is only removed - and the session only ends -
+# when the user clicks Logout, or after SESSION_TTL_SECONDS of not being
+# used at all.
+# --------------------------------------------------------------------------------
+def _load_sessions() -> dict:
+    if not os.path.exists(SESSION_FILE):
+        return {}
+    try:
+        with open(SESSION_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_sessions(sessions: dict):
+    try:
+        with open(SESSION_FILE, "w") as f:
+            json.dump(sessions, f, indent=2)
+    except Exception:
+        pass
+
+
+def _prune_expired(sessions: dict) -> dict:
+    now = time.time()
+    return {tok: s for tok, s in sessions.items() if s.get("expires_at", 0) > now}
+
+
+def create_session(username: str, role: str, workspace_id: str) -> str:
+    """Called right after a successful login. Returns a random token that the
+    caller should stash in st.query_params so it survives a page refresh."""
+    sessions = _prune_expired(_load_sessions())
+    token = secrets.token_urlsafe(32)
+    sessions[token] = {
+        "username": username,
+        "role": role,
+        "workspace_id": workspace_id,
+        "expires_at": time.time() + SESSION_TTL_SECONDS,
+    }
+    _save_sessions(sessions)
+    return token
+
+
+def validate_session(token: str):
+    """Returns {"username","role","workspace_id"} if the token is a live
+    session, else None. Also re-checks the account still exists (in case it
+    was deleted by an admin since the token was issued) and refreshes the
+    token's expiry so an actively-used tab never gets logged out mid-session."""
+    if not token:
+        return None
+    sessions = _prune_expired(_load_sessions())
+    sess = sessions.get(token)
+    if not sess:
+        return None
+    if not user_exists(sess["username"]):
+        del sessions[token]
+        _save_sessions(sessions)
+        return None
+    sess["expires_at"] = time.time() + SESSION_TTL_SECONDS
+    sessions[token] = sess
+    _save_sessions(sessions)
+    return {"username": sess["username"], "role": sess["role"], "workspace_id": sess["workspace_id"]}
+
+
+def destroy_session(token: str):
+    """Called on explicit Logout - this is the only normal way a session ends
+    before it naturally expires."""
+    if not token:
+        return
+    sessions = _load_sessions()
+    if token in sessions:
+        del sessions[token]
+        _save_sessions(sessions)
