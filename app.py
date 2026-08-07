@@ -26,6 +26,7 @@ import io
 import copy
 import hashlib
 import time
+import base64
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -85,12 +86,119 @@ DEFAULT_BRAND = {
     "bold": True,
     "italic": False,
     "font_family": "sans-serif",  # sans-serif / serif / monospace
+    "logo_light_bytes": None,  # shown when the app is in LIGHT theme (upload takes priority over URL below)
+    "logo_light_url": "",
+    "logo_dark_bytes": None,   # shown when the app is in DARK theme
+    "logo_dark_url": "",
+    "logo_width": 220,     # px — used on the login page; sidebar shows it smaller automatically
+    "logo_glow": True,     # pulsing blue glow on the logo's edges
+    "hide_login_title": True,  # when a logo is set, replace the "Sports Analytics Platform" text with it on the login page
 }
 
 FAMILY_ICONS = {
     "Bar": "📊", "Line": "📈", "Pie": "🥧", "Comparison": "⚖️", "Area": "🏔️",
     "Scatter": "🔵", "Box": "📦", "Histogram": "📶", "Treemap": "🌳", "Heatmap": "🔥",
 }
+
+
+def _img_data_uri(data: bytes) -> str:
+    """Turns raw uploaded image bytes into a data: URI so they can go straight
+    into a hand-written <img src=...> tag (needed for the glow/theme-swap CSS
+    below - st.image() can't carry custom CSS classes)."""
+    import base64
+    if data[:3] == b"\xff\xd8\xff":
+        mime = "image/jpeg"
+    else:
+        mime = "image/png"  # PNG (and everything else we accept) falls back fine as png
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def _brand_logo_srcs(brand: dict):
+    """Returns (light_src, dark_src) - each either a data: URI (uploaded file,
+    preferred) or a plain URL, or None if nothing is configured for that
+    theme. If only one theme's logo is set, the other silently reuses it
+    (better than showing no logo at all in that theme)."""
+    light = brand.get("logo_light_bytes")
+    light = _img_data_uri(light) if light else (brand.get("logo_light_url", "").strip() or None)
+    dark = brand.get("logo_dark_bytes")
+    dark = _img_data_uri(dark) if dark else (brand.get("logo_dark_url", "").strip() or None)
+    if light and not dark:
+        dark = light
+    if dark and not light:
+        light = dark
+    return light, dark
+
+
+def _detected_theme_type():
+    """'light' / 'dark' if this Streamlit version exposes the app's current
+    theme server-side (st.context.theme, added in newer Streamlit - reflects
+    the viewer's ACTUAL current theme, including a manual in-app override).
+    None if unavailable - caller falls back to a pure-CSS (prefers-color-scheme)
+    swap, which still gets it right for anyone on the default 'Auto' theme."""
+    try:
+        t = st.context.theme.type
+        if t in ("light", "dark"):
+            return t
+    except Exception:
+        pass
+    return None
+
+
+def has_brand_logo(brand: dict) -> bool:
+    light, dark = _brand_logo_srcs(brand)
+    return bool(light or dark)
+
+
+def _render_brand_logo(brand: dict, width: int = None, centered: bool = False):
+    """Renders the logo, automatically swapping between the light-theme and
+    dark-theme image so it looks right either way, with an optional pulsing
+    blue glow. Never raises - a bad/expired URL or corrupt upload should
+    never take down the login page or sidebar, just show no logo."""
+    light_src, dark_src = _brand_logo_srcs(brand)
+    if not light_src and not dark_src:
+        return
+    w = width or brand.get("logo_width", 220)
+    justify = "center" if centered else "flex-start"
+    glow_css = "filter:drop-shadow(0 0 3px rgba(70,150,255,.4));animation:raiLogoGlow 2.4s ease-in-out infinite;" \
+        if brand.get("logo_glow", True) else ""
+    keyframes = f"""
+        @keyframes raiLogoGlow {{
+            0%   {{ filter: drop-shadow(0 0 2px rgba(70,150,255,.35)) drop-shadow(0 0 5px rgba(70,150,255,.15)); }}
+            50%  {{ filter: drop-shadow(0 0 8px rgba(70,150,255,.9)) drop-shadow(0 0 18px rgba(70,150,255,.55)); }}
+            100% {{ filter: drop-shadow(0 0 2px rgba(70,150,255,.35)) drop-shadow(0 0 5px rgba(70,150,255,.15)); }}
+        }}
+    """ if brand.get("logo_glow", True) else ""
+    try:
+        theme = _detected_theme_type()
+        if theme == "dark":
+            src = dark_src
+        elif theme == "light":
+            src = light_src
+        else:
+            src = None  # unknown server-side - use the CSS media-query fallback below
+
+        if src:
+            html = f"""<style>{keyframes}</style>
+            <div style="display:flex;justify-content:{justify};margin-bottom:0.3rem;">
+                <img src="{src}" style="width:{w}px;height:auto;{glow_css}" />
+            </div>"""
+        else:
+            html = f"""<style>
+            {keyframes}
+            .rai-logo-l, .rai-logo-d {{ width:{w}px; height:auto; {glow_css} }}
+            .rai-logo-d {{ display:none; }}
+            @media (prefers-color-scheme: dark) {{
+                .rai-logo-l {{ display:none; }}
+                .rai-logo-d {{ display:inline-block; }}
+            }}
+            </style>
+            <div style="display:flex;justify-content:{justify};margin-bottom:0.3rem;">
+                <img class="rai-logo-l" src="{light_src}" />
+                <img class="rai-logo-d" src="{dark_src}" />
+            </div>"""
+        st.markdown(html, unsafe_allow_html=True)
+    except Exception:
+        pass
 
 
 # ==================================================================================
@@ -310,7 +418,13 @@ def _get_session_cookie():
 
 
 def login_screen():
-    st.markdown("<h1 style='text-align:center;'>🏆 Sports Analytics Platform</h1>", unsafe_allow_html=True)
+    _b = st.session_state.app_brand
+    _render_brand_logo(_b, centered=True)
+    # A configured logo already carries the product name/wordmark - showing the
+    # generic "Sports Analytics Platform" text heading underneath it as well
+    # would be redundant. Only fall back to that text title when no logo is set.
+    if not (_b.get("hide_login_title", True) and has_brand_logo(_b)):
+        st.markdown("<h1 style='text-align:center;'>🏆 Sports Analytics Platform</h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
@@ -955,6 +1069,7 @@ def customize_variant(fam, variant, meta, key_prefix):
 # ==================================================================================
 with st.sidebar:
     _b = st.session_state.app_brand
+    _render_brand_logo(_b, width=min(_b.get("logo_width", 220), 160))
     st.markdown(
         f"<div style='font-size:{_b['font_size']}px; color:{_b['color']}; "
         f"font-weight:{'700' if _b['bold'] else '400'}; "
@@ -962,8 +1077,7 @@ with st.sidebar:
         f"font-family:{_b['font_family']}; margin-bottom:0.2rem;'>{_b['text']}</div>",
         unsafe_allow_html=True,
     )
-    st.caption(f"👤 **{st.session_state.username}**")
-    st.caption(f"📌 Platform Understanding :- click: ⚙️Settings |❓How this tool works ")
+    st.caption(f"Logged in as **{st.session_state.username}** ({st.session_state.role})")
 
     # ---- Admin-only: "View as" a client/viewer workspace ------------------------
     # Admin has no data of its own - it borrows whichever account's workspace is
@@ -2010,6 +2124,71 @@ elif page == "⚙️ Settings":
                 b["bold"] = st.checkbox("Bold", b["bold"], key="brand_bold")
             with bc6:
                 b["italic"] = st.checkbox("Italic", b["italic"], key="brand_italic")
+
+            st.markdown("**Logo** — shown on the login page and in the sidebar, for every account. "
+                        "Only admins can change it (this whole section is inside the admin-only check above). "
+                        "Set both a light-theme and dark-theme version so it looks right either way — the "
+                        "correct one is picked automatically for each viewer.")
+            logo_light_col, logo_dark_col = st.columns(2)
+            with logo_light_col:
+                st.caption("☀️ For **light** theme (use dark-colored logo art)")
+                lt_up, lt_url = st.tabs(["📁 Upload", "🔗 Link"])
+                with lt_up:
+                    up_l = st.file_uploader("PNG, JPG or JPEG", type=["png", "jpg", "jpeg"], key="brand_logo_light_upload")
+                    if up_l is not None:
+                        b["logo_light_bytes"] = up_l.getvalue()
+                        b["logo_light_url"] = ""  # an upload always takes priority — clear the URL so there's no ambiguity
+                with lt_url:
+                    url_l = st.text_input("Image URL", b.get("logo_light_url", ""), key="brand_logo_light_url")
+                    if url_l != b.get("logo_light_url", ""):
+                        b["logo_light_url"] = url_l
+                        if url_l:
+                            b["logo_light_bytes"] = None
+                if b.get("logo_light_bytes") or b.get("logo_light_url", "").strip():
+                    st.image(b.get("logo_light_bytes") or b.get("logo_light_url"), width=160)
+                    if st.button("🗑️ Remove", key="brand_logo_light_remove"):
+                        b["logo_light_bytes"] = None
+                        b["logo_light_url"] = ""
+                        st.rerun()
+            with logo_dark_col:
+                st.caption("🌙 For **dark** theme (use light/white-colored logo art)")
+                dk_up, dk_url = st.tabs(["📁 Upload", "🔗 Link"])
+                with dk_up:
+                    up_d = st.file_uploader("PNG, JPG or JPEG", type=["png", "jpg", "jpeg"], key="brand_logo_dark_upload")
+                    if up_d is not None:
+                        b["logo_dark_bytes"] = up_d.getvalue()
+                        b["logo_dark_url"] = ""
+                with dk_url:
+                    url_d = st.text_input("Image URL", b.get("logo_dark_url", ""), key="brand_logo_dark_url")
+                    if url_d != b.get("logo_dark_url", ""):
+                        b["logo_dark_url"] = url_d
+                        if url_d:
+                            b["logo_dark_bytes"] = None
+                if b.get("logo_dark_bytes") or b.get("logo_dark_url", "").strip():
+                    st.image(b.get("logo_dark_bytes") or b.get("logo_dark_url"), width=160)
+                    if st.button("🗑️ Remove", key="brand_logo_dark_remove"):
+                        b["logo_dark_bytes"] = None
+                        b["logo_dark_url"] = ""
+                        st.rerun()
+            st.caption("Tip: PNGs with a **transparent background** look best - they blend into either theme "
+                       "instead of showing a white/black box around the logo.")
+
+            lc1, lc2, lc3 = st.columns([2, 1, 1])
+            with lc1:
+                b["logo_width"] = st.slider("Logo width (px, login page)", 60, 400, b.get("logo_width", 220), key="brand_logo_width")
+            with lc2:
+                b["logo_glow"] = st.checkbox("✨ Blue glow animation", b.get("logo_glow", True), key="brand_logo_glow")
+            with lc3:
+                b["hide_login_title"] = st.checkbox("Replace login title text", b.get("hide_login_title", True),
+                                                      key="brand_hide_login_title",
+                                                      help="When a logo is set, show it instead of the "
+                                                           "'Sports Analytics Platform' text heading on the login page.")
+
+            if has_brand_logo(b):
+                st.caption("Live preview (glow + auto theme-swap included):")
+                _render_brand_logo(b)
+            else:
+                st.caption("No logo set — only the text title above shows.")
 
             st.markdown(
                 f"<div style='font-size:{b['font_size']}px; color:{b['color']}; "
