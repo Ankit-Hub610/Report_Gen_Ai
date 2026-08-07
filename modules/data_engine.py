@@ -10,6 +10,7 @@ payments file or a completely different dataset.
 
 import io
 import json
+import warnings
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -173,6 +174,52 @@ def _dedup_columns(columns):
     return out
 
 
+DATE_NAME_HINTS = ["date", "time", "day", "created", "updated", "timestamp",
+                    "dt", "dob", "modified", "expiry", "expire", "due", "period"]
+
+
+def _best_date_parse(s: pd.Series):
+    """Try a few common parse strategies (default, day-first e.g. DD/MM/YYYY,
+    and pandas' own mixed-format inference) and return whichever one parses
+    the highest fraction of values, as (parsed_series, success_rate). Never
+    raises - a strategy that errors out is just skipped."""
+    best_parsed, best_rate = None, -1.0
+    for kwargs in ({}, {"dayfirst": True}, {"format": "mixed"}, {"format": "mixed", "dayfirst": True}):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                parsed = pd.to_datetime(s, errors="coerce", **kwargs)
+        except (TypeError, ValueError):
+            continue
+        rate = parsed.notna().mean() if len(parsed) else 0
+        if rate > best_rate:
+            best_parsed, best_rate = parsed, rate
+    return best_parsed, max(best_rate, 0)
+
+
+def _maybe_epoch_dates(s: pd.Series):
+    """Numeric columns that are actually Unix timestamps (seconds or
+    milliseconds since epoch), recognised only when the values fall in a
+    plausible calendar-date range - avoids turning ordinary numeric
+    measures/IDs into fake dates."""
+    num = pd.to_numeric(s, errors="coerce")
+    valid = num.dropna()
+    if valid.empty:
+        return None
+    med = valid.abs().median()
+    if 1e11 <= med < 1e13:      # milliseconds since epoch (~2001-2286)
+        unit = "ms"
+    elif 1e9 <= med < 1e10:     # seconds since epoch (~2001-2286)
+        unit = "s"
+    else:
+        return None
+    try:
+        parsed = pd.to_datetime(num, unit=unit, errors="coerce")
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed.notna().mean() > 0.9 else None
+
+
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Light generic cleanup: strip col names, drop fully-empty rows/cols, try to parse dates."""
     df = df.copy()
@@ -181,20 +228,50 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(axis=0, how="all")
 
     for col in df.columns:
-        if df[col].dtype == object:
+        lname = col.lower()
+        name_hints_date = any(k in lname for k in DATE_NAME_HINTS)
+
+        # NOTE: this used to check `df[col].dtype == object` only. Newer
+        # pandas (2.x with the string-dtype option, and 3.x by default) reads
+        # text columns from CSV/XLSX as a native "str" dtype instead of the
+        # old "object" dtype - that equality check silently missed those
+        # columns entirely, so dates (and numeric-looking text) in a text
+        # column never got parsed/converted on those pandas versions. Using
+        # is_string_dtype() catches both "object" and the newer "str" dtype.
+        is_textlike = df[col].dtype == object or pd.api.types.is_string_dtype(df[col])
+        if is_textlike and not pd.api.types.is_bool_dtype(df[col]):
             sample = df[col].dropna().astype(str).head(200)
             if len(sample) == 0:
                 continue
-            looks_like_date = any(k in col.lower() for k in ["date", "time", "day", "created", "updated"])
-            if looks_like_date:
-                parsed = pd.to_datetime(df[col], errors="coerce", infer_datetime_format=True)
-                if parsed.notna().mean() > 0.5:
+            # Numeric-looking text (amounts, IDs, ...) should stay numeric,
+            # not get accidentally swept into a date parse below.
+            numeric_try = pd.to_numeric(df[col].astype(str).str.replace(",", "", regex=False), errors="coerce")
+            is_mostly_numeric = numeric_try.notna().mean() > 0.9 and df[col].notna().sum() > 0
+
+            if not is_mostly_numeric:
+                # Try to parse as a date even without a "date"-ish column
+                # name (real-world files use all sorts of headers), but
+                # require a much higher success rate when the name gives no
+                # hint at all, so plain text columns aren't misread as dates.
+                parsed, rate = _best_date_parse(df[col])
+                threshold = 0.5 if name_hints_date else 0.85
+                if parsed is not None and rate > threshold and parsed.nunique(dropna=True) > 1:
                     df[col] = parsed
                     continue
-            # try numeric coercion for object columns that are actually numeric strings
-            numeric_try = pd.to_numeric(df[col].astype(str).str.replace(",", "", regex=False), errors="coerce")
-            if numeric_try.notna().mean() > 0.9 and df[col].notna().sum() > 0:
+
+            if is_mostly_numeric:
                 df[col] = numeric_try
+                continue
+
+        elif name_hints_date and pd.api.types.is_numeric_dtype(df[col]) and not pd.api.types.is_bool_dtype(df[col]):
+            # A numeric column whose name suggests a date (e.g. "created_at"
+            # stored as a Unix timestamp) - only converted when the values
+            # actually look like epoch timestamps.
+            epoch_parsed = _maybe_epoch_dates(df[col])
+            if epoch_parsed is not None:
+                df[col] = epoch_parsed
+                continue
+
     return df.reset_index(drop=True)
 
 
