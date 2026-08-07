@@ -448,7 +448,7 @@ def login_screen():
     # would be redundant. Only fall back to that text title when no logo is set.
     if not (_b.get("hide_login_title", True) and has_brand_logo(_b)):
         st.markdown("<h1 style='text-align:center;'> 🆁🅰-🅸 </h1>", unsafe_allow_html=True)
-        st.markdown("<p style='text-align:center;font-size:24px;color:#666;'>🆁🅴🆂🅴🅰🆁🅲🅷 🅰🅽🅰🅻🆈🆃🅸🅲🆂 🅸🅽🆃🅴🅻🅻🅸🅶🅴🅽🅲🅴</p>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align:center;font-size:24px;color:#666;'>𝗥𝗲𝘀𝗲𝗮𝗿𝗰𝗵 𝗔𝗻𝗮𝗹𝘆𝘁𝗶𝗰𝘀 𝗜𝗻𝘁𝗲𝗹𝗹𝗶𝗴𝗲𝗻𝗰𝗲</p>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
