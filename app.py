@@ -212,7 +212,15 @@ def _start_session(username: str, role: str):
 
 
 def login_screen():
-    st.markdown("<h1 style='text-align:center;'>🏆 Report_Gen_Tool & AI</h1>", unsafe_allow_html=True)
+    st.markdown("""
+<h1 style='text-align:center; margin-bottom:0;'>
+🏆 Ankit Analytics Hub
+</h1>
+
+<h4 style='text-align:center; color:gray; margin-top:5px; font-weight:normal;'>
+Powered by <b>Ankit Solanki</b>
+</h4>
+""", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
