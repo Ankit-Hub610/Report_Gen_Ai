@@ -214,8 +214,7 @@ def _start_session(username: str, role: str):
 def login_screen():
     st.markdown("""
 <h1 style='text-align:center; margin-bottom:0;'>
-          A | R
-ANALYZE | RESERCH | INNOVATE
+A | R - Analytics Resarch Platform
 </h1>
 
 <h4 style='text-align:center; color:gray; margin-top:5px; font-weight:normal;'>
