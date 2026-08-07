@@ -196,6 +196,20 @@ ADMIN_URL_KEY = "admin"
 ADMIN_URL_SECRET = "SET-YOUR-OWN-SECRET-HERE"
 
 
+def _start_session(username: str, role: str):
+    """Call right after a successful login: creates a persistent session
+    token, puts it in the URL (so a browser refresh doesn't log the person
+    out) and remembers it in session_state (so Logout can invalidate it)."""
+    workspace_id = auth.get_workspace_id(username)
+    token = auth.create_session(username, role, workspace_id)
+    st.session_state.authenticated = True
+    st.session_state.username = username
+    st.session_state.role = role
+    st.session_state.workspace_id = workspace_id
+    st.session_state._session_token = token
+    st.query_params["stoken"] = token
+
+
 def login_screen():
     st.markdown("<h1 style='text-align:center;'>🏆 Sports Analytics Platform</h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
@@ -208,10 +222,7 @@ def login_screen():
             if submitted:
                 role = auth.verify_login(u, p)
                 if role:
-                    st.session_state.authenticated = True
-                    st.session_state.username = u.strip()
-                    st.session_state.role = role
-                    st.session_state.workspace_id = auth.get_workspace_id(u.strip())
+                    _start_session(u.strip(), role)
                     st.rerun()
                 else:
                     st.error("Invalid username or password.")
@@ -226,18 +237,29 @@ def login_screen():
                 admin_submitted = st.form_submit_button("Admin Login", use_container_width=True)
                 if admin_submitted:
                     if auth.verify_admin_login(au, ap):
-                        st.session_state.authenticated = True
-                        st.session_state.username = au.strip()
-                        st.session_state.role = auth.ROLE_ADMIN
-                        st.session_state.workspace_id = auth.get_workspace_id(au.strip())
+                        _start_session(au.strip(), auth.ROLE_ADMIN)
                         st.rerun()
                     else:
                         st.error("Invalid admin username or password.")
 
 
 if not st.session_state.authenticated:
-    login_screen()
-    st.stop()
+    # Before showing the login screen, see if this browser tab is carrying a
+    # still-valid "remember me" token in its URL (put there on a previous
+    # login by _start_session() below). If so, this is just a page refresh /
+    # reopened tab, not a real logout - restore the session silently instead
+    # of forcing the person to log in again.
+    _restore_tok = st.query_params.get("stoken")
+    _restored = auth.validate_session(_restore_tok) if _restore_tok else None
+    if _restored:
+        st.session_state.authenticated = True
+        st.session_state.username = _restored["username"]
+        st.session_state.role = _restored["role"]
+        st.session_state.workspace_id = _restored["workspace_id"]
+        st.session_state._session_token = _restore_tok
+    else:
+        login_screen()
+        st.stop()
 
 
 # ==================================================================================
@@ -813,12 +835,16 @@ with st.sidebar:
         st.caption("👁️ View-only account — you can look at reports here but not upload data or change dashboards.")
     st.divider()
     if st.button("🚪 Logout", use_container_width=True):
+        auth.destroy_session(st.session_state.get("_session_token"))
+        if "stoken" in st.query_params:
+            del st.query_params["stoken"]
         st.session_state.authenticated = False
         st.session_state.username = None
         st.session_state.role = None
         st.session_state.workspace_id = None
         st.session_state.view_as_workspace = None
         st.session_state._loaded_workspace_id = None
+        st.session_state._session_token = None
         st.rerun()
 
 
@@ -1778,6 +1804,10 @@ elif page == "⚙️ Settings":
 
     with tab_about:
         st.subheader("What this tool does")
+        # NOTE: this tab is shown to every role (client / viewer / admin), so
+        # nothing about the Admin Panel - or that one even exists - belongs
+        # here. That description now lives ONLY inside the Admin Panel page
+        # itself (visible only to admin accounts). Keep it that way.
         st.markdown("""
 **Sports Analytics Platform** turns any spreadsheet-shaped file into a boardroom-ready
 report, without you writing a single formula.
@@ -1828,14 +1858,6 @@ report, without you writing a single formula.
 
 **⚙️ Settings**
 - Reset the default look of the Boss Dashboard.
-- This page. Login/user management now lives in the separate **🔐 Admin Panel**
-  (visible to admin accounts only).
-
-**🔐 Admin Panel (admin accounts only)**
-- Create new report-user (viewer) accounts, reset anyone's password, delete
-  accounts, and change your own admin password.
-- Report-users can never see or reach this page - it isn't in their sidebar
-  at all, and their login has no path to it.
 
 **Performance note:** column detection, KPI math and chart aggregation are all
 done with vectorized pandas/NumPy operations, so the same tool comfortably
@@ -1843,10 +1865,7 @@ handles datasets from a few hundred rows up to several million rows. For very
 large files, use the row-limit slider on the Data Table page and the filters on
 every page to narrow down what's rendered on screen.
 
-**Security note:** credentials are stored as SHA-256 hashes in `credentials.json`
-next to this app — never in plain text. Only accounts with the "admin" role can
-create/delete users or reset passwords; report-user (viewer) accounts have no
-access to any credential screen.
+**Security note:** your login credentials are never stored in plain text.
         """)
 
 
@@ -1858,8 +1877,8 @@ elif page == "🔐 Admin Panel":
     st.title("🔐 Admin Panel")
     st.caption("Visible to admin accounts only — report-users never see this page.")
 
-    tab_users, tab_mypw, tab_reset = st.tabs(
-        ["👥 Manage Accounts", "🔑 Change My Own Password", "🗑️ Reset Workspace Data"]
+    tab_users, tab_mypw, tab_reset, tab_admin_about = st.tabs(
+        ["👥 Manage Accounts", "🔑 Change My Own Password", "🗑️ Reset Workspace Data", "ℹ️ About This Panel"]
     )
 
     with tab_users:
@@ -1988,6 +2007,34 @@ elif page == "🔐 Admin Panel":
                     st.session_state.dashboard_name = "⭐ Boss Dashboard"
                 st.success(f"Workspace '{target_ws}' cleared.")
                 st.rerun()
+
+    with tab_admin_about:
+        st.subheader("Admin Panel — what only you can see")
+        st.caption("This information is only ever shown here, inside the Admin Panel — "
+                   "client and viewer accounts never see any mention of this page.")
+        st.markdown("""
+**⚙️ Settings (client-facing page)**
+- The "How This Tool Works" tab that clients/viewers see deliberately says nothing
+  about this Admin Panel, the admin login link, or the `?admin=...` URL secret —
+  they have no way to discover it exists from inside the app.
+
+**🔐 Admin Panel (this page — admin accounts only)**
+- **👥 Manage Accounts** — create new report-user (viewer) or client accounts,
+  reset anyone's password, delete accounts, and link a viewer to an existing
+  client's data workspace.
+- **🔑 Change My Own Password** — update your own admin login.
+- **🗑️ Reset Workspace Data** — wipe a client's loaded dataset/dashboard so
+  they can start over with fresh data.
+- Report-users and clients can never see or reach this page — it isn't in
+  their sidebar at all, and their normal login has no path to it. The hidden
+  admin login form only appears when this app is opened with the secret
+  `?admin=...` URL value set in `app.py` (`ADMIN_URL_SECRET`).
+
+**Security note:** credentials are stored as SHA-256 hashes in `credentials.json`
+next to this app — never in plain text. Only accounts with the "admin" role can
+create/delete users or reset passwords; client and viewer accounts have no
+access to any credential screen, and never see this tab.
+        """)
 
 
 # ==================================================================================
