@@ -37,6 +37,37 @@ STATUS_HINT_WORDS = ["status", "stage", "state"]
 # --------------------------------------------------------------------------------
 # LOADING
 # --------------------------------------------------------------------------------
+def _find_header_row(buf, sheet_name, scan_rows=15):
+    """Real-world Excel exports often have 1-3 title/blank rows above the
+    actual header row (a report title, a generated-on date, a blank spacer
+    row). If we always take row 0 as the header, those get read as data and
+    the real header row gets read as data too — so every column ends up
+    named 'Unnamed: 0', 'Unnamed: 1', etc, which then produces nonsense KPI
+    cards ("Total Unnamed: 9") and breaks chart generation entirely (there
+    are no sensibly-named columns left to build a chart from).
+
+    Scans the first few rows and picks the first one where most cells are
+    filled in and look like short text labels — a strong header-row
+    signature — rather than assuming row 0.
+    """
+    try:
+        preview = pd.read_excel(buf, sheet_name=sheet_name, header=None, nrows=scan_rows)
+    except Exception:
+        return 0
+    best_row, best_score = 0, -1
+    for i in range(len(preview)):
+        row = preview.iloc[i]
+        non_null = row.notna().sum()
+        if non_null < max(2, int(0.5 * len(row))):
+            continue
+        texty = sum(1 for v in row if isinstance(v, str) and 0 < len(v.strip()) <= 40)
+        uniq = row.astype(str).nunique()
+        score = non_null + texty + uniq
+        if score > best_score:
+            best_score, best_row = score, i
+    return best_row
+
+
 def load_dataframe(uploaded_file):
     """Load csv / xlsx / xls / json / pdf into a dict of {sheet_name: DataFrame}."""
     name = uploaded_file.name.lower()
@@ -53,9 +84,15 @@ def load_dataframe(uploaded_file):
         sheets = {}
         for s in xls.sheet_names:
             try:
-                sheets[s] = xls.parse(s)
+                buf.seek(0)
+                header_row = _find_header_row(buf, s)
+                buf.seek(0)
+                sheets[s] = pd.read_excel(buf, sheet_name=s, header=header_row)
             except Exception:
-                pass
+                try:
+                    sheets[s] = xls.parse(s)   # fall back to the plain read if detection itself errors
+                except Exception:
+                    pass
         return sheets
 
     if name.endswith(".json"):
