@@ -962,8 +962,8 @@ with st.sidebar:
         f"font-family:{_b['font_family']}; margin-bottom:0.2rem;'>{_b['text']}</div>",
         unsafe_allow_html=True,
     )
-    st.caption(f"👤 **{st.session_state.username}** ")
-    st.caption(f"📌 Platform Understanding :- ⚙️click |❓How this tool works
+    st.caption(f"👤 **{st.session_state.username}**")
+    st.caption(f"📌 Platform Understanding :- click: ⚙️Settings|❓How this tool works ")
 
     # ---- Admin-only: "View as" a client/viewer workspace ------------------------
     # Admin has no data of its own - it borrows whichever account's workspace is
