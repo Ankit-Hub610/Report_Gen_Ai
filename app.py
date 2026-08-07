@@ -799,7 +799,7 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
     st.caption(f"👤 **{st.session_state.username}**")
-    st.caption(f"📌 Platform Understanding :- click [⚙️Settings](Settings) | [❓How this tool works](How_this_tool_works)")
+    st.caption(f"📌 Platform Understanding :- click (⚙️Settings) | (❓How_this_tool_works)")
 
     # ---- Admin-only: "View as" a client/viewer workspace ------------------------
     # Admin has no data of its own - it borrows whichever account's workspace is
