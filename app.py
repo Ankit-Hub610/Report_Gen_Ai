@@ -111,6 +111,7 @@ def init_state():
     ss.setdefault("pinned_kpis", [])        # list of kpi labels pinned to dashboard
     ss.setdefault("p1_kpi_filters", {})     # {kpi_label: [filter,...]} — per-card filters, Raw Analysis KPI cards
     ss.setdefault("p1_kpi_number_format", "auto")  # global number format toolbar, Raw Analysis KPI cards
+    ss.setdefault("p2_kpi_number_format", "auto")  # global number format toolbar, Boss Dashboard KPI cards
     ss.setdefault("page", "Connect Data")
     ss.setdefault("data_source_name", None)
     ss.setdefault("custom_kpis", [])        # list of user-built KPI card dicts (Custom Builder)
@@ -1225,7 +1226,14 @@ elif page == "⭐ Boss Dashboard":
 
     # ---- Pinned KPIs ----
     st.subheader("Key Performance Indicators")
-    all_kpis = de.compute_kpis(df, meta)
+    if can_edit():
+        with st.expander("🌐 Global number format (applies to every Total/Avg card on this dashboard)", expanded=False):
+            fmt_labels = {"auto": "Auto (Cr / L / K)", "full": "Full number (no abbreviation)", "compact": "Compact (K / M / B)"}
+            cur = st.session_state.p2_kpi_number_format
+            choice = st.selectbox("Number format", list(fmt_labels.keys()), format_func=lambda k: fmt_labels[k],
+                                   index=list(fmt_labels.keys()).index(cur), key="p2_fmt_select")
+            st.session_state.p2_kpi_number_format = choice
+    all_kpis = de.compute_kpis(df, meta, number_format=st.session_state.p2_kpi_number_format)
     pinned = [k for k in all_kpis if k["label"] in st.session_state.pinned_kpis]
     pinned_custom_kpis = [c for c in st.session_state.custom_kpis if c.get("pinned")]
     if not pinned and not pinned_custom_kpis:
@@ -1233,7 +1241,8 @@ elif page == "⭐ Boss Dashboard":
                 "or build your own on the Custom Builder page.")
     else:
         if pinned:
-            kpi_cards(pinned, pinnable=False, removable=can_edit(), key_prefix="p2_")
+            kpi_cards(pinned, pinnable=False, removable=can_edit(), key_prefix="p2_",
+                      number_format=st.session_state.p2_kpi_number_format)
         if pinned_custom_kpis:
             st.caption("🧩 Custom KPI cards")
             for row_start in range(0, len(pinned_custom_kpis), 4):
@@ -1696,7 +1705,15 @@ elif page == "🤖 AI Assistant":
 elif page == "⚙️ Settings":
     st.title("⚙️ Settings")
 
-    tab_defaults, tab_about = st.tabs(["🎨 Defaults", "ℹ️ How This Tool Works"])
+    # "How This Tool Works" is admin-only — it documents the whole tool including
+    # things clients/viewers shouldn't need (or see) in their day-to-day use, so it
+    # must never be shown to non-admin roles. Only build that tab at all when the
+    # logged-in role is admin; other roles just get the Defaults tab.
+    is_admin_settings = st.session_state.role == auth.ROLE_ADMIN
+    if is_admin_settings:
+        tab_defaults, tab_about = st.tabs(["🎨 Defaults", "ℹ️ How This Tool Works"])
+    else:
+        tab_defaults = st.container()
 
     with tab_defaults:
         if st.session_state.role == auth.ROLE_ADMIN:
@@ -1802,12 +1819,13 @@ elif page == "⚙️ Settings":
 
         st.session_state.theme = th
 
-    with tab_about:
+    if is_admin_settings:
+      with tab_about:
         st.subheader("What this tool does")
-        # NOTE: this tab is shown to every role (client / viewer / admin), so
-        # nothing about the Admin Panel - or that one even exists - belongs
-        # here. That description now lives ONLY inside the Admin Panel page
-        # itself (visible only to admin accounts). Keep it that way.
+        # NOTE: this tab is now admin-only (see is_admin_settings above) - it is
+        # never shown to client/viewer roles. Nothing about the Admin Panel - or
+        # that one even exists - belongs here either; that description lives
+        # ONLY inside the Admin Panel page itself. Keep it that way.
         st.markdown("""
 **Sports Analytics Platform** turns any spreadsheet-shaped file into a boardroom-ready
 report, without you writing a single formula.
