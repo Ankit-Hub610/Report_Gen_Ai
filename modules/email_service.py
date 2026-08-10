@@ -25,7 +25,7 @@ import os
 import requests
 
 RESEND_URL = "https://api.resend.com/emails"
-SENDER_EMAIL = "𝚁𝙰-𝙸 - 𝚁𝚎𝚜𝚎𝚊𝚛𝚌𝚑 & 𝙰𝚗𝚊𝚕𝚢𝚝𝚒𝚌𝚜 𝙸𝚗𝚝𝚎𝚕𝚕𝚒𝚐𝚎𝚗𝚌𝚎 𝚋𝚢 𝚊𝚗𝚔𝚒𝚝 𝚜𝚘𝚕𝚊𝚗𝚔𝚒<onboarding@resend.dev>"
+SENDER_EMAIL = "𝚁𝙰-𝙸 𝙵𝚛𝚘𝚖 𝙰𝚗𝚔𝚒𝚝 𝚂𝚘𝚕𝚊𝚗𝚔𝚒<onboarding@resend.dev>"
 
 
 def get_api_key():
