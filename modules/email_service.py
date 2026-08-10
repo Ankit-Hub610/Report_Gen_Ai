@@ -25,7 +25,7 @@ import os
 import requests
 
 RESEND_URL = "https://api.resend.com/emails"
-SENDER_EMAIL = "🔐𝐑𝐀-𝐈 𝐅𝐑𝐎𝐌 𝐀𝐍𝐊𝐈𝐓 𝐒𝐎𝐋𝐀𝐍𝐊𝐈<onboarding@resend.dev>"
+SENDER_EMAIL = "🔐𝗥𝗔-𝗜𝗻𝘁𝗲𝗹𝗹𝗶𝗴𝗲𝗻𝗰𝗲<onboarding@resend.dev>"
 
 
 def get_api_key():
@@ -50,7 +50,7 @@ def send_password_reset_email(to_email: str, username: str, reset_url: str) -> t
 
     html = f"""
     <div style="font-family:sans-serif;max-width:480px;margin:auto;">
-      <h2>🔑𝗥𝗔-𝗜 𝗣𝗟𝗔𝗧𝗙𝗢𝗥𝗠</h2>
+      <h2>🔑𝗥𝗔-𝗜𝗻𝘁𝗲𝗹𝗹𝗶𝗴𝗲𝗻𝗰𝗲 𝗣𝗟𝗔𝗧𝗙𝗢𝗥𝗠</h2>
       <p>Hi {username},</p>
       <p>We got a request to reset the password on your account. Click the button
       below to set a new one — this link works once and expires in 30 minutes.</p>
@@ -67,7 +67,7 @@ def send_password_reset_email(to_email: str, username: str, reset_url: str) -> t
             RESEND_URL,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={"from": SENDER_EMAIL, "to": [to_email],
-                  "subject": "Reset your password — Sports Analytics Platform", "html": html},
+                  "subject": "Reset your password — RA-Intelligence Platform", "html": html},
             timeout=20,
         )
         if resp.status_code >= 400:
