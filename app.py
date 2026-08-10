@@ -450,7 +450,6 @@ def login_screen():
         st.markdown("<h1 style='text-align:center;'>RA-I</h1>", unsafe_allow_html=True)
         st.markdown("<p style='text-align:center;font-size:24px;color:#666;'>𝗥𝗲𝘀𝗲𝗮𝗿𝗰𝗵 𝗔𝗻𝗮𝗹𝘆𝘁𝗶𝗰𝘀 𝗜𝗻𝘁𝗲𝗹𝗹𝗶𝗴𝗲𝗻𝗰𝗲</p>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align:center;color:gray;'>Created by Ankit_Solanki</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
         with st.form("login_form"):
