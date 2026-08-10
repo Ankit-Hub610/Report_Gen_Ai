@@ -25,7 +25,7 @@ import os
 import requests
 
 RESEND_URL = "https://api.resend.com/emails"
-SENDER_EMAIL = "Sports Analytics Platform <onboarding@resend.dev>"
+SENDER_EMAIL = "𝗥𝗔-𝗜 𝗣𝗹𝗮𝘁𝗳𝗼𝗿𝗺 <onboarding@resend.dev>"
 
 
 def get_api_key():
@@ -50,7 +50,7 @@ def send_password_reset_email(to_email: str, username: str, reset_url: str) -> t
 
     html = f"""
     <div style="font-family:sans-serif;max-width:480px;margin:auto;">
-      <h2>🏆 Sports Analytics Platform</h2>
+      <h2>🔐 𝗥𝗔-𝗜 𝗕𝗬 𝗔𝗡𝗞𝗜𝗧_𝗦𝗢𝗟𝗔𝗡𝗞𝗜</h2>
       <p>Hi {username},</p>
       <p>We got a request to reset the password on your account. Click the button
       below to set a new one — this link works once and expires in 30 minutes.</p>
