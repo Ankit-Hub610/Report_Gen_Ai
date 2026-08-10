@@ -25,7 +25,7 @@ import os
 import requests
 
 RESEND_URL = "https://api.resend.com/emails"
-SENDER_EMAIL = "🔐𝗥𝗔-𝗜𝗻𝘁𝗲𝗹𝗹𝗶𝗴𝗲𝗻𝗰𝗲<onboarding@resend.dev>"
+SENDER_EMAIL = "🔐 RA-Intelligence <onboarding@resend.dev>"
 
 
 def get_api_key():
@@ -50,7 +50,7 @@ def send_password_reset_email(to_email: str, username: str, reset_url: str) -> t
 
     html = f"""
     <div style="font-family:sans-serif;max-width:480px;margin:auto;">
-      <h2>🔑𝗥𝗔-𝗜𝗻𝘁𝗲𝗹𝗹𝗶𝗴𝗲𝗻𝗰𝗲 𝗣𝗟𝗔𝗧𝗙𝗢𝗥𝗠</h2>
+      <h2>🔑𝐑𝐀-𝐈𝐧𝐭𝐞𝐥𝐥𝐢𝐠𝐞𝐧𝐜𝐞 𝐏𝐥𝐚𝐭𝐟𝐨𝐫𝐦 </h2>
       <p>Hi {username},</p>
       <p>We got a request to reset the password on your account. Click the button
       below to set a new one — this link works once and expires in 30 minutes.</p>
