@@ -50,7 +50,7 @@ def send_password_reset_email(to_email: str, username: str, reset_url: str) -> t
 
     html = f"""
     <div style="font-family:sans-serif;max-width:480px;margin:auto;">
-      <h2>🔑- RA-Intelligence Password</h2>
+      <h2>🔑 RA-Intelligence </h2>
       <p>Hi {username},</p>
       <p>We got a request to reset the password on your account. Click the button
       below to set a new one — this link works once and expires in 30 minutes.</p>
