@@ -1102,7 +1102,7 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
     st.caption(f"Logged in as **{st.session_state.username}** ({st.session_state.role})")
-    st.caption(f"💡Tool Guidance - ⚙️Settings > ❓how this tool work")
+    st.caption(f"💡Tool Guidance - ⚙️Settings >❓how this tool work")
 
     # ---- Admin-only: "View as" a client/viewer workspace ------------------------
     # Admin has no data of its own - it borrows whichever account's workspace is
