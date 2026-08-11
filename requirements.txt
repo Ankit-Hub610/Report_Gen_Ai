@@ -1,10 +1,13 @@
-streamlit>=1.38  # PINNED (min version) — the "stay logged in on refresh" cookie
-                 # (app.py: _get_session_cookie / st.context.cookies) needs
-                 # st.context.cookies, which only exists from Streamlit 1.38
-                 # onward. On an older/cached install, reading the cookie
-                 # silently fails and every refresh falls back to the login
-                 # page. Redeploy after this change so the host actually
-                 # picks up a version that has it.
+streamlit>=1.38  # PINNED (min version) — a reasonably recent Streamlit is needed
+                 # for extra_streamlit_components (the "stay logged in on
+                 # refresh" cookie, see app.py: CookieManager) to work reliably.
+extra-streamlit-components  # CookieManager — real browser cookie for "stay logged in
+                             # on refresh" (see app.py: _set_session_cookie /
+                             # _get_session_cookie). Replaced an earlier hand-rolled
+                             # components.html(<script>document.cookie=...) version
+                             # that was unreliable (race with Streamlit's own
+                             # re-render tearing the injected iframe down before its
+                             # script ran, so the cookie sometimes never got written).
 duckdb        # SQL query engine (Phase 5) — real SELECT/WHERE/GROUP BY over the loaded dataset
 pandas
 numpy
