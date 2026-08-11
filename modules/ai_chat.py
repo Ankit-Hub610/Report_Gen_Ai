@@ -216,3 +216,94 @@ def ask(question, df, meta, kpis, dashboard_charts, api_key, history=None):
     except requests.RequestException as e:
         return {"answer": None, "sql_used": last_sql, "proof_df": last_proof,
                 "error": f"Network error reaching OpenRouter — check internet: {e}"}
+
+
+# ==================================================================================
+# AUTO-BUILD A KPI CARD OR CHART FROM A PLAIN-LANGUAGE REQUIREMENT
+# ==================================================================================
+# Separate from the run_sql tool-calling loop above on purpose: this doesn't need
+# real numbers back from the data, just a JSON *definition* (which column, which
+# measure, which chart type) that app.py then turns into a normal Custom Builder
+# KPI card / chart dict — the same shape a person gets from clicking "+ New Card"
+# / "+ New Chart" by hand, so it's addable to Raw Analysis / Custom Builder and
+# pinnable to the Boss Dashboard exactly the same way.
+CARD_CHART_MEASURES = ["Sum", "Average", "Count", "Distinct Count", "Min", "Max", "Median", "Std Dev"]
+CARD_CHART_TYPES = ["Bar", "Line", "Pie", "Donut", "Area", "Scatter", "Box", "Histogram", "Treemap", "Heatmap", "Table"]
+
+
+def _card_chart_system_prompt(df: pd.DataFrame) -> str:
+    cols_desc = "\n".join(f"  - {c}: {df[c].dtype}" for c in df.columns)
+    return f"""You design ONE KPI card OR ONE chart for a BI dashboard from a plain-language requirement
+(Hindi/English mix is fine). Reply with ONLY a single valid JSON object — no prose, no markdown
+fences, nothing before or after it.
+
+DATASET COLUMNS (use these EXACT names, case-sensitive — never invent a column that isn't listed)
+{cols_desc}
+
+Reply with EXACTLY one of these two JSON shapes:
+
+KPI card (a single headline number):
+{{"kind": "kpi", "title": "<short card title>", "column": "<exact column name>",
+  "measure": "<one of: {', '.join(CARD_CHART_MEASURES)}>"}}
+
+Chart (a trend, breakdown, comparison, or distribution):
+{{"kind": "chart", "title": "<short chart title>",
+  "chart_type": "<one of: {', '.join(CARD_CHART_TYPES)}>",
+  "x_col": "<exact column name>", "x_grain": "<D, W, ME, YE, or null — only set for a date x_col>",
+  "y_col": "<exact column name>", "y_measure": "<one of: {', '.join(CARD_CHART_MEASURES)}>",
+  "color_col": "<exact column name, or null>"}}
+
+Use Sum/Average/Median on genuinely numeric columns; use Count/Distinct Count on non-numeric ones.
+Pick whichever chart type best fits what was asked for."""
+
+
+def _call_openrouter_plain(api_key, messages, temperature=0.1):
+    """Same endpoint as _call_openrouter but WITHOUT the run_sql tool — used
+    for requests that should just return plain JSON, not trigger a SQL call."""
+    resp = requests.post(
+        OPENROUTER_URL,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://sports-analytics-platform.local",
+            "X-Title": "Sports Analytics Platform",
+        },
+        json={"model": OPENROUTER_MODEL, "messages": messages, "temperature": temperature},
+        timeout=60,
+    )
+    if resp.status_code == 401:
+        raise ChatError("OpenRouter API key rejected — check the key at openrouter.ai/keys.")
+    if resp.status_code == 429:
+        raise ChatError("Free-tier rate limit hit — wait a minute and try again.")
+    if resp.status_code >= 400:
+        raise ChatError(f"OpenRouter API error ({resp.status_code}): {resp.text[:300]}")
+    return resp.json()
+
+
+def suggest_card_or_chart(requirement: str, df: pd.DataFrame, api_key):
+    """Asks the model to design ONE KPI card or ONE chart matching the loaded
+    dataset's real columns. Returns {"spec": dict|None, "error": str|None} —
+    `spec` (when present) is a plain dict in one of the two shapes documented
+    in _card_chart_system_prompt, not yet a full custom_kpis/custom_charts item."""
+    if not api_key:
+        return {"spec": None, "error": "No OpenRouter API key configured yet — add one on this page (it's free)."}
+    messages = [
+        {"role": "system", "content": _card_chart_system_prompt(df)},
+        {"role": "user", "content": requirement},
+    ]
+    try:
+        data = _call_openrouter_plain(api_key, messages)
+        content = data["choices"][0]["message"].get("content", "").strip()
+        content = content.strip("`\n ")
+        if content.lower().startswith("json"):
+            content = content[4:].strip()
+        spec = json.loads(content)
+        if spec.get("kind") not in ("kpi", "chart"):
+            return {"spec": None, "error": "AI didn't return a recognisable card/chart definition — try rephrasing."}
+        return {"spec": spec, "error": None}
+    except ChatError as e:
+        return {"spec": None, "error": str(e)}
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+        return {"spec": None, "error": "AI didn't return a valid card/chart definition — try rephrasing your requirement."}
+    except requests.RequestException as e:
+        return {"spec": None, "error": f"Network error reaching OpenRouter — check internet: {e}"}
