@@ -114,7 +114,11 @@ def _render_filter_value_inputs(df, f, key_prefix):
                 existing = f.get("range", (lo, hi))
                 if not (isinstance(existing, (tuple, list)) and len(existing) == 2):
                     existing = (lo, hi)
-                picked = st.date_input("Range", existing, key=f"{key_prefix}fd_{f['id']}")
+                try:
+                    picked = st.date_input("Range", existing, key=f"{key_prefix}fd_{f['id']}")
+                except Exception:
+                    f.pop("range", None)
+                    picked = st.date_input("Range", (lo, hi), key=f"{key_prefix}fd_{f['id']}_safe")
                 # st.date_input returns a single date (not a 2-tuple) while the
                 # user has only picked the start of the range - normalise so
                 # f["range"] is ALWAYS a proper (start, end) pair, never a bare
