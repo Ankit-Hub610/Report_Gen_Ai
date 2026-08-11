@@ -87,6 +87,14 @@ DEFAULT_BRAND = {
     "bold": True,
     "italic": False,
     "font_family": "sans-serif",  # sans-serif / serif / monospace
+    # Login-page logo, one per theme mode (dark visitor / light visitor).
+    # Each is raw image bytes (PNG/JPG) ready to hand straight to st.image -
+    # a PDF upload gets its first page rendered down to PNG bytes before
+    # being stored here (see _process_logo_file).
+    "logo_dark": None,
+    "logo_dark_mime": None,
+    "logo_light": None,
+    "logo_light_mime": None,
 }
 
 FAMILY_ICONS = {
@@ -126,7 +134,8 @@ def init_state():
         saved_brand = ws.load_branding()
         ss["app_brand"] = {**DEFAULT_BRAND, **saved_brand} if saved_brand else copy.deepcopy(DEFAULT_BRAND)
     # External Database Connector (Data Table page) - NEVER persisted to disk (see workspace_store.py)
-    ss.setdefault("ai_chat_history", [])     # list of {role, content} — the AI Assistant page's chat log
+    ss.setdefault("ai_chat_history", [])     # list of {role, content, ts} — the AI Assistant page's chat log
+    ss.setdefault("_chat_history_loaded_ws", None)  # which workspace's saved chat history is currently loaded into ai_chat_history
     ss.setdefault("ai_groq_key", None)       # session-only OpenRouter API key typed into the UI by admin (never written to disk)
     ss.setdefault("db_conn_uri", "")
     ss.setdefault("db_conn_type", "PostgreSQL")
@@ -327,7 +336,77 @@ def _get_session_cookie():
         return None  # cookie component hasn't finished its first mount yet - fails safe (just asks to log in again)
 
 
+def _detect_theme_mode():
+    """Best-effort 'dark' or 'light' for the CURRENT visitor, so the right
+    login logo can be shown. Tries the real per-visitor theme first
+    (Streamlit 1.38+ auto-detects the browser/OS preference under 'auto'),
+    falls back to the app-wide config default, and finally just 'dark'."""
+    try:
+        return st.context.theme.type  # 'light' or 'dark' — reflects THIS visitor's actual rendered theme
+    except Exception:
+        pass
+    try:
+        base = st.get_option("theme.base")
+        if base in ("light", "dark"):
+            return base
+    except Exception:
+        pass
+    return "dark"
+
+
+def _process_logo_file(uploaded_file):
+    """Turns an uploaded PNG/JPG/JPEG/PDF into (bytes, mime) ready to store
+    and hand straight to st.image. PDFs get their first page rendered down
+    to a PNG (needs the optional PyMuPDF package - see requirements.txt).
+    Returns (None, None) and shows an st.error on failure."""
+    raw = _read_upload(uploaded_file)
+    name = uploaded_file.name.lower()
+    if name.endswith(".pdf"):
+        try:
+            import fitz  # PyMuPDF
+        except ImportError:
+            st.error("PDF logos need the optional **PyMuPDF** package — add `PyMuPDF` to "
+                      "requirements.txt and redeploy, or upload a PNG/JPG instead.")
+            return None, None
+        try:
+            doc = fitz.open(stream=raw, filetype="pdf")
+            pix = doc.load_page(0).get_pixmap(matrix=fitz.Matrix(3, 3))  # ~3x zoom, crisp small logo
+            return pix.tobytes("png"), "image/png"
+        except Exception as e:
+            st.error(f"Couldn't read that PDF: {e}")
+            return None, None
+    mime = "image/jpeg" if name.endswith((".jpg", ".jpeg")) else "image/png"
+    return raw, mime
+
+
+def _fetch_logo_from_url(url):
+    """Downloads a direct image link (e.g. right-click an image -> 'Copy image
+    address', including Google-hosted image URLs) and returns (bytes, mime).
+    Returns (None, None) and shows an st.error if the link doesn't point at
+    an actual image."""
+    import requests
+    try:
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        ctype = resp.headers.get("Content-Type", "")
+        if not ctype.startswith("image/"):
+            st.error("That link doesn't point directly at an image file — right-click the image "
+                      "itself (not the page it's on) and choose 'Copy image address'.")
+            return None, None
+        return resp.content, ctype.split(";")[0].strip()
+    except Exception as e:
+        st.error(f"Couldn't fetch that image: {e}")
+        return None, None
+
+
 def login_screen():
+    brand = st.session_state.get("app_brand") or DEFAULT_BRAND
+    _mode = _detect_theme_mode()
+    _logo = brand.get(f"logo_{_mode}") or brand.get("logo_dark") or brand.get("logo_light")
+    if _logo:
+        _lc1, _lc2, _lc3 = st.columns([1, 1, 1])
+        with _lc2:
+            st.image(_logo, use_container_width=True)
     st.markdown("<h1 style='text-align:center;'>RA-I</h1>", unsafe_allow_html=True)
     st.markdown("<h1 style='text-align:center;'>Research | Analysis | Intteligance </h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
@@ -1960,7 +2039,8 @@ elif page == "🗂 Data Table":
 elif page == "🤖 AI Assistant":
     st.title("🤖 AI Assistant")
     st.caption("Ask questions in plain language about your data, KPIs, and dashboard charts. Answers are "
-               "grounded in real SQL run against your dataset — not guesses — and shown with proof below each reply.")
+               "grounded in real SQL run against your dataset — not guesses — and shown with proof below each reply. "
+               "Chat history is kept for **5 days** and then auto-deleted.")
 
     if st.session_state.df_raw is None:
         st.info("Load data on the **📥 Connect Data** page first.")
@@ -1969,6 +2049,12 @@ elif page == "🤖 AI Assistant":
     df_raw = st.session_state.df_raw
     meta = st.session_state.meta
     api_key = ac.get_api_key() or st.session_state.ai_groq_key
+
+    # Pull this workspace's saved chat history (5-day auto-expiring) exactly once
+    # per workspace per session — after that, session_state is the live copy.
+    if st.session_state._chat_history_loaded_ws != st.session_state.workspace_id:
+        st.session_state.ai_chat_history = ws.load_chat_history(st.session_state.workspace_id)
+        st.session_state._chat_history_loaded_ws = st.session_state.workspace_id
 
     if not api_key:
         if st.session_state.role == auth.ROLE_ADMIN:
@@ -2007,7 +2093,7 @@ elif page == "🤖 AI Assistant":
 
     question = st.chat_input("e.g. \"Which record is number 5?\" or \"What's the trend over the last 3 months?\"")
     if question:
-        st.session_state.ai_chat_history.append({"role": "user", "content": question})
+        st.session_state.ai_chat_history.append({"role": "user", "content": question, "ts": time.time()})
         with st.chat_message("user"):
             st.markdown(question)
         with st.chat_message("assistant"):
@@ -2024,12 +2110,111 @@ elif page == "🤖 AI Assistant":
                         st.dataframe(result["proof_df"], use_container_width=True)
                 st.session_state.ai_chat_history.append({
                     "role": "assistant", "content": result["answer"],
-                    "sql_used": result["sql_used"], "proof_df": result["proof_df"],
+                    "sql_used": result["sql_used"], "proof_df": result["proof_df"], "ts": time.time(),
                 })
+        ws.save_chat_history(st.session_state.ai_chat_history, st.session_state.workspace_id)
 
     if st.session_state.ai_chat_history and st.button("🗑️ Clear chat"):
         st.session_state.ai_chat_history = []
+        ws.save_chat_history([], st.session_state.workspace_id)
         st.rerun()
+
+    # ------------------------------------------------------------------------
+    # AUTO-BUILD A KPI CARD OR CHART FROM A PLAIN-LANGUAGE REQUIREMENT
+    # (view-only accounts can chat above, but can't add/pin dashboard content)
+    # ------------------------------------------------------------------------
+    if not can_edit():
+        st.stop()
+
+    st.divider()
+    st.subheader("🪄 Ask AI to build a card or chart")
+    st.caption("Describe what you need — AI designs a matching KPI card or chart from your real "
+               "columns. Add it to **🧩 Custom Builder** with one click, or pin it straight to the "
+               "**⭐ Boss Dashboard**.")
+    ai_req = st.text_input("e.g. \"monthly revenue trend\" or \"top clients by total paid\"", key="ai_card_req")
+    if st.button("✨ Generate", key="ai_card_gen") and ai_req.strip():
+        with st.spinner("Designing a card/chart from your data..."):
+            gen_result = ac.suggest_card_or_chart(ai_req.strip(), df_raw, api_key)
+        if gen_result.get("error"):
+            st.error(gen_result["error"])
+            st.session_state["_ai_card_spec"] = None
+        else:
+            st.session_state["_ai_card_spec"] = gen_result["spec"]
+
+    ai_spec = st.session_state.get("_ai_card_spec")
+    if ai_spec:
+        col_names = {c["name"] for c in ms.list_all_columns(df_raw)}
+        preview_box = st.container(border=True)
+        with preview_box:
+            if ai_spec.get("kind") == "kpi" and ai_spec.get("column") in col_names:
+                preview_card = {
+                    "title": ai_spec.get("title") or "AI Card",
+                    "column": ai_spec["column"],
+                    "measure": ai_spec.get("measure") if ai_spec.get("measure") in ac.CARD_CHART_MEASURES else "Sum",
+                    "filters": [], "number_format": "Auto (Cr / L / K)", "custom_format_code": "#,##0.00",
+                }
+                be.render_kpi_card_value(df_raw, preview_card)
+                pc1, pc2 = st.columns(2)
+                with pc1:
+                    if st.button("➕ Add to Custom Builder", key="ai_card_add", use_container_width=True):
+                        new_card = be.new_kpi_card(df_raw)
+                        new_card.update({k: v for k, v in preview_card.items() if k != "filters"})
+                        st.session_state.custom_kpis.append(new_card)
+                        ws.save_light(st.session_state, st.session_state.workspace_id)
+                        st.session_state["_ai_card_spec"] = None
+                        st.success("Added! See it on 🧩 Custom Builder → Custom KPI Cards.")
+                        st.rerun()
+                with pc2:
+                    if st.button("📌 Add & Pin to Boss Dashboard", key="ai_card_pin", use_container_width=True):
+                        new_card = be.new_kpi_card(df_raw)
+                        new_card.update({k: v for k, v in preview_card.items() if k != "filters"})
+                        new_card["pinned"] = True
+                        st.session_state.custom_kpis.append(new_card)
+                        ws.save_light(st.session_state, st.session_state.workspace_id)
+                        st.session_state["_ai_card_spec"] = None
+                        st.success("Added and pinned to ⭐ Boss Dashboard!")
+                        st.rerun()
+            elif ai_spec.get("kind") == "chart" and ai_spec.get("x_col") in col_names and ai_spec.get("y_col") in col_names:
+                preview_chart = {
+                    "id": "ai_preview",
+                    "title": ai_spec.get("title") or "AI Chart",
+                    "type": ai_spec.get("chart_type") if ai_spec.get("chart_type") in be.CHART_TYPES else "Bar",
+                    "x_col": ai_spec["x_col"],
+                    "x_grain": ai_spec.get("x_grain") if ai_spec.get("x_grain") in ("D", "W", "ME", "YE") else None,
+                    "y_col": ai_spec["y_col"],
+                    "y_measure": ai_spec.get("y_measure") if ai_spec.get("y_measure") in ac.CARD_CHART_MEASURES else "Sum",
+                    "color_col": ai_spec.get("color_col") if ai_spec.get("color_col") in col_names else None,
+                    "filters": [],
+                }
+                fig, insight, table_df = be.build_custom_figure(df_raw, preview_chart, get_style_dict())
+                if table_df is not None:
+                    st.dataframe(table_df, use_container_width=True, height=380)
+                elif fig is not None:
+                    st.plotly_chart(fig, use_container_width=True, key="ai_chart_preview", config=ce.PLOTLY_CONFIG)
+                st.caption(f"💡 {insight}")
+                pc1, pc2 = st.columns(2)
+                with pc1:
+                    if st.button("➕ Add to Custom Builder", key="ai_chart_add", use_container_width=True):
+                        new_chart = be.new_chart(df_raw)
+                        new_chart.update({k: v for k, v in preview_chart.items() if k not in ("id", "filters")})
+                        st.session_state.custom_charts.append(new_chart)
+                        ws.save_light(st.session_state, st.session_state.workspace_id)
+                        st.session_state["_ai_card_spec"] = None
+                        st.success("Added! See it on 🧩 Custom Builder → Custom Charts.")
+                        st.rerun()
+                with pc2:
+                    if st.button("📌 Add & Pin to Boss Dashboard", key="ai_chart_pin", use_container_width=True):
+                        new_chart = be.new_chart(df_raw)
+                        new_chart.update({k: v for k, v in preview_chart.items() if k not in ("id", "filters")})
+                        new_chart["pinned"] = True
+                        st.session_state.custom_charts.append(new_chart)
+                        ws.save_light(st.session_state, st.session_state.workspace_id)
+                        st.session_state["_ai_card_spec"] = None
+                        st.success("Added and pinned to ⭐ Boss Dashboard!")
+                        st.rerun()
+            else:
+                st.warning("AI suggested a column that doesn't match your dataset — try rephrasing your requirement.")
+                st.json(ai_spec)
 
 
 # ==================================================================================
@@ -2172,6 +2357,43 @@ elif page == "⚙️ Settings":
                 f"font-family:{b['font_family']};'>Preview: {b['text']}</div>",
                 unsafe_allow_html=True,
             )
+            st.divider()
+            st.markdown("**🖼️ Login page logo**")
+            st.caption("Shown above the sign-in form. Set a different logo for dark-theme and "
+                       "light-theme visitors — upload a PNG / JPG / JPEG / PDF, or paste a direct "
+                       "image link (right-click an image anywhere, incl. Google Images results, and "
+                       "choose 'Copy image address').")
+
+            def _logo_editor(col, mode, label):
+                with col:
+                    st.markdown(label)
+                    if b.get(f"logo_{mode}"):
+                        st.image(b[f"logo_{mode}"], width=160)
+                        if st.button("🗑️ Remove logo", key=f"brand_logo_rm_{mode}"):
+                            b[f"logo_{mode}"] = None
+                            b[f"logo_{mode}_mime"] = None
+                            st.rerun()
+                    up = st.file_uploader("Upload PNG / JPG / JPEG / PDF", type=["png", "jpg", "jpeg", "pdf"],
+                                           key=f"brand_logo_up_{mode}")
+                    if up is not None:
+                        data, mime = _process_logo_file(up)
+                        if data:
+                            b[f"logo_{mode}"] = data
+                            b[f"logo_{mode}_mime"] = mime
+                            st.success("Logo ready below — click 'Save branding for everyone' to publish it.")
+                    url = st.text_input("...or paste a direct image link", key=f"brand_logo_url_{mode}",
+                                         placeholder="https://...")
+                    if st.button("Use this link", key=f"brand_logo_url_btn_{mode}") and url.strip():
+                        data, mime = _fetch_logo_from_url(url.strip())
+                        if data:
+                            b[f"logo_{mode}"] = data
+                            b[f"logo_{mode}_mime"] = mime
+                            st.success("Logo ready below — click 'Save branding for everyone' to publish it.")
+
+            lg1, lg2 = st.columns(2)
+            _logo_editor(lg1, "dark", "🌙 Dark theme logo")
+            _logo_editor(lg2, "light", "☀️ Light theme logo")
+
             bcol_save, bcol_reset = st.columns([1, 1])
             with bcol_save:
                 if st.button("💾 Save branding for everyone", type="primary", key="brand_save"):
