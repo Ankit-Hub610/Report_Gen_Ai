@@ -393,8 +393,11 @@ def _process_logo_file(uploaded_file):
 
 def _glow_css(css_class: str, kind: str, color: str, style: str, intensity: int, speed: float) -> str:
     """Builds a <style> block that gives .{css_class} a neon/glow lighting
-    effect. kind is "text" (uses text-shadow) or "logo" (uses box-shadow on
-    the wrapping div, since an <img> can't take a text-shadow).
+    effect. kind is "text" (uses text-shadow, hugs the letter outlines) or
+    "logo" (uses filter: drop-shadow, which hugs the *visible pixels* of the
+    image rather than its rectangular bounding box — so a logo PNG with a
+    transparent background gets a glow that follows the actual letter/icon
+    shape instead of lighting up a box behind it).
 
     style options:
       "steady"  — constant glow, no animation. Classic always-on neon sign.
@@ -403,23 +406,24 @@ def _glow_css(css_class: str, kind: str, color: str, style: str, intensity: int,
       "rainbow" — the glow colour itself cycles through the spectrum
                   (ignores `color` — that's the whole point of this one).
     """
-    shadow_prop = "text-shadow" if kind == "text" else "box-shadow"
     i1, i2, i3, i4 = intensity, intensity * 2, intensity * 3, intensity * 4
-    if kind == "logo":
-        # box-shadow needs an explicit spread of 0 before blur, and looks
-        # better as a soft halo around the whole rectangle, not per-corner.
-        glow = lambda a, b: f"0 0 {a}px 0 {color}, 0 0 {b}px 0 {color}"
-    else:
-        glow = lambda a, b: f"0 0 {a}px {color}, 0 0 {b}px {color}"
+
+    def decl(a, b):
+        if kind == "logo":
+            return f"filter: drop-shadow(0 0 {a}px {color}) drop-shadow(0 0 {b}px {color});"
+        return f"text-shadow: 0 0 {a}px {color}, 0 0 {b}px {color};"
+
+    def decl_off():
+        return "filter: none;" if kind == "logo" else "text-shadow: none;"
 
     if style == "steady":
-        return f"<style>.{css_class} {{ {shadow_prop}: {glow(i1, i2)}; }}</style>"
+        return f"<style>.{css_class} {{ {decl(i1, i2)} }}</style>"
 
     if style == "pulse":
         return f"""<style>
         @keyframes {css_class}_kf {{
-            0%, 100% {{ {shadow_prop}: {glow(i1 * 0.5, i1)}; }}
-            50%      {{ {shadow_prop}: {glow(i3, i4)}; }}
+            0%, 100% {{ {decl(i1 * 0.5, i1)} }}
+            50%      {{ {decl(i3, i4)} }}
         }}
         .{css_class} {{ animation: {css_class}_kf {speed}s ease-in-out infinite; }}
         </style>"""
@@ -428,8 +432,8 @@ def _glow_css(css_class: str, kind: str, color: str, style: str, intensity: int,
         # Uneven timing on purpose — a real neon tube flicker isn't a smooth sine wave.
         return f"""<style>
         @keyframes {css_class}_kf {{
-            0%, 18%, 22%, 25%, 53%, 57%, 100% {{ {shadow_prop}: {glow(i2, i3)}; opacity: 1; }}
-            20%, 24%, 55% {{ {shadow_prop}: none; opacity: 0.4; }}
+            0%, 18%, 22%, 25%, 53%, 57%, 100% {{ {decl(i2, i3)} opacity: 1; }}
+            20%, 24%, 55% {{ {decl_off()} opacity: 0.4; }}
         }}
         .{css_class} {{ animation: {css_class}_kf {speed * 2.5}s linear infinite; }}
         </style>"""
