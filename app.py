@@ -291,12 +291,21 @@ def _set_session_cookie(token: str):
     race is exactly what was causing 'log in, then refresh -> bounced back
     to the login page' - every login effectively lost its cookie. Doing the
     reload in the SAME script tag, after the document.cookie line, guarantees
-    the write happens first."""
+    the write happens first.
+
+    Why window.top and not document/window.parent directly: components.html()
+    renders inside a nested iframe. Writing to that iframe's OWN document.cookie
+    can end up on the iframe's own (effectively separate) cookie jar rather
+    than the real top-level page's — the browser then reloads the real page,
+    which never got the cookie, and the person is right back at the login
+    screen on the very next refresh. window.top always refers to the actual
+    outermost browser tab, so the cookie lands on the real page's origin
+    (this is the fix for that exact bug)."""
     import streamlit.components.v1 as components
     components.html(
         f"""<script>
-        document.cookie = "{SESSION_COOKIE_NAME}={token}; path=/; max-age={auth.SESSION_LIFETIME_SECONDS}; SameSite=Lax";
-        window.parent.location.reload();
+        window.top.document.cookie = "{SESSION_COOKIE_NAME}={token}; path=/; max-age={auth.SESSION_LIFETIME_SECONDS}; SameSite=Lax";
+        window.top.location.reload();
         </script>""",
         height=0, width=0,
     )
@@ -305,14 +314,14 @@ def _set_session_cookie(token: str):
 
 def _clear_session_cookie():
     """Same reasoning as _set_session_cookie() above, in reverse: clear the
-    cookie and reload from the SAME script tag, so Logout can't leave a
-    stale cookie behind that would silently log the person back in on their
-    next visit."""
+    cookie (on window.top, for the same reason) and reload from the SAME
+    script tag, so Logout can't leave a stale cookie behind that would
+    silently log the person back in on their next visit."""
     import streamlit.components.v1 as components
     components.html(
         f"""<script>
-        document.cookie = "{SESSION_COOKIE_NAME}=; path=/; max-age=0; SameSite=Lax";
-        window.parent.location.reload();
+        window.top.document.cookie = "{SESSION_COOKIE_NAME}=; path=/; max-age=0; SameSite=Lax";
+        window.top.location.reload();
         </script>""",
         height=0, width=0,
     )
@@ -1458,7 +1467,6 @@ elif page == "⭐ Boss Dashboard":
     st.subheader("Selected Charts")
     pinned_custom_charts = [c for c in st.session_state.custom_charts if c.get("pinned")]
     chart_png_items = []
-    st.session_state._pdf_render_errors = []
 
     if not st.session_state.dashboard_charts and not pinned_custom_charts:
         st.info("No charts selected yet. Go to Raw Analysis and click ⭐ Add to Boss Dashboard on any chart, "
@@ -1476,20 +1484,20 @@ elif page == "⭐ Boss Dashboard":
                         st.rerun()
 
                 fig, insight, table_df = be.build_custom_figure(df, chart, style)
-                png_bytes = None
                 if table_df is not None:
                     st.dataframe(table_df, use_container_width=True, height=380)
                 elif fig is not None:
                     st.plotly_chart(fig, use_container_width=True, key=f"p2_custom_{chart['id']}", config=ce.PLOTLY_CONFIG)
-                    try:
-                        png_bytes = fig.to_image(format="png", width=1400, height=700, scale=2)
-                    except Exception as e:
-                        png_bytes = None
-                        st.session_state.setdefault("_pdf_render_errors", [])
-                        st.session_state._pdf_render_errors.append(f"{chart.get('title','Custom Chart')}: {e}")
                 st.caption(f"💡 {insight}")
+                # NOTE: we deliberately do NOT render this to a PNG here. Turning a chart into an
+                # image (for the PDF) needs kaleido, which is slow (roughly half a second to a
+                # couple of seconds PER chart) — and Streamlit re-runs this whole page on every
+                # single click anywhere on it. Doing that PNG work on every rerun made the page
+                # feel laggy in proportion to how many charts were pinned, even when nobody was
+                # exporting anything. We only pay that cost once, when "Generate & Download PDF"
+                # is actually clicked, below.
                 chart_png_items.append({"title": chart.get("title", "Custom Chart"), "insight": insight,
-                                         "png_bytes": png_bytes, "type": chart.get("type", "Chart")})
+                                         "fig": fig, "type": chart.get("type", "Chart")})
 
         for idx, entry in enumerate(list(st.session_state.dashboard_charts)):
             fam = entry["family"]
@@ -1522,22 +1530,11 @@ elif page == "⭐ Boss Dashboard":
                 st.plotly_chart(fig, use_container_width=True, key=f"p2_{widget_key}", config=ce.PLOTLY_CONFIG)
                 st.caption(f"💡 {insight}")
 
-                try:
-                    png_bytes = fig.to_image(format="png", width=1400, height=700, scale=2)
-                except Exception as e:
-                    png_bytes = None
-                    st.session_state.setdefault("_pdf_render_errors", [])
-                    st.session_state._pdf_render_errors.append(f"{variant.get('title', fam)}: {e}")
                 chart_png_items.append({"title": variant.get("title", fam), "insight": insight,
-                                         "png_bytes": png_bytes, "type": fam})
+                                         "fig": fig, "type": fam})
 
         st.divider()
         st.subheader("📄 Export")
-        if st.session_state.get("_pdf_render_errors"):
-            with st.expander(f"⚠️ {len(st.session_state._pdf_render_errors)} chart(s) could not be rendered "
-                              f"as images and will be missing from the PDF — click to see why"):
-                for msg in st.session_state._pdf_render_errors:
-                    st.caption(msg)
         report_title = st.text_input("Report title", st.session_state.dashboard_name or "Sports Performance & Payments Report")
         subtitle = st.text_input("Subtitle", f"Prepared for management review — {pd.Timestamp.today().date()}")
         filters_summary = ", ".join(
@@ -1546,6 +1543,23 @@ elif page == "⭐ Boss Dashboard":
         ) or "None"
 
         if st.button("⬇️ Generate & Download PDF", type="primary"):
+            render_errors = []
+            with st.spinner(f"Rendering {len(chart_png_items)} chart(s) to images for the PDF... "
+                             f"(this is the only step that needs to be slow)"):
+                for item in chart_png_items:
+                    fig = item.pop("fig", None)
+                    item["png_bytes"] = None
+                    if fig is not None:
+                        try:
+                            item["png_bytes"] = fig.to_image(format="png", width=1400, height=700, scale=2)
+                        except Exception as e:
+                            render_errors.append(f"{item['title']}: {e}")
+            if render_errors:
+                with st.expander(f"⚠️ {len(render_errors)} chart(s) could not be rendered as images "
+                                  f"and will be missing from the PDF — click to see why"):
+                    for msg in render_errors:
+                        st.caption(msg)
+
             with st.spinner("Building PDF report..."):
                 pdf_theme = {
                     "bg_color": st.session_state.theme["bg_color"],
