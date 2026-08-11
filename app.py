@@ -95,6 +95,14 @@ DEFAULT_BRAND = {
     "logo_dark_mime": None,
     "logo_light": None,
     "logo_light_mime": None,
+    "logo_width": 220,     # px — explicit size control for the login-page logo
+    # ---- Neon / glow lighting (advanced) --------------------------------------
+    "glow_enabled": False,
+    "glow_targets": ["text", "logo"],  # subset of "text" (sidebar brand text) / "logo" (login logo)
+    "glow_color": "#00E5FF",           # aqua/cyan — the classic neon look, but fully customizable
+    "glow_style": "pulse",             # "steady" | "pulse" | "flicker" | "rainbow"
+    "glow_intensity": 16,              # px — base glow size (bigger = thicker halo)
+    "glow_speed": 2.2,                 # seconds per animation cycle (ignored by "steady")
 }
 
 FAMILY_ICONS = {
@@ -121,7 +129,11 @@ def init_state():
     ss.setdefault("dashboard_charts", [])   # list of dicts: {family, variant} chosen for Boss Dashboard
     ss.setdefault("pinned_kpis", [])        # list of kpi labels pinned to dashboard
     ss.setdefault("p1_kpi_filters", {})     # {kpi_label: [filter,...]} — per-card filters, Raw Analysis KPI cards
-    ss.setdefault("p1_kpi_number_format", "auto")  # global number format toolbar, Raw Analysis KPI cards
+    ss.setdefault("p1_kpi_format", {})      # {kpi_label: format_code} — per-card NUMBER FORMAT (e.g. one card
+                                             # shows "58.18 L", another shows "5,818,432.00", another "12.3%") —
+                                             # each card remembers its own choice independently of every other card.
+    ss.setdefault("p1_kpi_custom_code", {})  # {kpi_label: "custom Excel-style code"} — only used when that
+                                              # card's format is set to "Custom (type Excel format code)"
     ss.setdefault("page", "Connect Data")
     ss.setdefault("data_source_name", None)
     ss.setdefault("custom_kpis", [])        # list of user-built KPI card dicts (Custom Builder)
@@ -379,7 +391,78 @@ def _process_logo_file(uploaded_file):
     return raw, mime
 
 
-def _fetch_logo_from_url(url):
+def _glow_css(css_class: str, kind: str, color: str, style: str, intensity: int, speed: float) -> str:
+    """Builds a <style> block that gives .{css_class} a neon/glow lighting
+    effect. kind is "text" (uses text-shadow) or "logo" (uses box-shadow on
+    the wrapping div, since an <img> can't take a text-shadow).
+
+    style options:
+      "steady"  — constant glow, no animation. Classic always-on neon sign.
+      "pulse"   — smoothly breathes bigger/smaller (the most common neon look).
+      "flicker" — irregular on/off flicker, like an old/cheap neon tube.
+      "rainbow" — the glow colour itself cycles through the spectrum
+                  (ignores `color` — that's the whole point of this one).
+    """
+    shadow_prop = "text-shadow" if kind == "text" else "box-shadow"
+    i1, i2, i3, i4 = intensity, intensity * 2, intensity * 3, intensity * 4
+    if kind == "logo":
+        # box-shadow needs an explicit spread of 0 before blur, and looks
+        # better as a soft halo around the whole rectangle, not per-corner.
+        glow = lambda a, b: f"0 0 {a}px 0 {color}, 0 0 {b}px 0 {color}"
+    else:
+        glow = lambda a, b: f"0 0 {a}px {color}, 0 0 {b}px {color}"
+
+    if style == "steady":
+        return f"<style>.{css_class} {{ {shadow_prop}: {glow(i1, i2)}; }}</style>"
+
+    if style == "pulse":
+        return f"""<style>
+        @keyframes {css_class}_kf {{
+            0%, 100% {{ {shadow_prop}: {glow(i1 * 0.5, i1)}; }}
+            50%      {{ {shadow_prop}: {glow(i3, i4)}; }}
+        }}
+        .{css_class} {{ animation: {css_class}_kf {speed}s ease-in-out infinite; }}
+        </style>"""
+
+    if style == "flicker":
+        # Uneven timing on purpose — a real neon tube flicker isn't a smooth sine wave.
+        return f"""<style>
+        @keyframes {css_class}_kf {{
+            0%, 18%, 22%, 25%, 53%, 57%, 100% {{ {shadow_prop}: {glow(i2, i3)}; opacity: 1; }}
+            20%, 24%, 55% {{ {shadow_prop}: none; opacity: 0.4; }}
+        }}
+        .{css_class} {{ animation: {css_class}_kf {speed * 2.5}s linear infinite; }}
+        </style>"""
+
+    if style == "rainbow":
+        return f"""<style>
+        @keyframes {css_class}_kf {{
+            0%   {{ filter: hue-rotate(0deg) drop-shadow(0 0 {i2}px {color}); }}
+            100% {{ filter: hue-rotate(360deg) drop-shadow(0 0 {i2}px {color}); }}
+        }}
+        .{css_class} {{ animation: {css_class}_kf {speed * 3}s linear infinite; }}
+        </style>"""
+
+    return ""
+
+
+def _render_glow_target(css_class: str, kind: str, brand: dict, inner_html: str):
+    """Wraps `inner_html` in the glow class + injects its <style> block, but
+    ONLY if glow is turned on and this kind ("text"/"logo") is one of the
+    selected targets — otherwise just renders inner_html untouched."""
+    if brand.get("glow_enabled") and kind in (brand.get("glow_targets") or []):
+        st.markdown(_glow_css(css_class, kind, brand["glow_color"], brand["glow_style"],
+                               brand["glow_intensity"], brand["glow_speed"]), unsafe_allow_html=True)
+        st.markdown(f'<div class="{css_class}">{inner_html}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(inner_html, unsafe_allow_html=True)
+
+
+def _logo_img_html(logo_bytes: bytes, mime: str, width: int, extra_style: str = "") -> str:
+    import base64
+    b64 = base64.b64encode(logo_bytes).decode()
+    return (f'<img src="data:{mime};base64,{b64}" style="width:{width}px; max-width:100%; '
+            f'display:block; margin:0 auto; border-radius:10px; {extra_style}">')
     """Downloads a direct image link (e.g. right-click an image -> 'Copy image
     address', including Google-hosted image URLs) and returns (bytes, mime).
     Returns (None, None) and shows an st.error if the link doesn't point at
@@ -403,10 +486,12 @@ def login_screen():
     brand = st.session_state.get("app_brand") or DEFAULT_BRAND
     _mode = _detect_theme_mode()
     _logo = brand.get(f"logo_{_mode}") or brand.get("logo_dark") or brand.get("logo_light")
+    _logo_mime = brand.get(f"logo_{_mode}_mime") or brand.get("logo_dark_mime") or brand.get("logo_light_mime") or "image/png"
     if _logo:
         _lc1, _lc2, _lc3 = st.columns([1, 1, 1])
         with _lc2:
-            st.image(_logo, use_container_width=True)
+            _img_html = _logo_img_html(_logo, _logo_mime, brand.get("logo_width", 220))
+            _render_glow_target("brand_glow_logo", "logo", brand, _img_html)
     st.markdown("<h1 style='text-align:center;'>RA-I</h1>", unsafe_allow_html=True)
     st.markdown("<h1 style='text-align:center;'>Research | Analysis | Intteligance </h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
@@ -920,16 +1005,21 @@ def render_slicers(df, meta, key_prefix="", editable=None):
     return view
 
 
-def kpi_cards(kpis, pinnable=False, key_prefix="", df=None, filterable=False, number_format="auto", removable=False):
+def kpi_cards(kpis, pinnable=False, key_prefix="", df=None, filterable=False, removable=False):
     """Renders KPI cards in a responsive grid. If pinnable, shows a pin checkbox per card.
     If filterable (needs `df`), every card that represents a plain column aggregation
-    (has "column"/"agg" set — see de.compute_kpis) gets its OWN "➕ Filter this card"
-    popover, independent of every other card and independent of the page-level filter.
+    (has "column"/"agg" set — see de.compute_kpis) gets its OWN "⚙️ Format & Filter" popover,
+    completely independent of every other card: its own filter, AND its own number format
+    (one card can show "58.18 L", the next "5,818,432.00", another "12.3%" — no single
+    "global" setting forces every card to look the same).
     If removable, shows a 🗑️ button that unpins the card right here (e.g. on the Boss
     Dashboard) — same effect as un-ticking its ⭐ back on Raw Analysis, but without
     having to leave the page to do it."""
     n_cols = 4
-    store = st.session_state.p1_kpi_filters
+    filter_store = st.session_state.p1_kpi_filters
+    format_store = st.session_state.p1_kpi_format
+    custom_store = st.session_state.p1_kpi_custom_code
+    format_labels = list(ms.NUMBER_FORMAT_PRESETS.keys())
     for row_start in range(0, len(kpis), n_cols):
         cols = st.columns(n_cols)
         for j, k in enumerate(kpis[row_start:row_start + n_cols]):
@@ -937,22 +1027,36 @@ def kpi_cards(kpis, pinnable=False, key_prefix="", df=None, filterable=False, nu
                 label = k["label"]
                 value, sub = k["value"], k.get("sub")
                 if filterable and df is not None and k.get("column") and k.get("agg"):
-                    card_filters = store.get(label, [])
+                    card_filters = filter_store.get(label, [])
+                    fmt_choice = format_store.get(label, "Auto (Cr / L / K)")
+                    custom_code = custom_store.get(label, "#,##0.00")
+                    fdf = ms.apply_filters(df, card_filters) if card_filters else df
+                    col, agg = k["column"], k["agg"]
+                    s = pd.to_numeric(fdf[col], errors="coerce") if agg in ("sum", "mean") else fdf[col]
+                    if agg == "sum":
+                        raw = s.sum()
+                    elif agg == "mean":
+                        raw = s.mean()
+                    else:  # nunique
+                        raw = s.nunique()
+                    value = ms.format_value(raw, ms.NUMBER_FORMAT_PRESETS.get(fmt_choice, "auto"), custom_code)
                     if card_filters:
-                        fdf = ms.apply_filters(df, card_filters)
-                        col, agg = k["column"], k["agg"]
-                        s = pd.to_numeric(fdf[col], errors="coerce") if agg in ("sum", "mean") else fdf[col]
-                        if agg == "sum":
-                            value = de._fmt_num(s.sum(), number_format)
-                        elif agg == "mean":
-                            value = de._fmt_num(s.mean(), number_format)
-                        elif agg == "nunique":
-                            value = f"{s.nunique():,}"
                         sub = f"{sub} · {len(fdf):,} rows after this card's filter"
                     st.metric(label, value, help=sub)
-                    with st.popover("➕ Filter this card", use_container_width=True):
+                    with st.popover("⚙️ Format & Filter", use_container_width=True):
+                        st.caption("Number format — this card only")
+                        new_fmt = st.selectbox("Format", format_labels,
+                                                index=format_labels.index(fmt_choice) if fmt_choice in format_labels else 0,
+                                                key=f"{key_prefix}kpifmt_{label}", label_visibility="collapsed")
+                        format_store[label] = new_fmt
+                        if ms.NUMBER_FORMAT_PRESETS.get(new_fmt) == "custom":
+                            custom_store[label] = st.text_input(
+                                "Excel-style code (e.g. #,##0.00 or 0.0% or ₹#,##0,,\"M\")",
+                                value=custom_code, key=f"{key_prefix}kpicustom_{label}")
+                        st.divider()
+                        st.caption("Filter — this card only")
                         new_filters = be.render_filter_builder(df, card_filters, key_prefix=f"{key_prefix}kpi_{label}_")
-                        store[label] = new_filters
+                        filter_store[label] = new_filters
                 else:
                     st.metric(label, value, help=sub)
                 if pinnable:
@@ -1137,13 +1241,13 @@ def customize_variant(fam, variant, meta, key_prefix):
 # ==================================================================================
 with st.sidebar:
     _b = st.session_state.app_brand
-    st.markdown(
+    _text_html = (
         f"<div style='font-size:{_b['font_size']}px; color:{_b['color']}; "
         f"font-weight:{'700' if _b['bold'] else '400'}; "
         f"font-style:{'italic' if _b['italic'] else 'normal'}; "
-        f"font-family:{_b['font_family']}; margin-bottom:0.2rem;'>{_b['text']}</div>",
-        unsafe_allow_html=True,
+        f"font-family:{_b['font_family']}; margin-bottom:0.2rem;'>{_b['text']}</div>"
     )
+    _render_glow_target("brand_glow_text", "text", _b, _text_html)
     st.caption(f"Logged in as **{st.session_state.username}** ({st.session_state.role})")
     st.caption(f"💡Tool Guidance - ⚙️Settings > ❓how this tool work")
 
@@ -1434,16 +1538,10 @@ if page == "📊 Raw Analysis":
     st.subheader("Key Performance Indicators")
     if can_edit():
         st.caption("Tick ⭐ under any card to pin it to the Boss Dashboard. Each card also has its own "
-                   "**➕ Filter this card** — independent of the page filter above and of every other card.")
-    with st.expander("🌐 Global number format (applies to every Total/Avg card at once)", expanded=False):
-        fmt_labels = {"auto": "Auto (Cr / L / K)", "full": "Full number (no abbreviation)", "compact": "Compact (K / M / B)"}
-        cur = st.session_state.p1_kpi_number_format
-        choice = st.selectbox("Number format", list(fmt_labels.keys()), format_func=lambda k: fmt_labels[k],
-                               index=list(fmt_labels.keys()).index(cur), key="p1_fmt_select")
-        st.session_state.p1_kpi_number_format = choice
-    kpis = de.compute_kpis(df, meta, number_format=st.session_state.p1_kpi_number_format)
-    kpi_cards(kpis, pinnable=can_edit(), key_prefix="p1_", df=df, filterable=True,
-              number_format=st.session_state.p1_kpi_number_format)
+                   "**⚙️ Format & Filter** — pick General/Number/Currency/Percentage/Custom for THAT card "
+                   "only, plus an optional filter — independent of the page filter above and of every other card.")
+    kpis = de.compute_kpis(df, meta)
+    kpi_cards(kpis, pinnable=can_edit(), key_prefix="p1_", df=df, filterable=True)
 
     st.divider()
     st.subheader("Chart Library — 10 variants per chart type")
@@ -2393,6 +2491,53 @@ elif page == "⚙️ Settings":
             lg1, lg2 = st.columns(2)
             _logo_editor(lg1, "dark", "🌙 Dark theme logo")
             _logo_editor(lg2, "light", "☀️ Light theme logo")
+
+            b["logo_width"] = st.slider("Logo size on the login page (px wide)", 80, 500,
+                                         b.get("logo_width", 220), key="brand_logo_width")
+
+            st.divider()
+            st.markdown("**✨ Neon / Glow Lighting**")
+            st.caption("An animated glow around the brand text and/or logo — classic neon-sign look, "
+                       "fully customizable (not locked to aqua, though that's the default).")
+            b["glow_enabled"] = st.toggle("Enable glow lighting", b.get("glow_enabled", False), key="brand_glow_enabled")
+            if b["glow_enabled"]:
+                gc1, gc2, gc3 = st.columns(3)
+                with gc1:
+                    b["glow_targets"] = st.multiselect(
+                        "Apply glow to", ["text", "logo"], default=b.get("glow_targets", ["text", "logo"]),
+                        format_func=lambda x: {"text": "Sidebar brand text", "logo": "Login logo"}[x],
+                        key="brand_glow_targets")
+                with gc2:
+                    b["glow_color"] = st.color_picker("Glow color", b.get("glow_color", "#00E5FF"), key="brand_glow_color")
+                with gc3:
+                    style_opts = {"steady": "Steady (always-on)", "pulse": "Pulse (breathing)",
+                                   "flicker": "Flicker (neon-sign)", "rainbow": "Rainbow cycle"}
+                    b["glow_style"] = st.selectbox(
+                        "Animation style", list(style_opts.keys()), format_func=lambda k: style_opts[k],
+                        index=list(style_opts.keys()).index(b.get("glow_style", "pulse")), key="brand_glow_style")
+                gc4, gc5 = st.columns(2)
+                with gc4:
+                    b["glow_intensity"] = st.slider("Glow intensity (px)", 4, 40, b.get("glow_intensity", 16), key="brand_glow_intensity")
+                with gc5:
+                    if b["glow_style"] != "steady":
+                        b["glow_speed"] = st.slider("Animation speed (seconds per cycle — lower = faster)",
+                                                     0.5, 6.0, float(b.get("glow_speed", 2.2)), 0.1, key="brand_glow_speed")
+
+                st.caption("Live preview:")
+                _prev_text_html = (
+                    f"<div style='font-size:{b['font_size']}px; color:{b['color']}; "
+                    f"font-weight:{'700' if b['bold'] else '400'}; "
+                    f"font-style:{'italic' if b['italic'] else 'normal'}; "
+                    f"font-family:{b['font_family']};'>{b['text']}</div>"
+                )
+                _render_glow_target("brand_glow_preview_text", "text", b, _prev_text_html)
+                _preview_logo = b.get("logo_dark") or b.get("logo_light")
+                if _preview_logo and "logo" in b["glow_targets"]:
+                    _preview_mime = b.get("logo_dark_mime") or b.get("logo_light_mime") or "image/png"
+                    _pc1, _pc2, _pc3 = st.columns([1, 1, 1])
+                    with _pc2:
+                        _render_glow_target("brand_glow_preview_logo", "logo", b,
+                                             _logo_img_html(_preview_logo, _preview_mime, min(b["logo_width"], 220)))
 
             bcol_save, bcol_reset = st.columns([1, 1])
             with bcol_save:
