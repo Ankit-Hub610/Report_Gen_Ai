@@ -23,6 +23,7 @@ Nothing here auto-expires or auto-clears on its own.
 import os
 import pickle
 import re
+import time
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STORE_ROOT = os.path.join(APP_DIR, "workspace_state")
@@ -247,3 +248,47 @@ def load_branding():
             return pickle.load(f)
     except Exception:
         return None
+
+
+# ----------------------------------------------------------------------------
+# AI Assistant chat history - per-workspace, self-expiring after 5 days.
+# Kept OUT of PERSISTED_KEYS/LIGHT_KEYS on purpose: it has its own TTL-pruning
+# read path below instead of being restored verbatim like the rest of the
+# workspace, so old chats actually disappear instead of accumulating forever.
+# ----------------------------------------------------------------------------
+CHAT_HISTORY_TTL_SECONDS = 5 * 24 * 60 * 60  # 5 days
+
+
+def _chat_history_file(workspace_id: str) -> str:
+    return os.path.join(_safe_dir(workspace_id), "chat_history.pkl")
+
+
+def save_chat_history(history: list, workspace_id: str) -> None:
+    """Best-effort save of the AI Assistant chat log for this workspace.
+    Each turn should carry a 'ts' (time.time()) so load_chat_history() can
+    prune it once it's more than 5 days old."""
+    try:
+        d = _safe_dir(workspace_id)
+        os.makedirs(d, exist_ok=True)
+        _atomic_pickle(history, _chat_history_file(workspace_id))
+    except Exception:
+        pass
+
+
+def load_chat_history(workspace_id: str) -> list:
+    """Returns this workspace's saved chat history, automatically dropping
+    (and re-saving without) any turn older than 5 days - old chats are never
+    shown again and get pruned off disk the next time this runs."""
+    path = _chat_history_file(workspace_id)
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "rb") as f:
+            history = pickle.load(f) or []
+    except Exception:
+        return []
+    cutoff = time.time() - CHAT_HISTORY_TTL_SECONDS
+    fresh = [turn for turn in history if turn.get("ts", 0) >= cutoff]
+    if len(fresh) != len(history):
+        save_chat_history(fresh, workspace_id)
+    return fresh
