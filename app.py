@@ -664,6 +664,18 @@ def render_filters(df, meta, key_prefix=""):
             lo, hi = d.min().date(), d.max().date()
             with cols_ui[i % 3]:
                 default = filters.get(f"{key_prefix}{col}_daterange", (lo, hi))
+                # st.date_input can hand back a 1-item tuple while someone has picked
+                # only the START of a range (before picking the end date) - feeding
+                # that partial tuple back in as `default` on the next rerun crashes
+                # with a StreamlitAPIException (it only accepts None, a single date,
+                # or an exact 2-item tuple/list). That stored bad value also
+                # persists to disk, so it kept crashing on every load, for every
+                # role, until cleared. Guard against it (and any other malformed
+                # leftover value, e.g. from a column that no longer has the same
+                # date range after a database refresh) by falling back to the full
+                # range instead of ever handing st.date_input something invalid.
+                if not (isinstance(default, (tuple, list)) and len(default) == 2):
+                    default = (lo, hi)
                 rng = st.date_input(col, default, key=f"{key_prefix}filt_date_{col}")
                 filters[f"{key_prefix}{col}_daterange"] = rng
             i += 1
