@@ -131,6 +131,11 @@ def init_state():
     ss.setdefault("db_conn_uri", "")
     ss.setdefault("db_conn_type", "PostgreSQL")
     ss.setdefault("db_connected", False)
+    ss.setdefault("data_source_is_db", False)   # was the CURRENT df_raw loaded from a database (vs file upload)?
+    ss.setdefault("db_last_load_sql", "")        # exact query used, so "Refresh from database" can re-run it
+    ss.setdefault("db_last_load_label", "")      # table/description shown in the "connected live" banner
+    ss.setdefault("db_last_refreshed_at", None)  # time.time() of the last successful (re)load, for the banner
+    ss.setdefault("db_auto_sync_seconds", 0)     # 0 = off; >0 = auto-refresh interval selected on Connect Data page
     ss.setdefault("db_queries", [])         # list of query-tab dicts, see modules/db_connector.py
     ss.setdefault("db_query_results", {})   # {query_id: DataFrame}
 
@@ -533,6 +538,37 @@ def _apply_loaded_df(df, source_name):
     st.session_state.dashboard_charts = []
     st.session_state.pinned_kpis = []
     st.session_state.dashboard_slicers = []
+    st.session_state.data_source_is_db = False   # a fresh file/sample load — any previous DB link no longer applies
+
+
+def _refresh_loaded_df(df, source_name):
+    """Like _apply_loaded_df, but for an in-place 'get the latest data' refresh
+    of an ALREADY-loaded database source: updates the data itself but keeps
+    whatever charts/KPI cards/slicers/filters were already built on top of it
+    (a refresh should feel like 'this table just got new rows', not 'start
+    the dashboard over from scratch'). Used by the manual Refresh button and
+    by auto-sync."""
+    st.session_state.df_raw = df
+    st.session_state.meta = de.profile_columns(df)
+    st.session_state.data_source_name = source_name
+    st.session_state.db_last_refreshed_at = time.time()
+
+
+def _run_db_refresh():
+    """Re-runs the last-used database query and applies the result. Returns
+    (ok, message). Safe to call from a button OR from an auto-sync rerun."""
+    if not st.session_state.db_conn_uri or not st.session_state.db_last_load_sql:
+        return False, ("No live database connection in this browser session — go to "
+                        "**📥 Connect Data → Connect Database** and load a table again "
+                        "(the connection isn't kept between browser sessions, for security: "
+                        "it would mean storing your database password on disk).")
+    try:
+        result_df = dbc.run_query(st.session_state.db_conn_uri, st.session_state.db_last_load_sql)
+        cleaned = de.clean_dataframe(result_df)
+        _refresh_loaded_df(cleaned, st.session_state.data_source_name)
+        return True, f"Refreshed — {len(cleaned):,} rows as of now."
+    except dbc.QueryError as e:
+        return False, f"Refresh failed: {e}"
 
 
 def load_files(uploaded_files, combine_mode="stack"):
@@ -1074,6 +1110,43 @@ if page == "📥 Connect Data":
     if st.session_state.df_raw is not None:
         st.success(f"🟢 Currently loaded: **{st.session_state.data_source_name}** "
                    f"({len(st.session_state.df_raw):,} rows × {len(st.session_state.df_raw.columns)} cols)")
+
+        if st.session_state.data_source_is_db:
+            db_col1, db_col2, db_col3 = st.columns([2, 1, 2])
+            with db_col1:
+                if st.session_state.db_last_refreshed_at:
+                    ago = int(time.time() - st.session_state.db_last_refreshed_at)
+                    ago_txt = f"{ago}s ago" if ago < 60 else f"{ago // 60}m ago"
+                    st.caption(f"🔌 Connected live to **{st.session_state.db_last_load_label}** — last refreshed {ago_txt}.")
+                else:
+                    st.caption(f"🔌 Connected live to **{st.session_state.db_last_load_label}**.")
+            with db_col2:
+                if st.button("🔄 Refresh now", key="db_manual_refresh_btn", use_container_width=True):
+                    ok, msg = _run_db_refresh()
+                    (st.success if ok else st.error)(msg)
+                    if ok:
+                        st.rerun()
+            with db_col3:
+                sync_choice = st.selectbox(
+                    "Auto-sync", ["Off", "Every 10s", "Every 30s", "Every 1 min", "Every 5 min"],
+                    index=["Off", "Every 10s", "Every 30s", "Every 1 min", "Every 5 min"].index(
+                        {0: "Off", 10: "Every 10s", 30: "Every 30s", 60: "Every 1 min", 300: "Every 5 min"}
+                        .get(st.session_state.db_auto_sync_seconds, "Off")
+                    ),
+                    key="db_auto_sync_choice", label_visibility="collapsed",
+                    help="Automatically re-run the same query and pull in new rows, without clicking Refresh.",
+                )
+                st.session_state.db_auto_sync_seconds = {
+                    "Off": 0, "Every 10s": 10, "Every 30s": 30, "Every 1 min": 60, "Every 5 min": 300,
+                }[sync_choice]
+            if st.session_state.db_auto_sync_seconds and AUTOREFRESH_AVAILABLE:
+                st_autorefresh(interval=st.session_state.db_auto_sync_seconds * 1000, key="db_connect_page_auto_sync")
+                ok, msg = _run_db_refresh()
+                if not ok:
+                    st.error(msg)
+            elif st.session_state.db_auto_sync_seconds and not AUTOREFRESH_AVAILABLE:
+                st.warning("Auto-sync needs the `streamlit-autorefresh` package — add it to requirements.txt to enable this.")
+
         if can_edit() and st.button("🗑️ Clear loaded data (start over with a new file/database)"):
             st.session_state.df_raw = None
             st.session_state.meta = None
@@ -1083,6 +1156,10 @@ if page == "📥 Connect Data":
             st.session_state.pinned_kpis = []
             st.session_state.dashboard_slicers = []
             st.session_state._last_upload_sig = None
+            st.session_state.data_source_is_db = False
+            st.session_state.db_last_load_sql = ""
+            st.session_state.db_last_load_label = ""
+            st.session_state.db_auto_sync_seconds = 0
             st.rerun()
 
     if can_edit():
@@ -1199,6 +1276,10 @@ if page == "📥 Connect Data":
                             result_df = dbc.run_query(st.session_state.db_conn_uri, custom_sql)
                             cleaned = de.clean_dataframe(result_df)
                             _apply_loaded_df(cleaned, f"{st.session_state.db_conn_type}: {pick_table}")
+                            st.session_state.data_source_is_db = True
+                            st.session_state.db_last_load_sql = custom_sql
+                            st.session_state.db_last_load_label = f"{st.session_state.db_conn_type}: {pick_table}"
+                            st.session_state.db_last_refreshed_at = time.time()
                             st.success(f"Loaded {len(cleaned):,} rows from **{pick_table}**.")
                             st.rerun()
                         except dbc.QueryError as e:
