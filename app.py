@@ -26,7 +26,6 @@ import io
 import copy
 import hashlib
 import time
-import base64
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -49,7 +48,7 @@ except ImportError:
 # ==================================================================================
 # PAGE CONFIG
 # ==================================================================================
-st.set_page_config(page_title="RA-Intelligence By Ankit_Solanki", page_icon="🕵️‍♀️", layout="wide")
+st.set_page_config(page_title="RA-I Created by Ankit_Solanki", page_icon="🏆", layout="wide")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SAMPLE_PATH = os.path.join(APP_DIR, "sample_data", "sample_sports_payments.csv")
@@ -79,149 +78,19 @@ PALETTES = {
     "Mono Green": ["#013220", "#0B6E4F", "#08A045", "#6BCB77", "#A6E3A1", "#D4F1D4"],
 }
 
-def _load_asset_bytes(filename: str):
-    """Reads a file from the assets/ folder next to app.py (committed to the
-    git repo, unlike workspace_state/ which is gitignored runtime data) —
-    used so the default logo is baked into the deploy itself and survives
-    every redeploy, with no admin action needed. Returns None (never raises)
-    if the file isn't there, so a missing asset just means no default logo
-    instead of crashing the app."""
-    try:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", filename)
-        with open(path, "rb") as f:
-            return f.read()
-    except Exception:
-        return None
-
-
 DEFAULT_BRAND = {
-    "text": "RA-I - Research & Analytics Intelligence",
+    "text": "🏆 RA-Intelligence",
     "font_size": 22,       # px, sidebar heading
     "color": "#F5F5F5",
     "bold": True,
     "italic": False,
     "font_family": "sans-serif",  # sans-serif / serif / monospace
-    # Baked-in default logo (assets/logo_light.png, assets/logo_dark.png — ship these
-    # two files in the repo). An admin can still override either from Settings → App
-    # Branding; that override is saved to workspace_state/ instead (see save_branding()
-    # below) and — unlike these baked-in defaults — won't survive a future redeploy
-    # unless workspace_state/ is on persistent storage, so re-upload there if needed.
-    "logo_light_bytes": _load_asset_bytes("logo_light.png"),  # shown when the app is in LIGHT theme
-    "logo_light_url": "",
-    "logo_dark_bytes": _load_asset_bytes("logo_dark.png"),    # shown when the app is in DARK theme
-    "logo_dark_url": "",
-    "logo_width": 220,     # px — used on the login page; sidebar shows it smaller automatically
-    "logo_glow": True,     # pulsing blue glow on the logo's edges
-    "hide_login_title": True,  # when a logo is set, replace the "Sports Analytics Platform" text with it on the login page
 }
 
 FAMILY_ICONS = {
     "Bar": "📊", "Line": "📈", "Pie": "🥧", "Comparison": "⚖️", "Area": "🏔️",
     "Scatter": "🔵", "Box": "📦", "Histogram": "📶", "Treemap": "🌳", "Heatmap": "🔥",
 }
-
-
-def _img_data_uri(data: bytes) -> str:
-    """Turns raw uploaded image bytes into a data: URI so they can go straight
-    into a hand-written <img src=...> tag (needed for the glow/theme-swap CSS
-    below - st.image() can't carry custom CSS classes)."""
-    import base64
-    if data[:3] == b"\xff\xd8\xff":
-        mime = "image/jpeg"
-    else:
-        mime = "image/png"  # PNG (and everything else we accept) falls back fine as png
-    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
-
-
-def _brand_logo_srcs(brand: dict):
-    """Returns (light_src, dark_src) - each either a data: URI (uploaded file,
-    preferred) or a plain URL, or None if nothing is configured for that
-    theme. If only one theme's logo is set, the other silently reuses it
-    (better than showing no logo at all in that theme)."""
-    light = brand.get("logo_light_bytes")
-    light = _img_data_uri(light) if light else (brand.get("logo_light_url", "").strip() or None)
-    dark = brand.get("logo_dark_bytes")
-    dark = _img_data_uri(dark) if dark else (brand.get("logo_dark_url", "").strip() or None)
-    if light and not dark:
-        dark = light
-    if dark and not light:
-        light = dark
-    return light, dark
-
-
-def _detected_theme_type():
-    """'light' / 'dark' if this Streamlit version exposes the app's current
-    theme server-side (st.context.theme, added in newer Streamlit - reflects
-    the viewer's ACTUAL current theme, including a manual in-app override).
-    None if unavailable - caller falls back to a pure-CSS (prefers-color-scheme)
-    swap, which still gets it right for anyone on the default 'Auto' theme."""
-    try:
-        t = st.context.theme.type
-        if t in ("light", "dark"):
-            return t
-    except Exception:
-        pass
-    return None
-
-
-def has_brand_logo(brand: dict) -> bool:
-    light, dark = _brand_logo_srcs(brand)
-    return bool(light or dark)
-
-
-def _render_brand_logo(brand: dict, width: int = None, centered: bool = False):
-    """Renders the logo, automatically swapping between the light-theme and
-    dark-theme image so it looks right either way, with an optional pulsing
-    blue glow. Never raises - a bad/expired URL or corrupt upload should
-    never take down the login page or sidebar, just show no logo.
-
-    IMPORTANT: every line handed to st.markdown() here is built with ZERO
-    leading whitespace. Markdown treats any line indented 4+ spaces as a
-    preformatted code block - a natural-looking indented triple-quoted
-    f-string (matching the surrounding Python code's indentation) renders
-    as literal visible text instead of an actual <img>/<style>, which is
-    exactly the bug this replaced (raw `<div>...` tags showing up on the
-    login page instead of the logo)."""
-    light_src, dark_src = _brand_logo_srcs(brand)
-    if not light_src and not dark_src:
-        return
-    w = width or brand.get("logo_width", 220)
-    justify = "center" if centered else "flex-start"
-    glow = brand.get("logo_glow", True)
-    glow_css = ("filter:drop-shadow(0 0 3px rgba(70,150,255,.4));"
-                "animation:raiLogoGlow 2.4s ease-in-out infinite;") if glow else ""
-    keyframes = ("@keyframes raiLogoGlow {"
-                 "0%{filter:drop-shadow(0 0 2px rgba(70,150,255,.35)) drop-shadow(0 0 5px rgba(70,150,255,.15));}"
-                 "50%{filter:drop-shadow(0 0 8px rgba(70,150,255,.9)) drop-shadow(0 0 18px rgba(70,150,255,.55));}"
-                 "100%{filter:drop-shadow(0 0 2px rgba(70,150,255,.35)) drop-shadow(0 0 5px rgba(70,150,255,.15));}"
-                 "}") if glow else ""
-    try:
-        theme = _detected_theme_type()
-        if theme == "dark":
-            src = dark_src
-        elif theme == "light":
-            src = light_src
-        else:
-            src = None  # unknown server-side - use the CSS media-query fallback below
-
-        if src:
-            html = (f'<style>{keyframes}</style>'
-                     f'<div style="display:flex;justify-content:{justify};margin-bottom:0.3rem;">'
-                     f'<img src="{src}" style="width:{w}px;height:auto;{glow_css}" />'
-                     f'</div>')
-        else:
-            html = (f'<style>{keyframes}'
-                     f'.rai-logo-l,.rai-logo-d{{width:{w}px;height:auto;{glow_css}}}'
-                     f'.rai-logo-d{{display:none;}}'
-                     f'@media (prefers-color-scheme: dark) {{.rai-logo-l{{display:none;}} .rai-logo-d{{display:inline-block;}}}}'
-                     f'</style>'
-                     f'<div style="display:flex;justify-content:{justify};margin-bottom:0.3rem;">'
-                     f'<img class="rai-logo-l" src="{light_src}" />'
-                     f'<img class="rai-logo-d" src="{dark_src}" />'
-                     f'</div>')
-        st.markdown(html, unsafe_allow_html=True)
-    except Exception:
-        pass
 
 
 # ==================================================================================
@@ -333,18 +202,39 @@ def sync_workspace_from_disk(force: bool = False):
         # the very next run's reload below would load a stale pre-change
         # copy from disk and silently undo whatever was just clicked - that
         # was making Remove/pin/etc. look broken.
-        # Fix: flush THIS session's current state to disk FIRST, then read
-        # back. If this session made the latest change, that's a no-op (we
-        # just read back what we wrote). If a DIFFERENT session (e.g. a
+        # Fix: flush THIS session's current LIGHT state to disk FIRST, then
+        # read back. If this session made the latest change, that's a no-op
+        # (we just read back what we wrote). If a DIFFERENT session (e.g. a
         # linked report-viewer, in another browser) saved something even
         # more recently, we correctly pick up THEIR newer version instead.
+        #
+        # PERF: this only ever needs to sync dashboard config (charts, pinned
+        # KPIs, slicers, name, pivot reports) between sessions sharing a
+        # workspace - never the dataset itself (df_raw only changes when
+        # THIS session explicitly loads new data, which already updates its
+        # own session_state directly). So this uses save_light()/load_light()
+        # instead of the full save()/load(), which used to re-pickle the
+        # WHOLE dataset on every single pin/unpin click - that was the cause
+        # of the reported lag on this page.
         if ss.get("df_raw") is not None:
-            ws.save(ss, wsid)
-    saved = ws.load(wsid)
-    if saved:
-        for k, v in saved.items():
+            ws.save_light(ss, wsid)
+        light = ws.load_light(wsid)
+        for k, v in light.items():
             if v is not None:
                 ss[k] = v
+
+    if workspace_changed:
+        # Rare event (login, or admin switching "View as") - the full
+        # dataset genuinely needs to load here, so use the full load().
+        saved = ws.load(wsid)
+        if saved:
+            for k, v in saved.items():
+                if v is not None:
+                    ss[k] = v
+        # What we just loaded from disk is already in sync with disk - mark it
+        # as such so the end-of-script auto-save doesn't immediately re-save
+        # the whole dataset again this same run.
+        ss["_last_saved_df_id"] = id(ss.get("df_raw"))
     # dashboard_name is a plain string with a non-None default (set in init_state).
     # Old workspace saves made before this field existed (or a save with the
     # title cleared) can leave it as None here, which crashes the Boss
@@ -389,48 +279,44 @@ SESSION_COOKIE_NAME = "app_session"
 
 
 def _set_session_cookie(token: str):
-    """Sets the 'stay logged in' cookie, then reruns - but only AFTER giving
-    the browser a moment to actually execute the cookie-setting script below.
+    """Sets the 'stay logged in' cookie, then reloads the page from JS itself
+    (never st.rerun() right after this - see the note below) so the very
+    next request the browser makes actually carries the freshly-set cookie.
 
-    Why the delay: components.html() renders an iframe; the browser has to
-    receive it and run its <script> before the cookie exists. Calling
-    st.rerun() immediately (no delay) used to race that - Streamlit could
-    tear the page down before the script ran, so the cookie was silently
-    never set (refresh -> bounced back to login).
-
-    An earlier version of this fix tried to reload via
-    `window.parent.location.reload()` from inside that same script instead
-    of a delay. That's WRONG: Streamlit's component iframe is sandboxed, and
-    a sandboxed iframe cannot navigate its parent's top-level page unless
-    the iframe is explicitly given that permission - browsers silently block
-    it. That's why login stopped working entirely after that attempt: the
-    cookie script ran, but the page reload it tried to trigger never
-    happened, so the app just sat there. A short server-side sleep before a
-    normal st.rerun() sidesteps that restriction completely - no navigation
-    is attempted from inside the iframe at all."""
+    Why not st.rerun(): components.html() injects an iframe whose <script>
+    the BROWSER has to receive and execute - that happens a moment after
+    Python moves on. Calling st.rerun() immediately after this call races
+    that: Streamlit can tear the whole page down and re-render before the
+    iframe's script ever ran, so the cookie never actually got written. That
+    race is exactly what was causing 'log in, then refresh -> bounced back
+    to the login page' - every login effectively lost its cookie. Doing the
+    reload in the SAME script tag, after the document.cookie line, guarantees
+    the write happens first."""
     import streamlit.components.v1 as components
     components.html(
         f"""<script>
         document.cookie = "{SESSION_COOKIE_NAME}={token}; path=/; max-age={auth.SESSION_LIFETIME_SECONDS}; SameSite=Lax";
+        window.parent.location.reload();
         </script>""",
         height=0, width=0,
     )
-    time.sleep(0.2)
-    st.rerun()
+    st.stop()  # don't let this run keep going (and re-render the login form) - the JS reload above takes over
 
 
 def _clear_session_cookie():
-    """Same reasoning as _set_session_cookie() above - a short delay before
-    rerunning, no iframe-triggered navigation."""
+    """Same reasoning as _set_session_cookie() above, in reverse: clear the
+    cookie and reload from the SAME script tag, so Logout can't leave a
+    stale cookie behind that would silently log the person back in on their
+    next visit."""
     import streamlit.components.v1 as components
     components.html(
         f"""<script>
         document.cookie = "{SESSION_COOKIE_NAME}=; path=/; max-age=0; SameSite=Lax";
+        window.parent.location.reload();
         </script>""",
         height=0, width=0,
     )
-    time.sleep(0.2)
-    st.rerun()
+    st.stop()
 
 
 def _get_session_cookie():
@@ -441,14 +327,8 @@ def _get_session_cookie():
 
 
 def login_screen():
-    _b = st.session_state.app_brand
-    _render_brand_logo(_b, centered=True)
-    # A configured logo already carries the product name/wordmark - showing the
-    # generic "Sports Analytics Platform" text heading underneath it as well
-    # would be redundant. Only fall back to that text title when no logo is set.
-    if not (_b.get("hide_login_title", True) and has_brand_logo(_b)):
-        st.markdown("<h1 style='text-align:center;'>RA-I</h1>", unsafe_allow_html=True)
-        st.markdown("<p style='text-align:center;font-size:24px;color:#666;'>𝗥𝗲𝘀𝗲𝗮𝗿𝗰𝗵 𝗔𝗻𝗮𝗹𝘆𝘁𝗶𝗰𝘀 𝗜𝗻𝘁𝗲𝗹𝗹𝗶𝗴𝗲𝗻𝗰𝗲</p>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align:center;'>RA-I</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align:center;'>Research | Analysis | Intteligance </h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
@@ -1093,7 +973,6 @@ def customize_variant(fam, variant, meta, key_prefix):
 # ==================================================================================
 with st.sidebar:
     _b = st.session_state.app_brand
-    _render_brand_logo(_b, width=min(_b.get("logo_width", 220), 160))
     st.markdown(
         f"<div style='font-size:{_b['font_size']}px; color:{_b['color']}; "
         f"font-weight:{'700' if _b['bold'] else '400'}; "
@@ -1102,7 +981,7 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
     st.caption(f"Logged in as **{st.session_state.username}** ({st.session_state.role})")
-    st.caption(f"💡Tool Guidance - ⚙️Settings >❓how this tool work")
+    st.caption(f"💡Tool Guidance - ⚙️Settings > ❓how this tool work")
 
     # ---- Admin-only: "View as" a client/viewer workspace ------------------------
     # Admin has no data of its own - it borrows whichever account's workspace is
@@ -2150,71 +2029,6 @@ elif page == "⚙️ Settings":
             with bc6:
                 b["italic"] = st.checkbox("Italic", b["italic"], key="brand_italic")
 
-            st.markdown("**Logo** — shown on the login page and in the sidebar, for every account. "
-                        "Only admins can change it (this whole section is inside the admin-only check above). "
-                        "Set both a light-theme and dark-theme version so it looks right either way — the "
-                        "correct one is picked automatically for each viewer.")
-            logo_light_col, logo_dark_col = st.columns(2)
-            with logo_light_col:
-                st.caption("☀️ For **light** theme (use dark-colored logo art)")
-                lt_up, lt_url = st.tabs(["📁 Upload", "🔗 Link"])
-                with lt_up:
-                    up_l = st.file_uploader("PNG, JPG or JPEG", type=["png", "jpg", "jpeg"], key="brand_logo_light_upload")
-                    if up_l is not None:
-                        b["logo_light_bytes"] = up_l.getvalue()
-                        b["logo_light_url"] = ""  # an upload always takes priority — clear the URL so there's no ambiguity
-                with lt_url:
-                    url_l = st.text_input("Image URL", b.get("logo_light_url", ""), key="brand_logo_light_url")
-                    if url_l != b.get("logo_light_url", ""):
-                        b["logo_light_url"] = url_l
-                        if url_l:
-                            b["logo_light_bytes"] = None
-                if b.get("logo_light_bytes") or b.get("logo_light_url", "").strip():
-                    st.image(b.get("logo_light_bytes") or b.get("logo_light_url"), width=160)
-                    if st.button("🗑️ Remove", key="brand_logo_light_remove"):
-                        b["logo_light_bytes"] = None
-                        b["logo_light_url"] = ""
-                        st.rerun()
-            with logo_dark_col:
-                st.caption("🌙 For **dark** theme (use light/white-colored logo art)")
-                dk_up, dk_url = st.tabs(["📁 Upload", "🔗 Link"])
-                with dk_up:
-                    up_d = st.file_uploader("PNG, JPG or JPEG", type=["png", "jpg", "jpeg"], key="brand_logo_dark_upload")
-                    if up_d is not None:
-                        b["logo_dark_bytes"] = up_d.getvalue()
-                        b["logo_dark_url"] = ""
-                with dk_url:
-                    url_d = st.text_input("Image URL", b.get("logo_dark_url", ""), key="brand_logo_dark_url")
-                    if url_d != b.get("logo_dark_url", ""):
-                        b["logo_dark_url"] = url_d
-                        if url_d:
-                            b["logo_dark_bytes"] = None
-                if b.get("logo_dark_bytes") or b.get("logo_dark_url", "").strip():
-                    st.image(b.get("logo_dark_bytes") or b.get("logo_dark_url"), width=160)
-                    if st.button("🗑️ Remove", key="brand_logo_dark_remove"):
-                        b["logo_dark_bytes"] = None
-                        b["logo_dark_url"] = ""
-                        st.rerun()
-            st.caption("Tip: PNGs with a **transparent background** look best - they blend into either theme "
-                       "instead of showing a white/black box around the logo.")
-
-            lc1, lc2, lc3 = st.columns([2, 1, 1])
-            with lc1:
-                b["logo_width"] = st.slider("Logo width (px, login page)", 60, 400, b.get("logo_width", 220), key="brand_logo_width")
-            with lc2:
-                b["logo_glow"] = st.checkbox("✨ Blue glow animation", b.get("logo_glow", True), key="brand_logo_glow")
-            with lc3:
-                b["hide_login_title"] = st.checkbox("Replace login title text", b.get("hide_login_title", True),
-                                                      key="brand_hide_login_title",
-                                                      help="When a logo is set, show it instead of the "
-                                                           "'Sports Analytics Platform' text heading on the login page.")
-
-            if has_brand_logo(b):
-                st.caption("Live preview (glow + auto theme-swap included):")
-                _render_brand_logo(b)
-            else:
-                st.caption("No logo set — only the text title above shows.")
-
             st.markdown(
                 f"<div style='font-size:{b['font_size']}px; color:{b['color']}; "
                 f"font-weight:{'700' if b['bold'] else '400'}; "
@@ -2554,8 +2368,24 @@ have no access to any credential screen, and never see this tab.
 # click/upload/etc.), so whatever is in session_state right now is always what's
 # on disk too. This is the only thing that makes data survive an app.py restart -
 # it is intentionally NOT tied to any particular button or page.
+#
+# PERF: df_raw only ever changes when THIS session loads a brand-new dataset
+# (see _apply_loaded_df/load_sample - both REASSIGN df_raw to a fresh object,
+# never mutate it in place), so its Python object identity (id()) reliably
+# tells us whether the dataset changed since the last time we wrote it to
+# disk. Before this check, EVERY interaction anywhere in the app (pinning a
+# KPI, adding a chart, moving a slicer...) re-pickled the whole dataset to
+# disk, which is what was causing the reported lag. Now the full save()
+# (dataset + config) only runs when the dataset actually changed; every
+# other interaction uses save_light(), which is cheap because it never
+# touches the dataset.
 if st.session_state.authenticated and st.session_state.df_raw is not None:
-    ws.save(st.session_state, effective_workspace_id())
+    _wsid_now = effective_workspace_id()
+    if st.session_state.get("_last_saved_df_id") != id(st.session_state.df_raw):
+        ws.save(st.session_state, _wsid_now)
+        st.session_state._last_saved_df_id = id(st.session_state.df_raw)
+    else:
+        ws.save_light(st.session_state, _wsid_now)
 
 
 # footer
