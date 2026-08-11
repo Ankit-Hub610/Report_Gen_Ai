@@ -26,9 +26,11 @@ import io
 import copy
 import hashlib
 import time
+import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
+import extra_streamlit_components as stx
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from modules import auth, data_engine as de, chart_engine as ce, pdf_export as pe
@@ -268,71 +270,56 @@ ADMIN_URL_SECRET = "SET-YOUR-OWN-SECRET-HERE"
 # reported.
 #
 # A real cookie fixes this: it's still remembered by THIS browser across a
-# refresh/reopen (via st.context.cookies, which reflects whatever cookies
-# the browser actually sent with the page request), but it is never part of
-# the URL text, so copy-pasting the link into another browser/device carries
-# no credential at all — that browser has to log in for real. Opening a
-# second TAB in the *same* browser will still be logged in, same as any
-# normal website (Gmail, etc.) — that's expected, not a leak, since it's
-# still the same physical browser holding the cookie.
+# refresh/reopen, but it is never part of the URL text, so copy-pasting the
+# link into another browser/device carries no credential at all — that
+# browser has to log in for real. Opening a second TAB in the *same*
+# browser will still be logged in, same as any normal website (Gmail,
+# etc.) — that's expected, not a leak, since it's still the same physical
+# browser holding the cookie.
+#
+# Why extra_streamlit_components.CookieManager and not a hand-rolled
+# components.html(<script>document.cookie=...) trick: that was tried first
+# and was unreliable — components.html() renders inside a nested iframe,
+# and Streamlit's own re-render cycle could tear that iframe down before
+# its script had actually run, so the cookie write sometimes silently never
+# happened (login, refresh, bounced back to the login screen). CookieManager
+# is a real bidirectional Streamlit component (like any other widget) that
+# Streamlit itself guarantees finishes mounting and reports its value back
+# before treating the run as complete, so there's no race to lose.
 SESSION_COOKIE_NAME = "app_session"
 
 
+def _get_cookie_manager():
+    return stx.CookieManager(key="app_cookie_manager")
+
+
+# One instance, created once per script run, used by every login/logout
+# path below and by the refresh-restore check further down this file.
+cookie_manager = _get_cookie_manager()
+
+
 def _set_session_cookie(token: str):
-    """Sets the 'stay logged in' cookie, then reloads the page from JS itself
-    (never st.rerun() right after this - see the note below) so the very
-    next request the browser makes actually carries the freshly-set cookie.
-
-    Why not st.rerun(): components.html() injects an iframe whose <script>
-    the BROWSER has to receive and execute - that happens a moment after
-    Python moves on. Calling st.rerun() immediately after this call races
-    that: Streamlit can tear the whole page down and re-render before the
-    iframe's script ever ran, so the cookie never actually got written. That
-    race is exactly what was causing 'log in, then refresh -> bounced back
-    to the login page' - every login effectively lost its cookie. Doing the
-    reload in the SAME script tag, after the document.cookie line, guarantees
-    the write happens first.
-
-    Why window.top and not document/window.parent directly: components.html()
-    renders inside a nested iframe. Writing to that iframe's OWN document.cookie
-    can end up on the iframe's own (effectively separate) cookie jar rather
-    than the real top-level page's — the browser then reloads the real page,
-    which never got the cookie, and the person is right back at the login
-    screen on the very next refresh. window.top always refers to the actual
-    outermost browser tab, so the cookie lands on the real page's origin
-    (this is the fix for that exact bug)."""
-    import streamlit.components.v1 as components
-    components.html(
-        f"""<script>
-        window.top.document.cookie = "{SESSION_COOKIE_NAME}={token}; path=/; max-age={auth.SESSION_LIFETIME_SECONDS}; SameSite=Lax";
-        window.top.location.reload();
-        </script>""",
-        height=0, width=0,
-    )
-    st.stop()  # don't let this run keep going (and re-render the login form) - the JS reload above takes over
+    """Sets the 'stay logged in' cookie in the browser. Caller is
+    responsible for calling st.rerun() right after this (CookieManager
+    handles its own component lifecycle - no manual page reload needed)."""
+    expires_at = datetime.datetime.now() + datetime.timedelta(seconds=auth.SESSION_LIFETIME_SECONDS)
+    cookie_manager.set(SESSION_COOKIE_NAME, token, expires_at=expires_at, key="set_session_cookie")
 
 
 def _clear_session_cookie():
-    """Same reasoning as _set_session_cookie() above, in reverse: clear the
-    cookie (on window.top, for the same reason) and reload from the SAME
-    script tag, so Logout can't leave a stale cookie behind that would
-    silently log the person back in on their next visit."""
-    import streamlit.components.v1 as components
-    components.html(
-        f"""<script>
-        window.top.document.cookie = "{SESSION_COOKIE_NAME}=; path=/; max-age=0; SameSite=Lax";
-        window.top.location.reload();
-        </script>""",
-        height=0, width=0,
-    )
-    st.stop()
+    """Clears the 'stay logged in' cookie. Caller is responsible for calling
+    st.rerun() right after this."""
+    try:
+        cookie_manager.delete(SESSION_COOKIE_NAME, key="del_session_cookie")
+    except KeyError:
+        pass  # already gone (e.g. cookie had already expired) - nothing to clear
 
 
 def _get_session_cookie():
     try:
-        return st.context.cookies.get(SESSION_COOKIE_NAME)
+        return cookie_manager.get(cookie=SESSION_COOKIE_NAME)
     except Exception:
-        return None  # older Streamlit without st.context.cookies — fails safe (just asks to log in again)
+        return None  # cookie component hasn't finished its first mount yet - fails safe (just asks to log in again)
 
 
 def login_screen():
@@ -355,6 +342,7 @@ def login_screen():
                     _token = auth.create_session(u.strip())
                     st.session_state._session_token = _token
                     _set_session_cookie(_token)  # survives a browser refresh, but not copy-paste into another browser
+                    st.rerun()
                 else:
                     st.error("Invalid username or password.")
 
@@ -398,6 +386,7 @@ def login_screen():
                         _token = auth.create_session(au.strip())
                         st.session_state._session_token = _token
                         _set_session_cookie(_token)
+                        st.rerun()
                     else:
                         st.error("Invalid admin username or password.")
 
@@ -1046,7 +1035,8 @@ with st.sidebar:
         st.session_state.view_as_workspace = None
         st.session_state._loaded_workspace_id = None
         st.session_state._session_token = None
-        _clear_session_cookie()  # clears the cookie + reloads the page itself; nothing to do after this call
+        _clear_session_cookie()
+        st.rerun()
 
 
 # ==================================================================================
