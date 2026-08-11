@@ -2284,7 +2284,7 @@ elif page == "🤖 AI Assistant":
                 preview_card = {
                     "title": ai_spec.get("title") or "AI Card",
                     "column": ai_spec["column"],
-                    "measure": ai_spec.get("measure") if ai_spec.get("measure") in ac.CARD_CHART_MEASURES else "Sum",
+                    "measure": ac.normalize_measure(ai_spec.get("measure")) or "Sum",
                     "filters": [], "number_format": "Auto (Cr / L / K)", "custom_format_code": "#,##0.00",
                 }
                 be.render_kpi_card_value(df_raw, preview_card)
@@ -2309,14 +2309,17 @@ elif page == "🤖 AI Assistant":
                         st.success("Added and pinned to ⭐ Boss Dashboard!")
                         st.rerun()
             elif ai_spec.get("kind") == "chart" and ai_spec.get("x_col") in col_names and ai_spec.get("y_col") in col_names:
+                _grain = ac.normalize_grain(ai_spec.get("x_grain"))
+                if ai_spec["x_col"] not in (meta.get("date_cols") or []):
+                    _grain = None  # a grain only makes sense on an actual date column - never trust the AI blindly here
                 preview_chart = {
                     "id": "ai_preview",
                     "title": ai_spec.get("title") or "AI Chart",
-                    "type": ai_spec.get("chart_type") if ai_spec.get("chart_type") in be.CHART_TYPES else "Bar",
+                    "type": ac.normalize_chart_type(ai_spec.get("chart_type")) or "Bar",
                     "x_col": ai_spec["x_col"],
-                    "x_grain": ai_spec.get("x_grain") if ai_spec.get("x_grain") in ("D", "W", "ME", "YE") else None,
+                    "x_grain": _grain,
                     "y_col": ai_spec["y_col"],
-                    "y_measure": ai_spec.get("y_measure") if ai_spec.get("y_measure") in ac.CARD_CHART_MEASURES else "Sum",
+                    "y_measure": ac.normalize_measure(ai_spec.get("y_measure")) or "Sum",
                     "color_col": ai_spec.get("color_col") if ai_spec.get("color_col") in col_names else None,
                     "filters": [],
                 }
