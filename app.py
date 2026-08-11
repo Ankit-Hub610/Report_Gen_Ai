@@ -226,15 +226,24 @@ def sync_workspace_from_disk(force: bool = False):
         # this page (Remove/pin/unpin/etc.) call st.rerun() immediately after
         # changing session_state, which SKIPS the normal end-of-script
         # auto-save for that run entirely (it lives at the very bottom of
-        # this file, which an immediate rerun never reaches). Without this,
-        # the very next run's reload below would load a stale pre-change
-        # copy from disk and silently undo whatever was just clicked - that
-        # was making Remove/pin/etc. look broken.
-        # Fix: flush THIS session's current LIGHT state to disk FIRST, then
-        # read back. If this session made the latest change, that's a no-op
-        # (we just read back what we wrote). If a DIFFERENT session (e.g. a
-        # linked report-viewer, in another browser) saved something even
-        # more recently, we correctly pick up THEIR newer version instead.
+        # this file, which an immediate rerun never reaches). Without handling
+        # that, the very next run's reload below would load a stale pre-change
+        # copy from disk and silently undo whatever was just clicked.
+        #
+        # FIX (this used to be the actual bug behind "Refresh does nothing"):
+        # the old code ALWAYS saved this session's current light state to disk
+        # before reading it back. That's correct when THIS session made the
+        # latest change (nothing lost) - but when a DIFFERENT session (e.g. a
+        # linked report-viewer clicking Refresh, having made no local edits)
+        # ran this, it kept re-saving its own STALE copy over whatever the
+        # other session had just saved, THEN read that same stale copy back -
+        # so Refresh silently clobbered the other session's newer change
+        # instead of picking it up.
+        #
+        # Correct behaviour: only flush-save if THIS session actually has an
+        # unsaved local change (its current light state differs from what we
+        # last synced to/from disk). Otherwise, just load - never overwrite
+        # with a copy we know is unchanged from what we already had.
         #
         # PERF: this only ever needs to sync dashboard config (charts, pinned
         # KPIs, slicers, name, pivot reports) between sessions sharing a
@@ -244,12 +253,17 @@ def sync_workspace_from_disk(force: bool = False):
         # instead of the full save()/load(), which used to re-pickle the
         # WHOLE dataset on every single pin/unpin click - that was the cause
         # of the reported lag on this page.
-        if ss.get("df_raw") is not None:
+        current_light = {k: ss.get(k) for k in ws.LIGHT_KEYS}
+        last_synced = ss.get("_light_synced_snapshot")
+        if ss.get("df_raw") is not None and current_light != last_synced:
             ws.save_light(ss, wsid)
-        light = ws.load_light(wsid)
-        for k, v in light.items():
-            if v is not None:
-                ss[k] = v
+            ss["_light_synced_snapshot"] = current_light
+        else:
+            light = ws.load_light(wsid)
+            for k, v in light.items():
+                if v is not None:
+                    ss[k] = v
+            ss["_light_synced_snapshot"] = {k: ss.get(k) for k in ws.LIGHT_KEYS}
 
     if workspace_changed:
         # Rare event (login, or admin switching "View as") - the full
@@ -263,6 +277,7 @@ def sync_workspace_from_disk(force: bool = False):
         # as such so the end-of-script auto-save doesn't immediately re-save
         # the whole dataset again this same run.
         ss["_last_saved_df_id"] = id(ss.get("df_raw"))
+        ss["_light_synced_snapshot"] = {k: ss.get(k) for k in ws.LIGHT_KEYS}
     # dashboard_name is a plain string with a non-None default (set in init_state).
     # Old workspace saves made before this field existed (or a save with the
     # title cleared) can leave it as None here, which crashes the Boss
