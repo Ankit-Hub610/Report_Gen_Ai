@@ -662,6 +662,8 @@ def render_filters(df, meta, key_prefix=""):
             if d.empty:
                 continue
             lo, hi = d.min().date(), d.max().date()
+            if lo == hi:
+                continue  # a single-value range isn't a useful filter (matches the numeric filter's lo==hi skip above)
             with cols_ui[i % 3]:
                 default = filters.get(f"{key_prefix}{col}_daterange", (lo, hi))
                 # st.date_input can hand back a 1-item tuple while someone has picked
@@ -676,7 +678,22 @@ def render_filters(df, meta, key_prefix=""):
                 # range instead of ever handing st.date_input something invalid.
                 if not (isinstance(default, (tuple, list)) and len(default) == 2):
                     default = (lo, hi)
-                rng = st.date_input(col, default, key=f"{key_prefix}filt_date_{col}")
+                # Belt-and-braces: the guard above covers the one specific bad shape
+                # we could reproduce, but st.date_input can reject a stored value for
+                # other reasons too (e.g. a date outside its own internal allowed
+                # range). Whatever the reason, ONE broken date filter should never
+                # take down cards/charts on the ENTIRE page for every role - that's
+                # strictly worse than just not offering a filter for this one column.
+                try:
+                    rng = st.date_input(col, default, key=f"{key_prefix}filt_date_{col}")
+                except Exception:
+                    filters.pop(f"{key_prefix}{col}_daterange", None)
+                    try:
+                        rng = st.date_input(col, (lo, hi), key=f"{key_prefix}filt_date_{col}_safe")
+                    except Exception:
+                        st.caption(f"⚠️ Couldn't build a date filter for **{col}** (unusual date values) — skipped.")
+                        i += 1
+                        continue
                 filters[f"{key_prefix}{col}_daterange"] = rng
             i += 1
         c1, c2 = st.columns([1, 5])
@@ -790,7 +807,13 @@ def render_slicers(df, meta, key_prefix="", editable=None):
                 if d.empty:
                     continue
                 lo, hi = d.min().date(), d.max().date()
-                rng = st.date_input(field, (lo, hi), key=skey, label_visibility="collapsed")
+                if lo == hi:
+                    continue
+                try:
+                    rng = st.date_input(field, (lo, hi), key=skey, label_visibility="collapsed")
+                except Exception:
+                    st.caption(f"⚠️ Couldn't build a date slicer for **{field}** (unusual date values) — skipped.")
+                    continue
                 if isinstance(rng, (tuple, list)) and len(rng) == 2:
                     d_col = pd.to_datetime(view[field], errors="coerce")
                     view = view[(d_col.dt.date >= rng[0]) & (d_col.dt.date <= rng[1])]
