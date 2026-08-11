@@ -229,6 +229,81 @@ def ask(question, df, meta, kpis, dashboard_charts, api_key, history=None):
 # pinnable to the Boss Dashboard exactly the same way.
 CARD_CHART_MEASURES = ["Sum", "Average", "Count", "Distinct Count", "Min", "Max", "Median", "Std Dev"]
 CARD_CHART_TYPES = ["Bar", "Line", "Pie", "Donut", "Area", "Scatter", "Box", "Histogram", "Treemap", "Heatmap", "Table"]
+GRAIN_CODES = ("D", "W", "ME", "YE")
+
+# --------------------------------------------------------------------------------
+# NORMALIZING THE AI's ANSWER
+# --------------------------------------------------------------------------------
+# The free/auto-routed model behind this (openrouter/free — whatever's currently
+# available on the free tier) mostly follows the "reply with exactly one of
+# these words" instruction above, but not always: it might say "pie chart"
+# instead of "Pie", "monthly" instead of "ME", "average" in lowercase, etc.
+# app.py used to check these fields with a strict `in` / `==` against the exact
+# expected strings, so ANY of those deviations silently fell through to a
+# hard-coded default (chart type -> always "Bar", grain -> always None/no
+# grouping) with no error shown — which is why chart type looked ignored, and
+# why a "monthly trend" request could come out grouped by every individual raw
+# timestamp instead of by month (hundreds of tiny slices/bars, and Plotly then
+# squashes the actual plot area to fit that huge legend — the "size" looking
+# broken was a symptom of this, not a separate bug). Normalize with synonyms
+# instead of requiring an exact match.
+_CHART_TYPE_ALIASES = {
+    "bar": "Bar", "bar chart": "Bar", "column": "Bar", "column chart": "Bar", "bars": "Bar",
+    "line": "Line", "line chart": "Line", "trend": "Line", "trendline": "Line",
+    "pie": "Pie", "pie chart": "Pie",
+    "donut": "Donut", "doughnut": "Donut", "donut chart": "Donut",
+    "area": "Area", "area chart": "Area",
+    "scatter": "Scatter", "scatter plot": "Scatter", "scatterplot": "Scatter",
+    "box": "Box", "box plot": "Box", "boxplot": "Box",
+    "histogram": "Histogram", "hist": "Histogram",
+    "treemap": "Treemap", "tree map": "Treemap",
+    "heatmap": "Heatmap", "heat map": "Heatmap",
+    "table": "Table",
+}
+_MEASURE_ALIASES = {
+    "sum": "Sum", "total": "Sum",
+    "average": "Average", "avg": "Average", "mean": "Average",
+    "count": "Count", "number of": "Count", "no of": "Count",
+    "distinct count": "Distinct Count", "unique count": "Distinct Count", "distinct": "Distinct Count", "unique": "Distinct Count",
+    "min": "Min", "minimum": "Min",
+    "max": "Max", "maximum": "Max",
+    "median": "Median",
+    "std dev": "Std Dev", "stddev": "Std Dev", "standard deviation": "Std Dev", "std": "Std Dev",
+}
+_GRAIN_ALIASES = {
+    "d": "D", "day": "D", "daily": "D",
+    "w": "W", "week": "W", "weekly": "W",
+    "me": "ME", "m": "ME", "month": "ME", "monthly": "ME",
+    "ye": "YE", "y": "YE", "year": "YE", "yearly": "YE", "annual": "YE", "annually": "YE",
+    "none": None, "": None,
+}
+
+
+def _normalize(raw, aliases: dict, valid_values):
+    """Case/spacing/synonym-tolerant match against a known set of values.
+    Returns the canonical value, or None if nothing reasonable matches."""
+    if raw is None:
+        return None
+    if raw in valid_values:  # already exact — the common case, skip the rest
+        return raw
+    key = str(raw).strip().lower()
+    if key in aliases:
+        return aliases[key]
+    return None
+
+
+def normalize_chart_type(raw):
+    return _normalize(raw, _CHART_TYPE_ALIASES, CARD_CHART_TYPES)
+
+
+def normalize_measure(raw):
+    return _normalize(raw, _MEASURE_ALIASES, CARD_CHART_MEASURES)
+
+
+def normalize_grain(raw):
+    if raw is None:
+        return None
+    return _normalize(raw, _GRAIN_ALIASES, GRAIN_CODES)
 
 
 def _card_chart_system_prompt(df: pd.DataFrame) -> str:
