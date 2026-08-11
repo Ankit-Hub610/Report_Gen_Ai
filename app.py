@@ -496,6 +496,7 @@ def login_screen():
         with _lc2:
             _img_html = _logo_img_html(_logo, _logo_mime, brand.get("logo_width", 220))
             _render_glow_target("brand_glow_logo", "logo", brand, _img_html)
+    st.markdown("<h1 style='text-align:center;'>RA-I</h1>", unsafe_allow_html=True)
     st.markdown("<h1 style='text-align:center;'>Research | Analysis | Intteligance </h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
@@ -1692,12 +1693,19 @@ elif page == "⭐ Boss Dashboard":
         st.title(st.session_state.dashboard_name or "⭐ Boss Dashboard")
     st.caption("Only what you picked shows up here. Style it, swap any chart, then export a clean PDF.")
 
-    # Auto-sync so a client and their linked report-viewer(s) - separate browser
-    # sessions sharing this workspace - always see each other's latest changes
-    # (pinned/swapped charts, slicers, theme...) without anyone touching a
-    # button. No user-facing controls for this on purpose - it's just always on.
-    if AUTOREFRESH_AVAILABLE:
-        st_autorefresh(interval=1000, key="boss_dashboard_live_sync")
+    # Manual sync, on purpose: a client and their linked report-viewer(s) are
+    # separate browser sessions sharing this workspace. Whoever clicks this
+    # pulls in the OTHER side's latest changes (pinned/swapped charts,
+    # slicers, theme...) right away. This replaces an earlier every-1-second
+    # auto-refresh, which kept re-syncing from disk in the background even
+    # when nothing had changed - a bigger drag on the page than just
+    # clicking Refresh when you actually want the latest.
+    _title_col, _refresh_col = st.columns([5, 1])
+    with _refresh_col:
+        if st.button("🔄 Refresh", use_container_width=True,
+                      help="Pull in the latest changes made by the client or their linked viewer(s)"):
+            sync_workspace_from_disk(force=True)
+            st.rerun()
 
     if st.session_state.df_raw is None:
         st.info("Load data on the **📥 Connect Data** page first.")
