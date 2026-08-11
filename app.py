@@ -253,17 +253,28 @@ def sync_workspace_from_disk(force: bool = False):
         # instead of the full save()/load(), which used to re-pickle the
         # WHOLE dataset on every single pin/unpin click - that was the cause
         # of the reported lag on this page.
+        #
+        # NOTE on deepcopy below: some actions (e.g. removing a pinned KPI
+        # card) mutate a LIGHT_KEYS list/dict IN PLACE (list.remove(...),
+        # card["pinned"] = False) instead of assigning a new object. If the
+        # snapshot only stored the same object reference, that in-place edit
+        # would silently show up in the snapshot too - making current_light
+        # look unchanged from last_synced, so the real edit would never get
+        # flushed to disk (and the very next load would overwrite it back to
+        # the old, pre-removal state). Deep-copying the snapshot is what
+        # makes it a true "what disk had last", independent of later in-place
+        # edits to session_state.
         current_light = {k: ss.get(k) for k in ws.LIGHT_KEYS}
         last_synced = ss.get("_light_synced_snapshot")
         if ss.get("df_raw") is not None and current_light != last_synced:
             ws.save_light(ss, wsid)
-            ss["_light_synced_snapshot"] = current_light
+            ss["_light_synced_snapshot"] = copy.deepcopy(current_light)
         else:
             light = ws.load_light(wsid)
             for k, v in light.items():
                 if v is not None:
                     ss[k] = v
-            ss["_light_synced_snapshot"] = {k: ss.get(k) for k in ws.LIGHT_KEYS}
+            ss["_light_synced_snapshot"] = copy.deepcopy({k: ss.get(k) for k in ws.LIGHT_KEYS})
 
     if workspace_changed:
         # Rare event (login, or admin switching "View as") - the full
@@ -277,7 +288,7 @@ def sync_workspace_from_disk(force: bool = False):
         # as such so the end-of-script auto-save doesn't immediately re-save
         # the whole dataset again this same run.
         ss["_last_saved_df_id"] = id(ss.get("df_raw"))
-        ss["_light_synced_snapshot"] = {k: ss.get(k) for k in ws.LIGHT_KEYS}
+        ss["_light_synced_snapshot"] = copy.deepcopy({k: ss.get(k) for k in ws.LIGHT_KEYS})
     # dashboard_name is a plain string with a non-None default (set in init_state).
     # Old workspace saves made before this field existed (or a save with the
     # title cleared) can leave it as None here, which crashes the Boss
