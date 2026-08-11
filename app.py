@@ -428,11 +428,27 @@ if _reset_token and not st.session_state.authenticated:
 
 # A genuine browser refresh wipes st.session_state (a brand-new Streamlit session
 # starts), which used to bounce people straight back to the login screen just for
-# hitting F5/reload. Before falling back to the login screen, check the ?s=...
-# token Streamlit kept in the URL across that reload — if it's still valid, log
-# the person back in silently instead of making them type their password again.
+# hitting F5/reload. Before falling back to the login screen, check the cookie
+# CookieManager keeps across that reload — if it's still valid, log the person
+# back in silently instead of making them type their password again.
+#
+# IMPORTANT: on a brand-new session (i.e. right after a real F5 refresh),
+# CookieManager hasn't actually heard back from the browser yet on THIS run —
+# reading a cookie is a one-way trip out to the browser and back, and that
+# reply doesn't arrive until the NEXT rerun. get_all() returns None to mean
+# specifically "haven't heard back yet" (as opposed to {} = "heard back, no
+# cookies"). Treating that None the same as "not logged in" (which the
+# earlier version of this code did) is exactly what was still sending people
+# to the login screen on every refresh even with a valid cookie sitting
+# right there in the browser. So: if it's still None, stop and wait for the
+# automatic rerun CookieManager triggers once it has the real answer -
+# don't conclude "not logged in" from an answer that hasn't arrived yet.
 if not st.session_state.authenticated:
-    _session_token = _get_session_cookie()
+    _all_cookies = cookie_manager.get_all()
+    if _all_cookies is None:
+        st.info("Restoring your session…")
+        st.stop()
+    _session_token = _all_cookies.get(SESSION_COOKIE_NAME)
     _resolved_user = auth.resolve_session(_session_token) if _session_token else None
     if _resolved_user and auth.user_exists(_resolved_user):
         st.session_state.authenticated = True
