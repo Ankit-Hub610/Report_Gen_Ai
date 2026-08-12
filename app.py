@@ -40,6 +40,7 @@ from modules import query_engine as qe
 from modules import db_connector as dbc
 from modules import ai_chat as ac
 from modules import email_service as es
+from modules import intel_engine as ie
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -159,6 +160,16 @@ def init_state():
     ss.setdefault("db_auto_sync_seconds", 0)     # 0 = off; >0 = auto-refresh interval selected on Connect Data page
     ss.setdefault("db_queries", [])         # list of query-tab dicts, see modules/db_connector.py
     ss.setdefault("db_query_results", {})   # {query_id: DataFrame}
+
+    # 🧠 Intelligence Report page
+    ss.setdefault("intel_role_overrides", {})   # user-confirmed column-role mapping (persisted)
+    ss.setdefault("intel_language", "English")  # persisted — last-picked narrative language
+    ss.setdefault("intel_action_checks", [])    # persisted — [{text, done}] Top-Actions tracker
+    ss.setdefault("intel_part", 1)              # session-only — which half of the report is showing (1 or 2)
+    ss.setdefault("_intel_cache_key", None)     # session-only — fingerprint of last-computed facts
+    ss.setdefault("_intel_facts", None)         # session-only — cached facts bundle (dict of real numbers)
+    ss.setdefault("_intel_narrative", None)     # session-only — cached AI narrative text, keyed by (cache_key, language)
+    ss.setdefault("intel_qa_history", [])       # session-only — follow-up Q&A chat log on this page
 
 
 init_state()
@@ -522,7 +533,7 @@ def login_screen():
         with _lc2:
             _img_html = _logo_img_html(_logo, _logo_mime, brand.get("logo_width", 220))
             _render_glow_target("brand_glow_logo", "logo", brand, _img_html)
-    st.markdown("<h1 style='text-align:center;'>Research | Analysis | Intelligence </h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align:center;'>Research | Analysis | Intteligance </h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
@@ -1307,8 +1318,8 @@ with st.sidebar:
 
     sync_workspace_from_disk()
 
-    nav_options = ["📥 Connect Data", "📊 Raw Analysis", "🧩 Custom Builder", "⭐ Boss Dashboard", "🗂 Data Table",
-                    "🤖 AI Assistant", "⚙️ Settings"]
+    nav_options = ["📥 Connect Data", "📊 Raw Analysis", "🧩 Custom Builder", "⭐ Boss Dashboard",
+                    "🧠 Intelligence Report", "🗂 Data Table", "🤖 AI Assistant", "⚙️ Settings"]
     if st.session_state.role == auth.ROLE_REPORT_VIEWER:
         nav_options = ["⭐ Boss Dashboard"]   # nothing else exists for this account, not even Settings
     if st.session_state.role == auth.ROLE_ADMIN:
@@ -1923,6 +1934,305 @@ elif page == "⭐ Boss Dashboard":
             st.download_button("📥 Click to download report.pdf", data=pdf_bytes,
                                 file_name="sports_analytics_report.pdf", mime="application/pdf",
                                 type="primary")
+
+
+# ==================================================================================
+# PAGE 2.5: INTELLIGENCE REPORT — full auto business-analytics report on ANY dataset
+# ==================================================================================
+elif page == "🧠 Intelligence Report":
+    st.title("🧠 Intelligence Report")
+    st.caption("Har number Python khud calculate karta hai (koi invented figure nahi) — AI sirf unko "
+               "explain, prioritize aur recommend karta hai.")
+
+    if st.session_state.df_raw is None:
+        st.info("⬅️ No data loaded yet. Go to **📥 Connect Data** in the sidebar to upload a file or connect a database.")
+        st.stop()
+
+    df_raw = st.session_state.df_raw
+    meta = st.session_state.meta
+    df = render_filters(df_raw, meta, key_prefix="intel_")
+    if df.empty:
+        st.warning("No rows match the current filters.")
+        st.stop()
+
+    api_key = ac.get_api_key() or st.session_state.ai_groq_key
+
+    # ------------------------------------------------------------------------
+    # COLUMN MAPPING — auto-detected, always user-confirmable/editable
+    # ------------------------------------------------------------------------
+    auto_roles = ie.detect_roles(df, meta)
+    saved_overrides = st.session_state.intel_role_overrides or {}
+    role_labels = {
+        "revenue": "Revenue / Sales", "cost": "Cost", "profit": "Profit (agar already column hai)",
+        "customer": "Customer", "product": "Product / Category", "location": "Location / Region",
+        "channel": "Channel", "order_id": "Order / Transaction ID", "date": "Date",
+    }
+    with st.expander("🧭 Column Mapping — auto-detected, confirm ya change karein", expanded=False):
+        cols_options = ["(none)"] + list(df.columns)
+        new_roles = {}
+        rcols = st.columns(3)
+        for i, (key, label) in enumerate(role_labels.items()):
+            default = saved_overrides.get(key, auto_roles.get(key)) or "(none)"
+            idx = cols_options.index(default) if default in cols_options else 0
+            with rcols[i % 3]:
+                picked = st.selectbox(label, cols_options, index=idx, key=f"intel_role_{key}")
+            new_roles[key] = None if picked == "(none)" else picked
+        if st.button("💾 Save mapping & Recalculate", key="intel_save_roles", disabled=not can_edit()):
+            st.session_state.intel_role_overrides = new_roles
+            st.session_state._intel_cache_key = None
+            ws.save_light(st.session_state, st.session_state.workspace_id)
+            st.rerun()
+    roles = dict(auto_roles)
+    roles.update({k: v for k, v in saved_overrides.items()})
+
+    # ------------------------------------------------------------------------
+    # LANGUAGE TOGGLE
+    # ------------------------------------------------------------------------
+    top_l, top_r = st.columns([4, 1])
+    with top_r:
+        language = st.radio("Language", ["English", "Hindi"], horizontal=True,
+                             index=0 if st.session_state.intel_language == "English" else 1,
+                             key="intel_lang_radio", label_visibility="collapsed")
+    if language != st.session_state.intel_language:
+        st.session_state.intel_language = language
+        st.session_state._intel_narrative = None  # force re-generation in the new language
+        ws.save_light(st.session_state, st.session_state.workspace_id)
+
+    # ------------------------------------------------------------------------
+    # COMPUTE FACTS (cached — recomputed only when data/mapping/language changes)
+    # ------------------------------------------------------------------------
+    cache_key = ie.facts_hash(df, roles, st.session_state.intel_language)
+    if st.session_state._intel_cache_key != cache_key or st.session_state._intel_facts is None:
+        with st.spinner("Numbers calculate ho rahe hain..."):
+            st.session_state._intel_facts = ie.build_facts_bundle(df, meta, roles)
+        st.session_state._intel_cache_key = cache_key
+        st.session_state._intel_narrative = None  # numbers changed -> old narrative is stale
+    facts = st.session_state._intel_facts
+
+    # ------------------------------------------------------------------------
+    # HEALTH BADGE (deterministic)
+    # ------------------------------------------------------------------------
+    health = facts["health"]
+    badge = {"Healthy": "🟢", "Stable": "🟡", "At Risk": "🟠", "Critical": "🔴"}.get(health["label"], "⚪")
+    st.markdown(f"### {badge}  Business Health: **{health['label']}**")
+    if health["reasons"]:
+        st.caption(" • ".join(health["reasons"]))
+
+    snapshots = ws.load_intel_snapshots(st.session_state.workspace_id)
+    if snapshots:
+        last = snapshots[-1]
+        cur_rev = facts["financials"].get("total_revenue")
+        if cur_rev is not None and last.get("total_revenue"):
+            delta = 100 * (cur_rev - last["total_revenue"]) / last["total_revenue"]
+            when = datetime.datetime.fromtimestamp(last["ts"]).strftime("%d %b %Y")
+            st.caption(f"📊 vs your last saved report ({when}): revenue **{delta:+.1f}%**")
+
+    st.divider()
+
+    # ------------------------------------------------------------------------
+    # PART NAVIGATION — split across two screens so nothing overflows one page
+    # ------------------------------------------------------------------------
+    part = st.radio("Report section", ["📄 Part 1 — Data, KPIs & Trends", "📄 Part 2 — Insights & Actions"],
+                     horizontal=True, index=st.session_state.intel_part - 1, key="intel_part_radio",
+                     label_visibility="collapsed")
+    st.session_state.intel_part = 1 if part.startswith("📄 Part 1") else 2
+    st.divider()
+
+    # ==========================================================================
+    # PART 1 — DATA QUALITY, KPI SCORECARD, FINANCIALS, TREND/FORECAST, BREAKDOWNS
+    # ==========================================================================
+    if st.session_state.intel_part == 1:
+        q = facts["quality"]
+        st.subheader("🧪 Data Quality")
+        qc1, qc2 = st.columns([1, 3])
+        with qc1:
+            st.metric("Quality Score", f"{q['score']}/100")
+        with qc2:
+            for issue in q["issues"]:
+                st.caption(f"• {issue}")
+
+        st.subheader("🎯 KPI Scorecard")
+        f = facts["financials"]
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Total Revenue", de._fmt_num(f.get("total_revenue")) if f.get("total_revenue") is not None else "—")
+        if f.get("profit_calculable"):
+            k2.metric("Total Profit", de._fmt_num(f.get("total_profit")),
+                      f"{f.get('profit_margin_pct')}% margin" if f.get("profit_margin_pct") is not None else None)
+        else:
+            k2.metric("Total Profit", "N/A")
+            k2.caption("Profit cannot be directly calculated from the available data.")
+        k3.metric("Total Orders", f"{f.get('total_orders'):,}" if f.get("total_orders") else "—")
+        k4.metric("Avg Order Value", de._fmt_num(f.get("avg_order_value")) if f.get("avg_order_value") is not None else "—")
+        k5, k6 = st.columns(2)
+        k5.metric("Customers", f"{f.get('customer_count'):,}" if f.get("customer_count") else "—")
+        k6.metric("Revenue / Customer", de._fmt_num(f.get("revenue_per_customer")) if f.get("revenue_per_customer") is not None else "—")
+
+        st.divider()
+        st.subheader("📈 Revenue Trend & Forecast")
+        t, fc = facts["trend"], facts["forecast"]
+        if t.get("available"):
+            trend_df = pd.DataFrame({"Period": t["periods"], "Revenue (Actual)": t["values"]}).set_index("Period")
+            st.line_chart(trend_df)
+            tc1, tc2 = st.columns(2)
+            tc1.caption(f"📈 Best period: **{t['best_period']}** ({de._fmt_num(t['best_period_value'])})")
+            tc2.caption(f"📉 Worst period: **{t['worst_period']}** ({de._fmt_num(t['worst_period_value'])})")
+            if t.get("overall_change_pct") is not None:
+                st.caption(f"Overall change (first → last period): **{t['overall_change_pct']:+.1f}%**"
+                           + (f" · CAGR: **{fc.get('cagr_pct')}%**" if t.get("cagr_pct") is not None else ""))
+        else:
+            st.info(t.get("reason", "Trend not available."))
+
+        if fc.get("available"):
+            st.caption(f"🔮 Forecast (next {len(fc['forecast_periods'])} months) — method: {fc['method']}, "
+                       f"confidence: **{fc['confidence']}** (R²={fc['r2']}), direction: **{fc['direction']}**")
+            fc_df = pd.DataFrame({
+                "Period": fc["history_periods"] + fc["forecast_periods"],
+                "Value": fc["history_values"] + fc["forecast_values"],
+                "Type": ["Actual"] * len(fc["history_periods"]) + ["Forecast"] * len(fc["forecast_periods"]),
+            })
+            st.dataframe(fc_df, use_container_width=True, hide_index=True)
+            st.caption("⚠️ Rows marked **Forecast** are estimates, not actual results.")
+        else:
+            st.info(fc.get("reason", "Forecast not available."))
+
+        if facts["anomalies"]:
+            st.divider()
+            st.subheader("🚨 Anomalies Detected")
+            st.dataframe(pd.DataFrame(facts["anomalies"]), use_container_width=True, hide_index=True)
+
+        if facts["correlations"]:
+            st.divider()
+            st.subheader("📊 Correlations")
+            st.dataframe(pd.DataFrame(facts["correlations"]), use_container_width=True, hide_index=True)
+            st.caption("Correlation does not prove causation.")
+
+        breakdown_labels = {"product": "📦 Product", "customer": "👥 Customer", "location": "🌍 Location", "channel": "🔀 Channel"}
+        any_breakdown = any(facts["breakdowns"].get(k, {}).get("available") for k in breakdown_labels)
+        if any_breakdown:
+            st.divider()
+            st.subheader("🏆 Top / Bottom Breakdowns")
+            btabs = st.tabs([lbl for k, lbl in breakdown_labels.items() if facts["breakdowns"].get(k, {}).get("available")])
+            available_keys = [k for k in breakdown_labels if facts["breakdowns"].get(k, {}).get("available")]
+            for key, tab in zip(available_keys, btabs):
+                b = facts["breakdowns"][key]
+                with tab:
+                    st.caption(f"By **{b['dimension']}**, measured on **{b['measure']}** · {b['unique_count']} unique values · "
+                               f"top-5 share of total: **{b['top5_share_pct']}%**")
+                    bc1, bc2 = st.columns(2)
+                    with bc1:
+                        st.markdown("**Top performers**")
+                        st.dataframe(pd.DataFrame(b["top"]), use_container_width=True, hide_index=True)
+                    with bc2:
+                        st.markdown("**Bottom performers**")
+                        st.dataframe(pd.DataFrame(b["bottom"]), use_container_width=True, hide_index=True)
+
+        st.divider()
+        if st.button("➡️ Continue to Part 2 — Insights & Actions", type="primary", key="intel_go_part2"):
+            st.session_state.intel_part = 2
+            st.rerun()
+
+    # ==========================================================================
+    # PART 2 — AI NARRATIVE (root cause, risks, opportunities, actions, verdict)
+    #          + ACTION TRACKER + FOLLOW-UP Q&A + EXPORT
+    # ==========================================================================
+    else:
+        st.subheader("🧠 AI Analyst Write-up")
+        st.caption("Sabhi numbers upar Part 1 se hi liye gaye hain — AI unhe explain/prioritize karta hai, "
+                   "koi naya number invent nahi karta.")
+
+        if not api_key:
+            if st.session_state.role == auth.ROLE_ADMIN:
+                st.warning("No free OpenRouter API key configured yet — add one on the **🤖 AI Assistant** page to enable this section.")
+            else:
+                st.info("🧠 AI write-up abhi enable nahi hai. Please contact your admin to turn this on.")
+        else:
+            regen_col1, regen_col2 = st.columns([1, 3])
+            with regen_col1:
+                gen_clicked = st.button("✨ Generate / Refresh Report", type="primary", key="intel_gen_report")
+            if gen_clicked or (st.session_state._intel_narrative is None):
+                with st.spinner("AI report likh raha hai..."):
+                    facts_text = ie.facts_to_prompt_text(facts)
+                    result = ac.generate_report_narrative(facts_text, api_key, st.session_state.intel_language)
+                if result["error"]:
+                    st.error(result["error"])
+                else:
+                    st.session_state._intel_narrative = result["report"]
+
+            if st.session_state._intel_narrative:
+                st.markdown(st.session_state._intel_narrative)
+
+                exp_col1, exp_col2, exp_col3 = st.columns(3)
+                with exp_col1:
+                    st.download_button("⬇️ Download report (.md)", data=st.session_state._intel_narrative,
+                                        file_name="intelligence_report.md", mime="text/markdown",
+                                        use_container_width=True)
+                with exp_col2:
+                    if st.button("💾 Save snapshot for future comparison", use_container_width=True, disabled=not can_edit()):
+                        ws.save_intel_snapshot({
+                            "ts": time.time(),
+                            "total_revenue": facts["financials"].get("total_revenue"),
+                            "total_profit": facts["financials"].get("total_profit"),
+                            "profit_margin_pct": facts["financials"].get("profit_margin_pct"),
+                            "row_count": facts["row_count"],
+                        }, st.session_state.workspace_id)
+                        st.success("Snapshot saved.")
+                with exp_col3:
+                    with st.popover("📧 Email this report", use_container_width=True):
+                        to_email = st.text_input("Send to", key="intel_email_to")
+                        if st.button("Send", key="intel_email_send") and to_email.strip():
+                            ok, msg = es.send_report_email(
+                                to_email.strip(), "Intelligence Report — RA-Intelligence Platform",
+                                st.session_state._intel_narrative)
+                            (st.success if ok else st.error)(msg)
+
+        st.divider()
+        st.subheader("✅ Action Tracker")
+        st.caption("Top Actions ko yahan add karke tick karte jao — persist rahega.")
+        new_action = st.text_input("+ Add an action item", key="intel_new_action")
+        if st.button("Add", key="intel_add_action") and new_action.strip() and can_edit():
+            st.session_state.intel_action_checks.append({"text": new_action.strip(), "done": False})
+            ws.save_light(st.session_state, st.session_state.workspace_id)
+            st.rerun()
+        for i, item in enumerate(list(st.session_state.intel_action_checks)):
+            ac1, ac2 = st.columns([9, 1])
+            with ac1:
+                checked = st.checkbox(item["text"], value=item["done"], key=f"intel_action_{i}", disabled=not can_edit())
+                if checked != item["done"]:
+                    st.session_state.intel_action_checks[i]["done"] = checked
+                    ws.save_light(st.session_state, st.session_state.workspace_id)
+            with ac2:
+                if can_edit() and st.button("🗑️", key=f"intel_action_del_{i}"):
+                    st.session_state.intel_action_checks.pop(i)
+                    ws.save_light(st.session_state, st.session_state.workspace_id)
+                    st.rerun()
+
+        if api_key:
+            st.divider()
+            st.subheader("💬 Follow-up Questions")
+            st.caption("Is report ke baare mein kuch aur poochna hai? Answers real SQL se grounded hote hain.")
+            for turn in st.session_state.intel_qa_history:
+                with st.chat_message(turn["role"]):
+                    st.markdown(turn["content"])
+            qa_question = st.chat_input("e.g. \"Which month had the highest revenue?\"", key="intel_qa_input")
+            if qa_question:
+                st.session_state.intel_qa_history.append({"role": "user", "content": qa_question})
+                with st.chat_message("user"):
+                    st.markdown(qa_question)
+                with st.chat_message("assistant"):
+                    with st.spinner("Sochte hain..."):
+                        kpis_for_qa = de.compute_kpis(df, meta)
+                        qa_result = ac.ask(qa_question, df, meta, kpis_for_qa, st.session_state.dashboard_charts,
+                                           api_key, history=st.session_state.intel_qa_history[:-1])
+                    if qa_result["error"]:
+                        st.error(qa_result["error"])
+                    else:
+                        st.markdown(qa_result["answer"])
+                        st.session_state.intel_qa_history.append({"role": "assistant", "content": qa_result["answer"]})
+
+        st.divider()
+        if st.button("⬅️ Back to Part 1", key="intel_back_part1"):
+            st.session_state.intel_part = 1
+            st.rerun()
 
 
 # ==================================================================================
