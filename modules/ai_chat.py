@@ -355,6 +355,78 @@ def _call_openrouter_plain(api_key, messages, temperature=0.1):
     return resp.json()
 
 
+# ==================================================================================
+# INTELLIGENCE REPORT — NARRATIVE WRITE-UP OVER ALREADY-COMPUTED FACTS
+# ==================================================================================
+# Unlike the two functions above (`ask`, `suggest_card_or_chart`), this NEVER lets
+# the model touch raw data or invent a number — modules/intel_engine.py computes
+# every figure in the report with plain pandas first, and this function is only
+# ever asked to explain / prioritise / write up numbers it's handed. That split is
+# what keeps a free/uncontrolled model from hallucinating a business report.
+_REPORT_SECTIONS_EN = (
+    "1. Executive Summary (health verdict + why, 3-4 sentences)\n"
+    "2. Root-Cause Highlights (for the 2-3 biggest moves in the numbers: Problem -> Evidence -> "
+    "Possible Cause -> Business Impact -> Recommended Action. Clearly separate correlation from "
+    "confirmed cause.)\n"
+    "3. Risks (3-5 risks, each: Risk -> Evidence from the numbers above -> Qualitative confidence "
+    "(Low/Medium/High, since no statistical probability was computed) -> Potential Impact -> Mitigation)\n"
+    "4. Opportunities (3-5, ranked by likely Impact x Feasibility)\n"
+    "5. Top 5 Positive Findings (short bullets, cite the actual numbers)\n"
+    "6. Top 5 Problems (short bullets, cite the actual numbers)\n"
+    "7. Top 8 Recommended Actions as a markdown table with columns: Priority | Action | Reason | "
+    "Expected Impact | Time Horizon (Immediate/30 Days/60-90 Days/3-6 Months)\n"
+    "8. Growth Strategy — answer briefly: where to invest more, where to cut, biggest opportunity, "
+    "biggest risk, what management should do first\n"
+    "9. One-sentence Final Verdict (bold) — the one thing management should remember"
+)
+_REPORT_SECTIONS_HI = (
+    "उपरोक्त सभी सेक्शन हिंदी में लिखें (Hindi/Devanagari script mein), lekin column names, product/customer/"
+    "location ke naam aur numbers English/original form mein hi rakhein।"
+)
+
+
+def _report_system_prompt(facts_text: str, language: str) -> str:
+    lang_instr = _REPORT_SECTIONS_HI if language == "Hindi" else "Write the whole report in clear, simple English."
+    return f"""You are a senior business analyst writing a management report. You are given ONLY
+pre-computed, real facts about a dataset below — every number in it was calculated with actual code,
+not by you. You must NEVER invent, adjust, or estimate any number yourself — only use the numbers
+given. Where a section says "not available", say so plainly instead of guessing. Clearly separate
+ACTUAL data from FORECAST data wherever both appear (the facts below label forecasts explicitly).
+Never claim causation where only correlation is shown.
+
+FACTS (all real, pre-computed — DATA SOURCE OF TRUTH):
+{facts_text}
+
+Write a management report with EXACTLY these sections, in this order, using markdown headers (###):
+{_REPORT_SECTIONS_EN}
+
+{lang_instr}
+Keep it concise and business-focused — no filler, no repeating the raw facts list verbatim, no
+disclaimers about being an AI."""
+
+
+def generate_report_narrative(facts_text: str, api_key: str, language: str = "English"):
+    """Returns {"report": str|None, "error": str|None}. `language` is
+    'English', 'Hindi', or 'Both' (caller should call this twice for 'Both',
+    once per language, and cache each separately)."""
+    if not api_key:
+        return {"report": None, "error": "No OpenRouter API key configured yet — add one on the AI Assistant page (it's free)."}
+    lang = "Hindi" if language == "Hindi" else "English"
+    messages = [{"role": "user", "content": _report_system_prompt(facts_text, lang)}]
+    try:
+        data = _call_openrouter_plain(api_key, messages, temperature=0.35)
+        content = data["choices"][0]["message"].get("content", "").strip()
+        if not content:
+            return {"report": None, "error": "AI returned an empty report — try again."}
+        return {"report": content, "error": None}
+    except ChatError as e:
+        return {"report": None, "error": str(e)}
+    except requests.RequestException as e:
+        return {"report": None, "error": f"Network error reaching OpenRouter — check internet: {e}"}
+    except (KeyError, IndexError, TypeError):
+        return {"report": None, "error": "AI didn't return a usable report — try again."}
+
+
 def suggest_card_or_chart(requirement: str, df: pd.DataFrame, api_key):
     """Asks the model to design ONE KPI card or ONE chart matching the loaded
     dataset's real columns. Returns {"spec": dict|None, "error": str|None} —
