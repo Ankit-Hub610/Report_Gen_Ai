@@ -75,3 +75,47 @@ def send_password_reset_email(to_email: str, username: str, reset_url: str) -> t
         return True, "Sent."
     except Exception as e:
         return False, f"Network error sending email: {e}"
+
+
+def send_report_email(to_email: str, subject: str, body_markdown: str) -> tuple[bool, str]:
+    """Sends any plain/markdown-ish text body as a simple HTML email — used by
+    the 🧠 Intelligence Report page's 'Email this report' button. Returns
+    (success, message)."""
+    api_key = get_api_key()
+    if not api_key:
+        return False, ("Email sending isn't configured yet — ask your admin to set up a free "
+                        "Resend API key (see README).")
+
+    # Very light markdown-ish -> HTML: headers and line breaks only, good enough for a report body.
+    safe = (body_markdown or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html_lines = []
+    for line in safe.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("### "):
+            html_lines.append(f"<h3>{stripped[4:]}</h3>")
+        elif stripped.startswith("## "):
+            html_lines.append(f"<h2>{stripped[3:]}</h2>")
+        elif stripped.startswith("# "):
+            html_lines.append(f"<h1>{stripped[2:]}</h1>")
+        elif stripped == "":
+            html_lines.append("<br>")
+        else:
+            html_lines.append(f"<p>{stripped}</p>")
+    html = f"""
+    <div style="font-family:sans-serif;max-width:680px;margin:auto;">
+      <h2>🧠 Intelligence Report — RA-Intelligence Platform</h2>
+      {''.join(html_lines)}
+    </div>
+    """
+    try:
+        resp = requests.post(
+            RESEND_URL,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"from": SENDER_EMAIL, "to": [to_email], "subject": subject, "html": html},
+            timeout=20,
+        )
+        if resp.status_code >= 400:
+            return False, f"Email provider error ({resp.status_code}): {resp.text[:200]}"
+        return True, "Sent."
+    except Exception as e:
+        return False, f"Network error sending email: {e}"
