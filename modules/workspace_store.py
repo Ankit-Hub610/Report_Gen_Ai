@@ -42,6 +42,9 @@ PERSISTED_KEYS = [
     "dashboard_slicers",
     "dashboard_name",
     "pivot_reports",
+    "intel_action_checks",   # 🧠 Intelligence Report — ticked/unticked state of the Top Actions checklist
+    "intel_language",        # 🧠 Intelligence Report — last-picked narrative language (English/Hindi)
+    "intel_role_overrides",  # 🧠 Intelligence Report — user-confirmed column-role mapping
 ]
 # NOTE: db_queries / db_conn_uri (external Database Connector state) are
 # INTENTIONALLY excluded from persistence - a database connection string
@@ -217,6 +220,54 @@ def list_workspace_ids():
         name for name in os.listdir(STORE_ROOT)
         if os.path.isfile(os.path.join(STORE_ROOT, name, "current.pkl"))
     )
+
+
+# ----------------------------------------------------------------------------
+# Intelligence Report snapshots - per-workspace, so the report can show
+# "vs your last report" deltas. Kept small on purpose: only the headline
+# numbers (not the raw dataset, not the AI narrative text) are stored, so
+# this file stays tiny even after many snapshots. Capped to the most recent
+# MAX_SNAPSHOTS so it never grows unbounded.
+# ----------------------------------------------------------------------------
+MAX_INTEL_SNAPSHOTS = 20
+
+
+def _intel_snapshots_file(workspace_id: str) -> str:
+    return os.path.join(_safe_dir(workspace_id), "intel_snapshots.pkl")
+
+
+def save_intel_snapshot(headline: dict, workspace_id: str) -> None:
+    """headline should be a small, pickle-friendly dict of the report's key
+    numbers (e.g. total_revenue, total_profit, margin, row_count, ts). Never
+    stores the DataFrame or the full narrative - just enough to compute a
+    'vs last time' delta later. Best-effort, never raises."""
+    try:
+        d = _safe_dir(workspace_id)
+        os.makedirs(d, exist_ok=True)
+        path = _intel_snapshots_file(workspace_id)
+        existing = []
+        if os.path.isfile(path):
+            try:
+                with open(path, "rb") as f:
+                    existing = pickle.load(f) or []
+            except Exception:
+                existing = []
+        existing.append(headline)
+        existing = existing[-MAX_INTEL_SNAPSHOTS:]
+        _atomic_pickle(existing, path)
+    except Exception:
+        pass
+
+
+def load_intel_snapshots(workspace_id: str) -> list:
+    path = _intel_snapshots_file(workspace_id)
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f) or []
+    except Exception:
+        return []
 
 
 # ----------------------------------------------------------------------------
