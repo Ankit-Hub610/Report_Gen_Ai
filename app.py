@@ -1942,7 +1942,8 @@ elif page == "⭐ Boss Dashboard":
 elif page == "🧠 Intelligence Report":
     st.title("🧠 Intelligence Report")
     st.caption("Har number Python khud calculate karta hai (koi invented figure nahi) — AI sirf unko "
-               "explain, prioritize aur recommend karta hai.")
+               "explain, prioritize aur recommend karta hai. Neeche **🎚️ Manage Slicers** se koi bhi field "
+               "add karo — usmein value select karte hi KPIs, charts aur AI insights sab apne aap update ho jaate hain.")
 
     if st.session_state.df_raw is None:
         st.info("⬅️ No data loaded yet. Go to **📥 Connect Data** in the sidebar to upload a file or connect a database.")
@@ -1951,6 +1952,7 @@ elif page == "🧠 Intelligence Report":
     df_raw = st.session_state.df_raw
     meta = st.session_state.meta
     df = render_filters(df_raw, meta, key_prefix="intel_")
+    df = render_slicers(df, meta, key_prefix="intel_", editable=can_edit())
     if df.empty:
         st.warning("No rows match the current filters.")
         st.stop()
