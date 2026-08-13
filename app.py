@@ -140,6 +140,8 @@ def init_state():
     ss.setdefault("custom_kpis", [])        # list of user-built KPI card dicts (Custom Builder)
     ss.setdefault("custom_charts", [])      # list of user-built chart dicts (Custom Builder, Power-BI style)
     ss.setdefault("dashboard_slicers", [])  # list of dicts: {field, style} - Boss Dashboard slicer widgets
+    ss.setdefault("dashboard_zoom", {})     # {chart_key: [start_pct, end_pct]} - persisted per-chart zoom window,
+                                             # applied identically on-screen AND when the SAME chart is exported to PDF
     ss.setdefault("dashboard_name", "⭐ Boss Dashboard")  # fully editable Boss Dashboard title
     # App branding (sidebar title) - GLOBAL across every account, admin-editable.
     # Loaded from disk once per session (not per-workspace - see workspace_store.load_branding).
@@ -161,7 +163,7 @@ def init_state():
     ss.setdefault("db_queries", [])         # list of query-tab dicts, see modules/db_connector.py
     ss.setdefault("db_query_results", {})   # {query_id: DataFrame}
 
-    # 🧠 Intelligence Report page
+    # 📈 Full Analysis page
     ss.setdefault("intel_role_overrides", {})   # user-confirmed column-role mapping (persisted)
     ss.setdefault("intel_language", "English")  # persisted — last-picked narrative language
     ss.setdefault("intel_action_checks", [])    # persisted — [{text, done}] Top-Actions tracker
@@ -202,6 +204,34 @@ def can_edit_dashboard() -> bool:
     cards, manage slicers, tweak the theme, export PDF — same as a client,
     just scoped to that one page."""
     return st.session_state.role in (auth.ROLE_ADMIN, auth.ROLE_CLIENT, auth.ROLE_REPORT_VIEWER)
+
+
+def _render_chart_with_zoom(fig, zoom_key: str, widget_key: str, editable: bool = True):
+    """Renders a Boss Dashboard chart with a compact '🔍 Zoom' range slider above
+    it. The chosen zoom window (0-100%) is stored in st.session_state.dashboard_zoom
+    (persisted), applied to THIS SAME fig object before st.plotly_chart draws it -
+    and the caller then reuses that same fig for the PDF export, so whatever zoom
+    is showing on screen is exactly what appears in the exported PDF too. Returns
+    the (possibly zoom-applied) fig so the caller can hand it to chart_png_items."""
+    zoom = st.session_state.dashboard_zoom.get(zoom_key, [0, 100])
+    if editable:
+        zc1, zc2 = st.columns([1, 20])
+        with zc1:
+            st.markdown("🔍")
+        with zc2:
+            new_zoom = st.slider("Zoom (show data range %)", 0, 100, tuple(zoom), step=1,
+                                  key=f"zoom_{widget_key}", label_visibility="collapsed",
+                                  help="Drag either handle to zoom in on crowded data labels. "
+                                       "This exact zoom is what will appear in the exported PDF too.")
+            new_zoom = list(new_zoom)
+            if new_zoom != zoom:
+                st.session_state.dashboard_zoom[zoom_key] = new_zoom
+                ws.save_light(st.session_state, st.session_state.workspace_id)
+                zoom = new_zoom
+    if zoom != [0, 100]:
+        fig = ce.apply_zoom_window(fig, zoom[0], zoom[1])
+    st.plotly_chart(fig, use_container_width=True, key=widget_key, config=ce.PLOTLY_CONFIG)
+    return fig
 
 
 def sync_workspace_from_disk(force: bool = False):
@@ -1319,7 +1349,7 @@ with st.sidebar:
     sync_workspace_from_disk()
 
     nav_options = ["📥 Connect Data", "📊 Raw Analysis", "🧩 Custom Builder", "⭐ Boss Dashboard",
-                    "🧠 Intelligence Report", "🗂 Data Table", "🤖 AI Assistant", "⚙️ Settings"]
+                    "📈 Full Analysis", "🗂 Data Table", "🤖 AI Assistant", "⚙️ Settings"]
     if st.session_state.role == auth.ROLE_REPORT_VIEWER:
         nav_options = ["⭐ Boss Dashboard"]   # nothing else exists for this account, not even Settings
     if st.session_state.role == auth.ROLE_ADMIN:
@@ -1833,7 +1863,9 @@ elif page == "⭐ Boss Dashboard":
                 if table_df is not None:
                     st.dataframe(table_df, use_container_width=True, height=380)
                 elif fig is not None:
-                    st.plotly_chart(fig, use_container_width=True, key=f"p2_custom_{chart['id']}", config=ce.PLOTLY_CONFIG)
+                    fig = _render_chart_with_zoom(fig, zoom_key=f"custom_{chart['id']}",
+                                                   widget_key=f"p2_custom_{chart['id']}",
+                                                   editable=can_edit_dashboard())
                 st.caption(f"💡 {insight}")
                 # NOTE: we deliberately do NOT render this to a PNG here. Turning a chart into an
                 # image (for the PDF) needs kaleido, which is slow (roughly half a second to a
@@ -1873,7 +1905,8 @@ elif page == "⭐ Boss Dashboard":
                         st.rerun()
 
                 fig, insight = ce.build_figure(df, variant, style)
-                st.plotly_chart(fig, use_container_width=True, key=f"p2_{widget_key}", config=ce.PLOTLY_CONFIG)
+                fig = _render_chart_with_zoom(fig, zoom_key=widget_key, widget_key=f"p2_{widget_key}",
+                                               editable=can_edit_dashboard())
                 st.caption(f"💡 {insight}")
 
                 chart_png_items.append({"title": variant.get("title", fam), "insight": insight,
@@ -1939,11 +1972,12 @@ elif page == "⭐ Boss Dashboard":
 # ==================================================================================
 # PAGE 2.5: INTELLIGENCE REPORT — full auto business-analytics report on ANY dataset
 # ==================================================================================
-elif page == "🧠 Intelligence Report":
-    st.title("🧠 Intelligence Report")
-    st.caption("Har number Python khud calculate karta hai (koi invented figure nahi) — AI sirf unko "
-               "explain, prioritize aur recommend karta hai. Neeche **🎚️ Manage Slicers** se koi bhi field "
-               "add karo — usmein value select karte hi KPIs, charts aur AI insights sab apne aap update ho jaate hain.")
+elif page == "📈 Full Analysis":
+    st.title("📈 Full Analysis")
+    st.caption("Har number Python khud calculate karta hai (koi invented figure nahi). "
+               "**Page 1** neeche poora detailed analysis dikhata hai (data samajhna, saaf karna, "
+               "aur calculated columns), **Page 2** usका simple summary — past kya tha, future me kya hoga, "
+               "aur kahan focus/invest karna hai.")
 
     if st.session_state.df_raw is None:
         st.info("⬅️ No data loaded yet. Go to **📥 Connect Data** in the sidebar to upload a file or connect a database.")
@@ -1988,7 +2022,7 @@ elif page == "🧠 Intelligence Report":
     roles.update({k: v for k, v in saved_overrides.items()})
 
     # ------------------------------------------------------------------------
-    # LANGUAGE TOGGLE
+    # LANGUAGE TOGGLE (only affects the optional AI write-up on Page 2)
     # ------------------------------------------------------------------------
     top_l, top_r = st.columns([4, 1])
     with top_r:
@@ -2011,63 +2045,87 @@ elif page == "🧠 Intelligence Report":
         st.session_state._intel_narrative = None  # numbers changed -> old narrative is stale
     facts = st.session_state._intel_facts
 
-    # ------------------------------------------------------------------------
-    # HEALTH BADGE (deterministic)
-    # ------------------------------------------------------------------------
+    # Deterministic insights/recommendations + derived columns — computed once here,
+    # used by BOTH pages below. Never depends on an API key.
+    ir = ie.generate_insights_and_recommendations(facts)
+    enriched_df, derived_log = ie.derive_analysis_columns(df, roles)
+    cleaning_log = ie.data_cleaning_log(df, enriched_df, facts["quality"])
+
     health = facts["health"]
     badge = {"Healthy": "🟢", "Stable": "🟡", "At Risk": "🟠", "Critical": "🔴"}.get(health["label"], "⚪")
-    st.markdown(f"### {badge}  Business Health: **{health['label']}**")
-    if health["reasons"]:
-        st.caption(" • ".join(health["reasons"]))
 
     snapshots = ws.load_intel_snapshots(st.session_state.workspace_id)
+    snap_caption = None
     if snapshots:
         last = snapshots[-1]
         cur_rev = facts["financials"].get("total_revenue")
         if cur_rev is not None and last.get("total_revenue"):
             delta = 100 * (cur_rev - last["total_revenue"]) / last["total_revenue"]
             when = datetime.datetime.fromtimestamp(last["ts"]).strftime("%d %b %Y")
-            st.caption(f"📊 vs your last saved report ({when}): revenue **{delta:+.1f}%**")
+            snap_caption = f"📊 vs your last saved report ({when}): revenue **{delta:+.1f}%**"
 
     st.divider()
 
     # ------------------------------------------------------------------------
-    # PART NAVIGATION — split across two screens so nothing overflows one page
+    # PAGE NAVIGATION — 2 pages, as requested
     # ------------------------------------------------------------------------
-    part = st.radio("Report section", ["📄 Part 1 — Data, KPIs & Trends", "📄 Part 2 — Insights & Actions"],
+    part = st.radio("Report section", ["📋 Page 1 — Full Analysis", "📈 Page 2 — Summary & Recommendations"],
                      horizontal=True, index=st.session_state.intel_part - 1, key="intel_part_radio",
                      label_visibility="collapsed")
-    st.session_state.intel_part = 1 if part.startswith("📄 Part 1") else 2
+    st.session_state.intel_part = 1 if part.startswith("📋 Page 1") else 2
     st.divider()
 
     # ==========================================================================
-    # PART 1 — DATA QUALITY, KPI SCORECARD, FINANCIALS, TREND/FORECAST, BREAKDOWNS
+    # PAGE 1 — DATA UNDERSTANDING, CLEANING, CALCULATED COLUMNS, FULL ANALYSIS
     # ==========================================================================
     if st.session_state.intel_part == 1:
-        q = facts["quality"]
-        st.subheader("🧪 Data Quality")
-        qc1, qc2 = st.columns([1, 3])
-        with qc1:
-            st.metric("Quality Score", f"{q['score']}/100")
-        with qc2:
-            for issue in q["issues"]:
-                st.caption(f"• {issue}")
-
-        st.subheader("🎯 KPI Scorecard")
         f = facts["financials"]
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Total Revenue", de._fmt_num(f.get("total_revenue")) if f.get("total_revenue") is not None else "—")
+        st.markdown(f"##### {facts['row_count']:,} rows × {facts['col_count']} columns"
+                    + (f" · date range detected via **{roles.get('date')}**" if roles.get("date") else ""))
+        st.markdown(f"### {badge}  Business Health: **{health['label']}**")
+        if health["reasons"]:
+            st.caption(" • ".join(health["reasons"]))
+        if snap_caption:
+            st.caption(snap_caption)
+
+        # ---- KPI colored band (matches the reference report's KPI-band look) ----
+        kpi_band = [
+            ("Total Revenue", de._fmt_num(f.get("total_revenue")) if f.get("total_revenue") is not None else "—", "#2C6E49"),
+            ("Total Orders", f"{f.get('total_orders'):,}" if f.get("total_orders") else "—", "#3969AC"),
+            ("Customers", f"{f.get('customer_count'):,}" if f.get("customer_count") else "—", "#7F3C8D"),
+            ("Avg Order Value", de._fmt_num(f.get("avg_order_value")) if f.get("avg_order_value") is not None else "—", "#E68310"),
+        ]
+        band_cols = st.columns(len(kpi_band))
+        for col, (label, value, color) in zip(band_cols, kpi_band):
+            with col:
+                st.markdown(
+                    f"<div style='background:{color};color:white;padding:6px 10px;border-radius:6px 6px 0 0;"
+                    f"font-size:12px;font-weight:600;text-align:center;'>{label}</div>"
+                    f"<div style='background:rgba(127,127,127,0.08);padding:14px 10px;border-radius:0 0 6px 6px;"
+                    f"text-align:center;font-size:22px;font-weight:700;'>{value}</div>",
+                    unsafe_allow_html=True,
+                )
         if f.get("profit_calculable"):
-            k2.metric("Total Profit", de._fmt_num(f.get("total_profit")),
-                      f"{f.get('profit_margin_pct')}% margin" if f.get("profit_margin_pct") is not None else None)
-        else:
-            k2.metric("Total Profit", "N/A")
-            k2.caption("Profit cannot be directly calculated from the available data.")
-        k3.metric("Total Orders", f"{f.get('total_orders'):,}" if f.get("total_orders") else "—")
-        k4.metric("Avg Order Value", de._fmt_num(f.get("avg_order_value")) if f.get("avg_order_value") is not None else "—")
-        k5, k6 = st.columns(2)
-        k5.metric("Customers", f"{f.get('customer_count'):,}" if f.get("customer_count") else "—")
-        k6.metric("Revenue / Customer", de._fmt_num(f.get("revenue_per_customer")) if f.get("revenue_per_customer") is not None else "—")
+            st.caption(f"Total Profit: **{de._fmt_num(f.get('total_profit'))}**"
+                       + (f" · Margin: **{f.get('profit_margin_pct')}%**" if f.get("profit_margin_pct") is not None else "")
+                       + (f" · Revenue/Customer: **{de._fmt_num(f.get('revenue_per_customer'))}**" if f.get("revenue_per_customer") is not None else ""))
+
+        st.divider()
+        st.subheader("🧹 Data Understanding & Cleaning")
+        du1, du2 = st.columns(2)
+        with du1:
+            st.markdown("**What the data looks like**")
+            for line in cleaning_log:
+                st.caption(f"• {line}")
+            st.markdown(f"**Data Quality Score: {facts['quality']['score']}/100**")
+            for issue in facts["quality"]["issues"]:
+                st.caption(f"• {issue}")
+        with du2:
+            st.markdown("**Calculated / added columns for this analysis**")
+            for line in derived_log:
+                st.caption(f"• {line}")
+            detected = ", ".join(f"{k}={v}" for k, v in roles.items() if v) or "—"
+            st.caption(f"Detected column roles: {detected}")
 
         st.divider()
         st.subheader("📈 Revenue Trend & Forecast")
@@ -2081,6 +2139,9 @@ elif page == "🧠 Intelligence Report":
             if t.get("overall_change_pct") is not None:
                 st.caption(f"Overall change (first → last period): **{t['overall_change_pct']:+.1f}%**"
                            + (f" · CAGR: **{fc.get('cagr_pct')}%**" if t.get("cagr_pct") is not None else ""))
+            monthly_tbl = pd.DataFrame({"Period": t["periods"], "Revenue": t["values"], "MoM Growth %": t["mom_growth_pct"]})
+            st.markdown("**Month-by-month table**")
+            st.dataframe(monthly_tbl, use_container_width=True, hide_index=True)
         else:
             st.info(t.get("reason", "Trend not available."))
 
@@ -2129,63 +2190,94 @@ elif page == "🧠 Intelligence Report":
                         st.dataframe(pd.DataFrame(b["bottom"]), use_container_width=True, hide_index=True)
 
         st.divider()
-        if st.button("➡️ Continue to Part 2 — Insights & Actions", type="primary", key="intel_go_part2"):
+        if st.button("➡️ Continue to Page 2 — Summary & Recommendations", type="primary", key="intel_go_part2"):
             st.session_state.intel_part = 2
             st.rerun()
 
     # ==========================================================================
-    # PART 2 — AI NARRATIVE (root cause, risks, opportunities, actions, verdict)
-    #          + ACTION TRACKER + FOLLOW-UP Q&A + EXPORT
+    # PAGE 2 — SIMPLE SUMMARY: PAST %, FUTURE %, KEY INSIGHTS, RECOMMENDED ACTIONS
+    #          + optional AI write-up + ACTION TRACKER + FOLLOW-UP Q&A + EXPORT
     # ==========================================================================
     else:
-        st.subheader("🧠 AI Analyst Write-up")
-        st.caption("Sabhi numbers upar Part 1 se hi liye gaye hain — AI unhe explain/prioritize karta hai, "
-                   "koi naya number invent nahi karta.")
+        f = facts["financials"]
+        st.markdown(f"### {badge}  Business Health: **{health['label']}**")
+        if snap_caption:
+            st.caption(snap_caption)
 
-        if not api_key:
-            if st.session_state.role == auth.ROLE_ADMIN:
-                st.warning("No free OpenRouter API key configured yet — add one on the **🤖 AI Assistant** page to enable this section.")
-            else:
-                st.info("🧠 AI write-up abhi enable nahi hai. Please contact your admin to turn this on.")
-        else:
-            regen_col1, regen_col2 = st.columns([1, 3])
-            with regen_col1:
-                gen_clicked = st.button("✨ Generate / Refresh Report", type="primary", key="intel_gen_report")
-            if gen_clicked or (st.session_state._intel_narrative is None):
-                with st.spinner("AI report likh raha hai..."):
-                    facts_text = ie.facts_to_prompt_text(facts)
-                    result = ac.generate_report_narrative(facts_text, api_key, st.session_state.intel_language)
-                if result["error"]:
-                    st.error(result["error"])
-                else:
-                    st.session_state._intel_narrative = result["report"]
+        exec_band = [
+            ("Total Revenue", de._fmt_num(f.get("total_revenue")) if f.get("total_revenue") is not None else "—", "#2C6E49"),
+            ("Total Orders", f"{f.get('total_orders'):,}" if f.get("total_orders") else "—", "#3969AC"),
+            ("Customers", f"{f.get('customer_count'):,}" if f.get("customer_count") else "—", "#7F3C8D"),
+            ("Profit Margin", f"{f.get('profit_margin_pct')}%" if f.get("profit_margin_pct") is not None else "N/A", "#E68310"),
+        ]
+        band_cols = st.columns(len(exec_band))
+        for col, (label, value, color) in zip(band_cols, exec_band):
+            with col:
+                st.markdown(
+                    f"<div style='background:{color};color:white;padding:6px 10px;border-radius:6px 6px 0 0;"
+                    f"font-size:12px;font-weight:600;text-align:center;'>{label}</div>"
+                    f"<div style='background:rgba(127,127,127,0.08);padding:14px 10px;border-radius:0 0 6px 6px;"
+                    f"text-align:center;font-size:22px;font-weight:700;'>{value}</div>",
+                    unsafe_allow_html=True,
+                )
 
-            if st.session_state._intel_narrative:
-                st.markdown(st.session_state._intel_narrative)
+        st.divider()
+        sp1, sp2 = st.columns(2)
+        with sp1:
+            st.subheader("⏮️ Past Performance")
+            st.write(ir["past_summary"])
+        with sp2:
+            st.subheader("⏭️ Future Outlook")
+            st.write(ir["future_summary"])
 
-                exp_col1, exp_col2, exp_col3 = st.columns(3)
-                with exp_col1:
-                    st.download_button("⬇️ Download report (.md)", data=st.session_state._intel_narrative,
-                                        file_name="intelligence_report.md", mime="text/markdown",
-                                        use_container_width=True)
-                with exp_col2:
-                    if st.button("💾 Save snapshot for future comparison", use_container_width=True, disabled=not can_edit()):
-                        ws.save_intel_snapshot({
-                            "ts": time.time(),
-                            "total_revenue": facts["financials"].get("total_revenue"),
-                            "total_profit": facts["financials"].get("total_profit"),
-                            "profit_margin_pct": facts["financials"].get("profit_margin_pct"),
-                            "row_count": facts["row_count"],
-                        }, st.session_state.workspace_id)
-                        st.success("Snapshot saved.")
-                with exp_col3:
-                    with st.popover("📧 Email this report", use_container_width=True):
-                        to_email = st.text_input("Send to", key="intel_email_to")
-                        if st.button("Send", key="intel_email_send") and to_email.strip():
-                            ok, msg = es.send_report_email(
-                                to_email.strip(), "Intelligence Report — RA-Intelligence Platform",
-                                st.session_state._intel_narrative)
-                            (st.success if ok else st.error)(msg)
+        st.divider()
+        ins_col, act_col = st.columns(2)
+        with ins_col:
+            st.subheader("💡 Key Insights")
+            for line in ir["key_insights"]:
+                st.markdown(f"- {line}")
+        with act_col:
+            st.subheader("✅ Recommended Actions")
+            for i, line in enumerate(ir["recommended_actions"], 1):
+                st.markdown(f"{i}. {line}")
+
+        # ---- Deterministic report text, used for download/email below ----
+        det_lines = [
+            f"# Full Analysis Summary — {pd.Timestamp.today().date()}",
+            f"\nBusiness Health: {health['label']}",
+            f"\n## Past Performance\n{ir['past_summary']}",
+            f"\n## Future Outlook\n{ir['future_summary']}",
+            "\n## Key Insights",
+            *[f"- {x}" for x in ir["key_insights"]],
+            "\n## Recommended Actions",
+            *[f"{i}. {x}" for i, x in enumerate(ir["recommended_actions"], 1)],
+        ]
+        deterministic_report_md = "\n".join(det_lines)
+
+        st.divider()
+        exp_col1, exp_col2, exp_col3 = st.columns(3)
+        with exp_col1:
+            st.download_button("⬇️ Download summary (.md)", data=deterministic_report_md,
+                                file_name="analysis_summary.md", mime="text/markdown",
+                                use_container_width=True)
+        with exp_col2:
+            if st.button("💾 Save snapshot for future comparison", use_container_width=True, disabled=not can_edit()):
+                ws.save_intel_snapshot({
+                    "ts": time.time(),
+                    "total_revenue": facts["financials"].get("total_revenue"),
+                    "total_profit": facts["financials"].get("total_profit"),
+                    "profit_margin_pct": facts["financials"].get("profit_margin_pct"),
+                    "row_count": facts["row_count"],
+                }, st.session_state.workspace_id)
+                st.success("Snapshot saved.")
+        with exp_col3:
+            with st.popover("📧 Email this summary", use_container_width=True):
+                to_email = st.text_input("Send to", key="intel_email_to")
+                if st.button("Send", key="intel_email_send") and to_email.strip():
+                    ok, msg = es.send_report_email(
+                        to_email.strip(), "Analysis Summary — RA-Intelligence Platform",
+                        deterministic_report_md)
+                    (st.success if ok else st.error)(msg)
 
         st.divider()
         st.subheader("✅ Action Tracker")
@@ -2207,6 +2299,32 @@ elif page == "🧠 Intelligence Report":
                     st.session_state.intel_action_checks.pop(i)
                     ws.save_light(st.session_state, st.session_state.workspace_id)
                     st.rerun()
+
+        # ---- Optional AI write-up — deeper narrative, NOT the primary content anymore ----
+        st.divider()
+        with st.expander("🤖 Ask AI to elaborate further (optional, needs an API key)", expanded=False):
+            st.caption("Deterministic summary upar already complete hai. Ye sirf ek extra, longer AI "
+                       "write-up hai agar chahiye — sabhi numbers wahi hain, koi naya number invent nahi hota.")
+            if not api_key:
+                if st.session_state.role == auth.ROLE_ADMIN:
+                    st.warning("No free OpenRouter API key configured yet — add one on the **🤖 AI Assistant** page to enable this.")
+                else:
+                    st.info("🧠 AI write-up abhi enable nahi hai. Please contact your admin to turn this on.")
+            else:
+                gen_clicked = st.button("✨ Generate / Refresh AI write-up", type="primary", key="intel_gen_report")
+                if gen_clicked or (st.session_state._intel_narrative is None and False):
+                    with st.spinner("AI report likh raha hai..."):
+                        facts_text = ie.facts_to_prompt_text(facts)
+                        result = ac.generate_report_narrative(facts_text, api_key, st.session_state.intel_language)
+                    if result["error"]:
+                        st.error(result["error"])
+                    else:
+                        st.session_state._intel_narrative = result["report"]
+
+                if st.session_state._intel_narrative:
+                    st.markdown(st.session_state._intel_narrative)
+                    st.download_button("⬇️ Download AI write-up (.md)", data=st.session_state._intel_narrative,
+                                        file_name="ai_writeup.md", mime="text/markdown", key="intel_ai_dl")
 
         if api_key:
             st.divider()
@@ -2232,7 +2350,7 @@ elif page == "🧠 Intelligence Report":
                         st.session_state.intel_qa_history.append({"role": "assistant", "content": qa_result["answer"]})
 
         st.divider()
-        if st.button("⬅️ Back to Part 1", key="intel_back_part1"):
+        if st.button("⬅️ Back to Page 1", key="intel_back_part1"):
             st.session_state.intel_part = 1
             st.rerun()
 
