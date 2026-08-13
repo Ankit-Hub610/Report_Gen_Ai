@@ -41,6 +41,7 @@ from modules import db_connector as dbc
 from modules import ai_chat as ac
 from modules import email_service as es
 from modules import intel_engine as ie
+from modules import ppt_engine as ppt
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -1350,6 +1351,12 @@ with st.sidebar:
 
     nav_options = ["📥 Connect Data", "📊 Raw Analysis", "🧩 Custom Builder", "⭐ Boss Dashboard",
                     "📈 Full Analysis", "🗂 Data Table", "🤖 AI Assistant", "⚙️ Settings"]
+    # "💡 Business Insights" only makes sense for datasets that actually have a
+    # Payment Page Title-shaped column (e.g. "Badminton AMD Mondays") - this app
+    # is used by many different clients with unrelated datasets, so the tab
+    # itself stays hidden unless THIS client's currently loaded data has one.
+    if st.session_state.df_raw is not None and ppt.detect_title_column(st.session_state.df_raw, st.session_state.meta):
+        nav_options.insert(4, "💡 Business Insights")  # right after Boss Dashboard
     if st.session_state.role == auth.ROLE_REPORT_VIEWER:
         nav_options = ["⭐ Boss Dashboard"]   # nothing else exists for this account, not even Settings
     if st.session_state.role == auth.ROLE_ADMIN:
@@ -1972,6 +1979,118 @@ elif page == "⭐ Boss Dashboard":
 # ==================================================================================
 # PAGE 2.5: INTELLIGENCE REPORT — full auto business-analytics report on ANY dataset
 # ==================================================================================
+elif page == "💡 Business Insights":
+    st.title("💡 Business Insights")
+    st.caption("Payment Page Title ko **Sport → Code/Location → Day** hierarchy me todkar dikhata hai — "
+               "kaunsa sport/location/day sabse zyada revenue de raha hai, kaunsi payment pages abhi "
+               "active hain, aur kahan focus/reduce karna chahiye. Sirf tab dikhta hai jab dataset me "
+               "aisa title column ho.")
+
+    if st.session_state.df_raw is None:
+        st.info("⬅️ No data loaded yet. Go to **📥 Connect Data** in the sidebar to upload a file or connect a database.")
+        st.stop()
+
+    df_raw = st.session_state.df_raw
+    meta = st.session_state.meta
+    df = render_filters(df_raw, meta, key_prefix="ppt_")
+    df = render_slicers(df, meta, key_prefix="ppt_", editable=can_edit())
+    if df.empty:
+        st.warning("No rows match the current filters.")
+        st.stop()
+
+    title_col = ppt.detect_title_column(df, meta)
+    if not title_col:
+        # Belt-and-suspenders: the nav item itself is already hidden when this
+        # returns None, but filters/slicers above could in principle narrow
+        # the dataset down to nothing usable — same fallback either way.
+        st.info("Is dataset me koi 'Payment Page Title' jaisa column nahi mila (Sport/Code/Day pattern wala), "
+                "isliye ye page abhi kuch dikha nahi sakta.")
+        st.stop()
+
+    auto_status_col = ppt.detect_status_column(df, meta)
+    auto_roles = ie.detect_roles(df, meta)
+    with st.expander("🧭 Column Mapping — auto-detected, confirm ya change karein", expanded=False):
+        numeric_opts = list(meta.get("numeric_cols", []) or []) or list(df.columns)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            amt_default = auto_roles.get("revenue") if auto_roles.get("revenue") in numeric_opts else numeric_opts[0]
+            amount_col = st.selectbox("Amount / Revenue column", numeric_opts,
+                                       index=numeric_opts.index(amt_default), key="ppt_amount_col")
+        with c2:
+            status_opts = ["(none)"] + list(df.columns)
+            status_default = auto_status_col or "(none)"
+            picked = st.selectbox("Status column (Captured / Failed / Refunded)", status_opts,
+                                   index=status_opts.index(status_default) if status_default in status_opts else 0,
+                                   key="ppt_status_col")
+            status_col = None if picked == "(none)" else picked
+        with c3:
+            date_opts = ["(none)"] + list(meta.get("date_cols", []) or [])
+            date_default = auto_roles.get("date") if auto_roles.get("date") in date_opts else "(none)"
+            picked_d = st.selectbox("Date column", date_opts,
+                                     index=date_opts.index(date_default), key="ppt_date_col")
+            date_col = None if picked_d == "(none)" else picked_d
+        st.caption(f"Detected Payment Page Title column: **{title_col}**"
+                   + (" · no Status column found — every row treated as Captured" if not status_col else ""))
+
+    edf = ppt.enrich(df, title_col, status_col)
+    n_unparsed = int((edf["_parse_status"] == "DATA REVIEW REQUIRED").sum())
+
+    sport_t = ppt.sport_table(edf, amount_col, date_col)
+    code_t = ppt.code_table(edf, amount_col, date_col)
+    day_t = ppt.day_table(edf, amount_col, date_col)
+    page_t = ppt.payment_page_table(edf, title_col, amount_col, date_col)
+    hs = ppt.health_score(page_t)
+
+    # ---- KPI row ----
+    total_rev = float(page_t["Captured Revenue"].sum()) if not page_t.empty else 0.0
+    total_txn = int(page_t["Transactions"].sum()) if not page_t.empty else 0
+    total_captured = int(page_t["Captured Transactions"].sum()) if not page_t.empty else 0
+    capture_rate = round(100 * total_captured / total_txn, 1) if total_txn else 0
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Captured Revenue", f"₹{total_rev:,.0f}")
+    k2.metric("Captured Transactions", f"{total_captured:,}")
+    k3.metric("Capture Rate", f"{capture_rate}%")
+    k4.metric("Unique Payment Pages", f"{page_t['Payment Page Title'].nunique():,}" if not page_t.empty else "0")
+    k5.metric("Health Score", f"{hs['score']} · {hs['label']}" if hs["score"] is not None else hs["label"])
+
+    if n_unparsed:
+        st.warning(f"⚠️ {n_unparsed:,} row(s) ka title format samajh nahi aaya (Sport/Code/Day pattern match nahi hua) "
+                    "— unhe **DATA REVIEW REQUIRED** maana gaya hai, guess nahi kiya gaya.")
+
+    st.divider()
+    st.subheader("🏆 Sport Analysis")
+    st.dataframe(sport_t, use_container_width=True, hide_index=True)
+
+    st.subheader("📍 Code / Location Analysis")
+    st.dataframe(code_t, use_container_width=True, hide_index=True)
+
+    st.subheader("📅 Day Analysis")
+    st.dataframe(day_t, use_container_width=True, hide_index=True)
+
+    st.subheader("🧾 Payment Page Analysis (detailed)")
+    st.dataframe(page_t, use_container_width=True, hide_index=True, height=420)
+
+    st.divider()
+    st.subheader("❤️ Health Score")
+    hcol1, hcol2 = st.columns([1, 3])
+    with hcol1:
+        st.metric("Overall", f"{hs['score']}" if hs["score"] is not None else "—", hs["label"])
+    with hcol2:
+        if hs["components"]:
+            st.dataframe(pd.DataFrame(hs["components"]), use_container_width=True, hide_index=True)
+        else:
+            st.caption("DATA REQUIRED — not enough of this dataset's columns matched to score health.")
+
+    st.divider()
+    st.subheader("🧭 Management Decisions")
+    st.caption("Evidence-based hi — koi bhi decision revenue ke alawa capacity/cost/profit data maangta hai "
+               "to wo explicitly 'DATA REQUIRED' bolega, guess nahi karega.")
+    decisions = ppt.management_decisions(sport_t, code_t, day_t, page_t)
+    if not decisions:
+        st.info("Abhi koi strong 🟢/🟡/🔴 signal nahi mila — data thoda aur accumulate hone dein.")
+    else:
+        st.dataframe(pd.DataFrame(decisions).head(25), use_container_width=True, hide_index=True)
+
 elif page == "📈 Full Analysis":
     st.title("📈 Full Analysis")
     st.caption("Har number Python khud calculate karta hai (koi invented figure nahi). "
