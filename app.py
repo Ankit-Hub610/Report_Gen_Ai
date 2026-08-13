@@ -564,7 +564,7 @@ def login_screen():
         with _lc2:
             _img_html = _logo_img_html(_logo, _logo_mime, brand.get("logo_width", 220))
             _render_glow_target("brand_glow_logo", "logo", brand, _img_html)
-    st.markdown("<h1 style='text-align:center;'>Research | Analysis | Intteligance </h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align:center;'>Research | Analysis | intelligence </h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
