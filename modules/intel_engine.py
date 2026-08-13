@@ -19,6 +19,8 @@ user in the UI before anything is calculated.
 import numpy as np
 import pandas as pd
 
+from modules import data_engine as de
+
 # --------------------------------------------------------------------------------
 # ROLE DETECTION
 # --------------------------------------------------------------------------------
@@ -455,6 +457,187 @@ def build_facts_bundle(df: pd.DataFrame, meta: dict, roles: dict) -> dict:
         "correlations": correlations,
         "breakdowns": breakdowns,
         "health": health,
+    }
+
+
+# --------------------------------------------------------------------------------
+# DERIVED / CALCULATED COLUMNS — "column add karni he to usko bhi kare" — for ANY
+# dataset, based on whatever roles were detected. Never mutates the original
+# df_raw in session_state; only used to enrich the two Analysis pages. Returns
+# (enriched_df, log) where log is a list of plain-language strings describing
+# exactly what was added and why, so the "Data Understanding & Cleaning" section
+# can show real, honest steps instead of a canned message.
+# --------------------------------------------------------------------------------
+def derive_analysis_columns(df: pd.DataFrame, roles: dict) -> tuple:
+    out = df.copy()
+    log = []
+
+    date_col = roles.get("date")
+    if date_col and date_col in out.columns:
+        d = pd.to_datetime(out[date_col], errors="coerce")
+        if d.notna().sum() > 0:
+            out["_Period (Month)"] = d.dt.to_period("M").astype(str)
+            out["_Day of Week"] = d.dt.day_name()
+            log.append(f"Added **'Period (Month)'** and **'Day of Week'** from '{date_col}' to make time-based grouping possible.")
+
+    rev_col, cost_col, profit_col = roles.get("revenue"), roles.get("cost"), roles.get("profit")
+    if rev_col and cost_col and not profit_col and rev_col in out.columns and cost_col in out.columns:
+        out["_Profit (calculated)"] = _num(out[rev_col]) - _num(out[cost_col])
+        log.append(f"Added **'Profit (calculated)'** = '{rev_col}' − '{cost_col}' (no profit column existed in the source data).")
+
+    cust_col = roles.get("customer")
+    if cust_col and cust_col in out.columns:
+        counts = out[cust_col].value_counts()
+        out["_Repeat Customer"] = out[cust_col].map(lambda x: "Repeat" if counts.get(x, 0) > 1 else "First-time")
+        log.append(f"Added **'Repeat Customer'** flag from '{cust_col}' (first-time vs repeat) to measure loyalty/repeat demand.")
+
+    if rev_col and rev_col in out.columns:
+        s = _num(out[rev_col])
+        if s.notna().sum() > 0:
+            q75 = s.quantile(0.75)
+            out["_Value Tier"] = pd.cut(s, bins=[-np.inf, s.quantile(0.25), q75, np.inf],
+                                        labels=["Low value", "Mid value", "High value"])
+            log.append(f"Added **'Value Tier'** (Low/Mid/High) by splitting '{rev_col}' into quartile bands, "
+                       f"so high-value rows can be found at a glance.")
+
+    if not log:
+        log.append("No extra columns were needed for a clean analysis — the source data already had "
+                    "everything required (revenue/date/customer-style fields).")
+
+    return out, log
+
+
+def data_cleaning_log(df_before: pd.DataFrame, df_after: pd.DataFrame, quality: dict) -> list:
+    """Plain-language summary of what was found/handled while preparing the data,
+    for the 'Data Understanding & Cleaning' section. Deterministic, no AI."""
+    lines = []
+    lines.append(f"Started with **{len(df_before):,} rows × {len(df_before.columns)} columns**.")
+    if quality.get("duplicate_rows"):
+        lines.append(f"Found **{quality['duplicate_rows']:,} duplicate rows** — flagged (not silently dropped) "
+                     f"so nothing you didn't ask for was deleted.")
+    if quality.get("missing_pct", 0) > 0:
+        lines.append(f"**{quality['missing_pct']}%** of all cells were missing/blank across the dataset.")
+    lines.append(f"Column types were auto-detected (numbers, dates, categories/text) and dates were parsed "
+                 f"into a proper date type so trends and monthly grouping work correctly.")
+    added_cols = [c for c in df_after.columns if c not in df_before.columns]
+    if added_cols:
+        lines.append(f"**{len(added_cols)} new column(s)** were calculated to support the analysis (see below).")
+    return lines
+
+
+def generate_insights_and_recommendations(facts: dict) -> dict:
+    """Deterministic 'Key Insights' + 'Recommended Actions' + plain-language past/
+    future summary — mirrors the reference report format (bullet insights on one
+    side, numbered recommended actions on the other). Never depends on an AI
+    call/API key, so this section is ALWAYS available, for ANY dataset."""
+    insights = []
+    actions = []
+    f = facts["financials"]
+    t = facts["trend"]
+    fc = facts["forecast"]
+    q = facts["quality"]
+    h = facts["health"]
+    bkd = facts["breakdowns"]
+
+    # ---- PAST ----
+    past_bits = []
+    if t.get("available") and t.get("overall_change_pct") is not None:
+        chg = t.get("overall_change_pct")
+        direction = "grown" if chg > 0 else ("dropped" if chg < 0 else "stayed flat")
+        past_bits.append(f"Over the period covered by your data, revenue has **{direction} by {abs(chg):.1f}%** "
+                          f"(from the first period to the last).")
+        past_bits.append(f"The best period was **{t['best_period']}** and the weakest was **{t['worst_period']}**.")
+        insights.append(f"Revenue {direction} {abs(chg):.1f}% from {t['periods'][0]} to {t['periods'][-1]}.")
+        if chg is not None and chg < 0:
+            actions.append(f"Revenue is down {abs(chg):.1f}% overall — dig into what changed around "
+                           f"**{t['worst_period']}** (the weakest period) before it repeats.")
+    elif t.get("available"):
+        past_bits.append(f"The best period was **{t['best_period']}** and the weakest was **{t['worst_period']}**.")
+    else:
+        past_bits.append("Not enough date/revenue history in this data to measure a past trend "
+                          "(need a date column and a revenue-style column).")
+    if f.get("total_revenue") is not None:
+        past_bits.append(f"Total revenue captured so far: **{de._fmt_num(f['total_revenue'])}** "
+                          f"across {f.get('total_orders', 0):,} orders.")
+    if f.get("profit_calculable") and f.get("profit_margin_pct") is not None:
+        past_bits.append(f"Profit margin so far is **{f['profit_margin_pct']}%**.")
+        if f["profit_margin_pct"] < 10:
+            actions.append(f"Profit margin is only {f['profit_margin_pct']}% — review pricing or costs, "
+                           f"this is thin and leaves little room for error.")
+    past_summary = " ".join(past_bits)
+
+    # ---- FUTURE ----
+    future_bits = []
+    if fc.get("available"):
+        fdir = fc.get("direction", "flat")
+        first_fc, last_fc = fc["forecast_values"][0], fc["forecast_values"][-1]
+        base = t["values"][-1] if t.get("available") and t.get("values") else None
+        pct_vs_last = _pct(last_fc - base, base) if base else None
+        future_bits.append(f"Based on the recent trend, revenue is projected to be **{fdir}** over the next "
+                            f"{len(fc['forecast_periods'])} month(s), reaching roughly **{de._fmt_num(last_fc)}** "
+                            f"by {fc['forecast_periods'][-1]}"
+                            + (f" (**{pct_vs_last:+.1f}%** vs the most recent actual month)." if pct_vs_last is not None else "."))
+        future_bits.append(f"Forecast confidence: **{fc['confidence']}** (this is an estimate, not a guarantee).")
+        insights.append(f"Forecast direction for the next {len(fc['forecast_periods'])} month(s): {fdir}.")
+        if fdir == "Downward":
+            actions.append("The forecast points **downward** — plan a retention/promo push now rather than "
+                           "after the drop shows up in the numbers.")
+        elif fdir == "Upward":
+            actions.append("The forecast points **upward** — this is a good moment to invest in the "
+                           "channels/products already driving that growth (see below).")
+    else:
+        future_bits.append("Not enough monthly history to forecast the future yet "
+                            "(need at least 4 months of date + revenue data).")
+    future_summary = " ".join(future_bits)
+
+    # ---- QUALITY ----
+    insights.append(f"Data quality score: **{q['score']}/100**.")
+    if q["score"] < 80:
+        actions.append("Data quality has gaps (missing values / duplicates / bad dates) — cleaning this up "
+                       "will make every number above more reliable.")
+
+    # ---- CONCENTRATION / WHERE TO FOCUS & INVEST ----
+    label_map = {"product": "product/category", "customer": "customer", "location": "location", "channel": "channel"}
+    for key, label in label_map.items():
+        b = bkd.get(key, {})
+        if not b.get("available"):
+            continue
+        top = b["top"]
+        if not top:
+            continue
+        best = top[0]
+        insights.append(f"Top {label}: **{best['name']}** — {best['share_pct']}% of measured value on its own.")
+        if b.get("top5_share_pct", 0) >= 60:
+            actions.append(f"The top 5 {label}s account for **{b['top5_share_pct']}%** of value — this is "
+                           f"concentrated. Focus retention effort here, but also invest in growing the next "
+                           f"tier down so the business isn't overly dependent on just a few {label}s.")
+        else:
+            actions.append(f"Value is fairly spread across {label}s (top 5 = {b['top5_share_pct']}%) — "
+                           f"invest more in **{best['name']}**, your single best performer, to grow it further.")
+        if b.get("bottom"):
+            worst = b["bottom"][0]
+            if worst["share_pct"] < 1:
+                actions.append(f"**{worst['name']}** ({label}) is contributing almost nothing "
+                               f"({worst['share_pct']}%) — worth deciding whether to invest in fixing it "
+                               f"or drop focus on it.")
+
+    if facts["anomalies"]:
+        insights.append(f"{len(facts['anomalies'])} unusual month(s) detected in revenue "
+                        f"(much higher or lower than normal) — see Anomalies below.")
+        actions.append("Investigate the flagged anomaly month(s) — they're often the biggest single clue "
+                       "to what's helping or hurting the business.")
+
+    insights.append(f"Overall business health: **{h['label']}**" + (f" — {'; '.join(h['reasons'])}." if h['reasons'] else "."))
+
+    if not actions:
+        actions.append("No red flags detected — keep monitoring monthly revenue and the breakdowns below "
+                       "to catch changes early.")
+
+    return {
+        "past_summary": past_summary,
+        "future_summary": future_summary,
+        "key_insights": insights,
+        "recommended_actions": actions,
     }
 
 
