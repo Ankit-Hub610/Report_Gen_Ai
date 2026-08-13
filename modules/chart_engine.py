@@ -13,21 +13,81 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
-# Shared config for every st.plotly_chart(...) call in the app. Keeps ONLY the
-# "download as PNG" button in the toolbar and removes the zoom / pan / box
-# select / lasso select / autoscale / reset-axes / fullscreen icons the user
-# doesn't need - data labels, legend and measure controls stay untouched since
-# those are separate Streamlit widgets, not part of this toolbar.
+# Shared config for every st.plotly_chart(...) call in the app. Zoom/pan/reset
+# are kept ON (scrollZoom + the toolbar buttons) so crowded data labels can be
+# zoomed into and read properly - only box/lasso select are removed since
+# nothing in this app uses selection events. NOTE: mouse/scroll zoom here is a
+# quick on-screen look only - it is NOT what syncs to the PDF (Plotly doesn't
+# report live zoom state back to Streamlit). For a zoom level that also shows
+# up identically in the exported PDF, use the explicit "🔍 Zoom" slider that
+# app.py renders above each Boss Dashboard chart (see apply_zoom_window below).
 PLOTLY_CONFIG = {
     "displaylogo": False,
     "displayModeBar": "hover",
+    "scrollZoom": True,
     "modeBarButtonsToRemove": [
-        "zoom2d", "pan2d", "select2d", "lasso2d",
-        "zoomIn2d", "zoomOut2d", "autoScale2d", "resetScale2d",
+        "select2d", "lasso2d",
         "hoverClosestCartesian", "hoverCompareCartesian",
         "toggleSpikelines",
     ],
 }
+
+
+def apply_zoom_window(fig, start_pct: float = 0, end_pct: float = 100):
+    """Restricts the figure's x-axis to the [start_pct, end_pct] window (0-100)
+    of its own data range - i.e. an explicit, storable "zoom" that (unlike
+    mouse-drag zoom) can be persisted and reproduced exactly, both on-screen
+    AND in the PDF export (same fig object, same baked-in range). Spreads out
+    the remaining points/bars so crowded data labels become readable. Safe
+    no-op on any figure type this doesn't cleanly apply to (pie/treemap/heatmap,
+    or a figure with no x data) - never raises."""
+    try:
+        if start_pct is None or end_pct is None:
+            return fig
+        start_pct = max(0, min(100, float(start_pct)))
+        end_pct = max(0, min(100, float(end_pct)))
+        if start_pct >= end_pct or (start_pct <= 0 and end_pct >= 100):
+            return fig
+
+        xs_all = []
+        for tr in fig.data:
+            xv = getattr(tr, "x", None)
+            if xv is not None:
+                xs_all.extend(list(xv))
+        if len(xs_all) < 2:
+            return fig
+
+        # de-dup while preserving first-seen order (works for both category
+        # axes and already-sorted numeric/date axes)
+        seen, ordered = set(), []
+        for v in xs_all:
+            if v not in seen:
+                seen.add(v)
+                ordered.append(v)
+        n = len(ordered)
+        if n < 2:
+            return fig
+
+        start_i = int(n * start_pct / 100)
+        end_i = min(n, max(start_i + 1, int(round(n * end_pct / 100))))
+        first_val, last_val = ordered[start_i], ordered[end_i - 1]
+
+        is_numeric = all(isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool)
+                         for v in ordered)
+        is_datelike = False
+        if not is_numeric:
+            try:
+                is_datelike = pd.api.types.is_datetime64_any_dtype(pd.Series(ordered))
+            except Exception:
+                is_datelike = False
+
+        if is_numeric or is_datelike:
+            fig.update_xaxes(range=[first_val, last_val], autorange=False)
+        else:
+            fig.update_xaxes(range=[start_i - 0.5, end_i - 1 + 0.5], autorange=False)
+    except Exception:
+        pass
+    return fig
 
 FAMILIES = ["Bar", "Line", "Pie", "Comparison", "Area", "Scatter", "Box", "Histogram", "Treemap", "Heatmap"]
 
