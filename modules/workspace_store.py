@@ -20,6 +20,7 @@ Admin Panel -> "Reset Workspace Data" tab, for a specific workspace_id.
 Nothing here auto-expires or auto-clears on its own.
 """
 
+import base64
 import os
 import pickle
 import re
@@ -40,6 +41,8 @@ PERSISTED_KEYS = [
     "custom_kpis",
     "custom_charts",
     "dashboard_slicers",
+    "dashboard_zoom",     # {chart_key: [start_pct, end_pct]} — per-chart zoom window, so it survives restarts
+                          # and the PDF export (rendered from the same figure) matches what's on screen
     "dashboard_name",
     "pivot_reports",
     "intel_action_checks",   # 🧠 Intelligence Report — ticked/unticked state of the Top Actions checklist
@@ -277,6 +280,80 @@ def load_intel_snapshots(workspace_id: str) -> list:
 # ----------------------------------------------------------------------------
 _BRAND_FILE = os.path.join(STORE_ROOT, "_branding.pkl")
 
+# ----------------------------------------------------------------------------
+# OPTIONAL GitHub-backed persistence (branding only, for now)
+# ----------------------------------------------------------------------------
+# Local disk (workspace_state/) is NOT persistent on platforms with an
+# ephemeral filesystem (e.g. Streamlit Community Cloud) — the container gets
+# rebuilt from the git repo whenever the app sleeps from inactivity and is
+# reopened, or on every redeploy, wiping anything that was only ever written
+# to local disk at runtime. That's exactly why branding (logo, colors, glow)
+# was disappearing and needing to be re-set up on every fresh open.
+#
+# Fix: if these two secrets are configured (Settings -> Secrets on Streamlit
+# Cloud, or a local .streamlit/secrets.toml, or plain env vars), branding is
+# ALSO committed straight to the GitHub repo via the Contents API, so it's
+# baked into the exact same source the container rebuilds from and survives
+# every restart/redeploy:
+#
+#     GITHUB_TOKEN  = "ghp_..."          # fine-grained PAT, 'Contents: Read and write' on this repo only
+#     GITHUB_REPO   = "yourname/yourrepo"
+#     GITHUB_BRANCH = "main"             # optional, defaults to "main"
+#
+# Without these set, behavior is UNCHANGED from before (local-disk pickle
+# only) — fine for local/dev runs or any host with a real persistent disk.
+# Best-effort throughout: a failed GitHub call never crashes the app, it just
+# silently falls back to whatever's on local disk for the rest of that run.
+GITHUB_BRAND_PATH = "workspace_state/_branding.pkl"
+
+
+def _github_config():
+    token = os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("GITHUB_REPO")
+    branch = os.environ.get("GITHUB_BRANCH")
+    try:
+        import streamlit as st
+        token = st.secrets.get("GITHUB_TOKEN", token)
+        repo = st.secrets.get("GITHUB_REPO", repo)
+        branch = st.secrets.get("GITHUB_BRANCH", branch)
+    except Exception:
+        pass
+    if token and repo:
+        return {"token": token, "repo": repo.strip("/"), "branch": (branch or "main")}
+    return None
+
+
+def _github_headers(cfg):
+    return {"Authorization": f"token {cfg['token']}", "Accept": "application/vnd.github+json"}
+
+
+def _github_get_file(cfg, path):
+    """Returns (raw_bytes, sha) or (None, None) if missing/unreachable."""
+    try:
+        import requests
+        url = f"https://api.github.com/repos/{cfg['repo']}/contents/{path}"
+        r = requests.get(url, headers=_github_headers(cfg), params={"ref": cfg["branch"]}, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            return base64.b64decode(data["content"]), data.get("sha")
+    except Exception:
+        pass
+    return None, None
+
+
+def _github_put_file(cfg, path, content_bytes, message):
+    try:
+        import requests
+        url = f"https://api.github.com/repos/{cfg['repo']}/contents/{path}"
+        _, sha = _github_get_file(cfg, path)
+        payload = {"message": message, "content": base64.b64encode(content_bytes).decode(), "branch": cfg["branch"]}
+        if sha:
+            payload["sha"] = sha
+        r = requests.put(url, headers=_github_headers(cfg), json=payload, timeout=15)
+        return r.status_code in (200, 201)
+    except Exception:
+        return False
+
 
 def save_branding(brand: dict) -> None:
     try:
@@ -287,11 +364,35 @@ def save_branding(brand: dict) -> None:
         os.replace(tmp_path, _BRAND_FILE)
     except Exception:
         pass
+    cfg = _github_config()
+    if cfg:
+        try:
+            _github_put_file(cfg, GITHUB_BRAND_PATH, pickle.dumps(brand), "Update app branding (auto-saved)")
+        except Exception:
+            pass
 
 
 def load_branding():
     """Returns the saved brand dict, or None if nothing's been saved yet /
-    the file is unreadable (treated as 'use defaults', never crashes)."""
+    unreadable (treated as 'use defaults', never crashes). Tries GitHub first
+    (if configured) since that's the copy that actually survives a restart;
+    falls back to local disk otherwise, which is always tried and kept as a
+    fast local mirror for the rest of this run."""
+    cfg = _github_config()
+    if cfg:
+        content, _ = _github_get_file(cfg, GITHUB_BRAND_PATH)
+        if content:
+            try:
+                brand = pickle.loads(content)
+                try:
+                    os.makedirs(STORE_ROOT, exist_ok=True)
+                    with open(_BRAND_FILE, "wb") as f:
+                        pickle.dump(brand, f)
+                except Exception:
+                    pass
+                return brand
+            except Exception:
+                pass
     if not os.path.isfile(_BRAND_FILE):
         return None
     try:
