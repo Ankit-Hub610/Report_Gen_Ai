@@ -8,12 +8,14 @@
 
 ## 📸 Screenshots
 
-*(Add 2-4 screenshots here — e.g. Boss Dashboard, Full Analysis page, a generated chart. In GitHub, drag-and-drop images into the README editor and it auto-generates the line below; on LinkedIn, just attach them as post images.)*
+<img width="888" height="563" alt="image" src="https://github.com/user-attachments/assets/aa108db7-fe9a-4d56-90f1-391e95efde1b" />
+<img width="1913" height="697" alt="image" src="https://github.com/user-attachments/assets/bb6d7e3a-3700-4f90-8dfb-2a14a141b22e" />
+<img width="1565" height="706" alt="image" src="https://github.com/user-attachments/assets/f7073bcf-81b5-47c7-bb31-12a036f6fea3" />
+<img width="1561" height="828" alt="image" src="https://github.com/user-attachments/assets/d98f1a46-2e0a-4908-8431-8da3e610a6d8" />
+<img width="1577" height="752" alt="image" src="https://github.com/user-attachments/assets/d5af4d4f-12b7-4f85-9f02-172d94400317" />
+<img width="1606" height="580" alt="image" src="https://github.com/user-attachments/assets/5c4e75d1-443b-4226-a3e1-bafeef94414c" />
+<img width="1702" height="887" alt="image" src="https://github.com/user-attachments/assets/fad36e29-447a-4959-87e9-f84211089182" />
 
-<!-- ![Boss Dashboard](assets/screenshot-1.png) -->
-<!-- ![Full Analysis](assets/screenshot-2.png) -->
-
----
 
 ## 👉 Try it live
 
