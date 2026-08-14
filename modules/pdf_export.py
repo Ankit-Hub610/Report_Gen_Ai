@@ -173,36 +173,35 @@ def build_pdf_report(report_title, subtitle, kpis, chart_items, theme, filters_s
     # ---- KPI grid - 4 per row, styled as distinct "cards" ----
     if kpis:
         story.append(Paragraph("\u25A0 KEY PERFORMANCE INDICATORS", section_style))
-        rows, row = [], []
-        for k in kpis:
-            cell = [Paragraph("KPI", kpi_eyebrow_style),
+
+        def _kpi_cell(k):
+            return [Paragraph("KPI", kpi_eyebrow_style),
                     Paragraph(k["label"], kpi_label_style),
                     Paragraph(str(k["value"]), kpi_value_style),
                     Paragraph(k.get("sub", "") or "", kpi_sub_style)]
-            row.append(cell)
-            if len(row) == 4:
-                rows.append(row)
-                row = []
-        if row:
-            while len(row) < 4:
-                row.append([Paragraph("", kpi_label_style)])
-            rows.append(row)
 
-        table_data = [[_stack(c) for c in r] for r in rows]
-        t = Table(table_data, colWidths=[doc.width / 4.0] * 4)
-        style_cmds = [
-            ("BOX", (0, 0), (-1, -1), 0.6, box_border),
-            ("INNERGRID", (0, 0), (-1, -1), 0.5, box_border),
-            ("BACKGROUND", (0, 0), (-1, -1), card_bg),
-            ("TOPPADDING", (0, 0), (-1, -1), 9),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ]
-        for r_idx in range(len(rows)):
-            for c_idx in range(4):
-                style_cmds.append(("LINEABOVE", (c_idx, r_idx), (c_idx, r_idx), 2.2, accent))
-        t.setStyle(TableStyle(style_cmds))
-        story.append(t)
+        # Group into rows of (up to) 4 real cards each - the LAST row is never
+        # padded with blank cells. Instead it's rendered as its own table with
+        # exactly as many columns as it has real cards, stretched to fill the
+        # same width - so 2 KPIs show as 2 full-width cards, not 2 real + 2
+        # empty bordered boxes.
+        groups = [kpis[i:i + 4] for i in range(0, len(kpis), 4)]
+        for group in groups:
+            n = len(group)
+            table_data = [[_stack(_kpi_cell(k)) for k in group]]
+            t = Table(table_data, colWidths=[doc.width / n] * n)
+            style_cmds = [
+                ("BOX", (0, 0), (-1, -1), 0.6, box_border),
+                ("INNERGRID", (0, 0), (-1, -1), 0.5, box_border),
+                ("BACKGROUND", (0, 0), (-1, -1), card_bg),
+                ("TOPPADDING", (0, 0), (-1, -1), 9),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ]
+            for c_idx in range(n):
+                style_cmds.append(("LINEABOVE", (c_idx, 0), (c_idx, 0), 2.2, accent))
+            t.setStyle(TableStyle(style_cmds))
+            story.append(t)
 
     # ---- One chart per page, each clearly labelled with its TYPE ----
     for item in chart_items:
