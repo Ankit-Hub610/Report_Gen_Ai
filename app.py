@@ -199,11 +199,12 @@ def can_edit() -> bool:
 def can_edit_dashboard() -> bool:
     """Like can_edit(), but ALSO true for a 'report_viewer' (a restricted
     account a client can self-serve create for their own boss/manager —
-    see Settings → My Report Viewers). A report_viewer only ever sees the
-    Boss Dashboard page at all (everything else is hidden from their
-    sidebar), but gets FULL control of what they do see there: pin/unpin
-    cards, manage slicers, tweak the theme, export PDF — same as a client,
-    just scoped to that one page."""
+    see Settings → My Report Viewers) — but ONLY on the Boss Dashboard page.
+    A report_viewer can also see Business Insights / Full Analysis / AI
+    Assistant, but those stay read-only for them (use can_edit(), not this,
+    for anything on those pages) — Boss Dashboard is the one page where a
+    viewer gets full control of what they see: pin/unpin cards, manage
+    slicers, tweak the theme, zoom charts, export PDF — same as a client."""
     return st.session_state.role in (auth.ROLE_ADMIN, auth.ROLE_CLIENT, auth.ROLE_REPORT_VIEWER)
 
 
@@ -214,7 +215,7 @@ def _render_chart_with_zoom(fig, zoom_key: str, widget_key: str, editable: bool 
     and the caller then reuses that same fig for the PDF export, so whatever zoom
     is showing on screen is exactly what appears in the exported PDF too. Returns
     the (possibly zoom-applied) fig so the caller can hand it to chart_png_items."""
-    zoom = st.session_state.dashboard_zoom.get(zoom_key, [0, 100])
+    zoom = (st.session_state.get("dashboard_zoom") or {}).get(zoom_key, [0, 100])
     if editable:
         zc1, zc2 = st.columns([1, 20])
         with zc1:
@@ -258,8 +259,17 @@ def sync_workspace_from_disk(force: bool = False):
     if not workspace_changed and not force:
         return
     if workspace_changed:
+        # Dict-typed persisted keys need to reset to {}, not None - list-typed ones
+        # already got that right below. "filters" is patched explicitly right after
+        # this loop, so it doesn't need to be listed here too.
+        _dict_reset_keys = {"dashboard_zoom", "intel_role_overrides"}
         for k in ws.PERSISTED_KEYS:
-            ss[k] = [] if isinstance(ss.get(k), list) else None
+            if isinstance(ss.get(k), list):
+                ss[k] = []
+            elif k in _dict_reset_keys:
+                ss[k] = {}
+            else:
+                ss[k] = None
         ss["filters"] = {}
         ss["p3_sql_result"] = None  # SQL Query tab result belongs to the previous workspace — drop it on switch
         ss["p3_sql_error"] = None
@@ -564,7 +574,7 @@ def login_screen():
         with _lc2:
             _img_html = _logo_img_html(_logo, _logo_mime, brand.get("logo_width", 220))
             _render_glow_target("brand_glow_logo", "logo", brand, _img_html)
-    st.markdown("<h1 style='text-align:center;'>Research | Analysis | intelligence </h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align:center;'>Research | Analysis | Intteligance </h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
@@ -1358,7 +1368,12 @@ with st.sidebar:
     if st.session_state.df_raw is not None and ppt.detect_title_column(st.session_state.df_raw, st.session_state.meta):
         nav_options.insert(4, "💡 Business Insights")  # right after Boss Dashboard
     if st.session_state.role == auth.ROLE_REPORT_VIEWER:
-        nav_options = ["⭐ Boss Dashboard"]   # nothing else exists for this account, not even Settings
+        # A viewer's job is to read the finished picture, not build it - so Connect
+        # Data / Raw Analysis / Custom Builder / Data Table / Settings stay hidden.
+        # But the three "here's what's going on" pages (and the chatbot to ask
+        # follow-ups about them) ARE useful to a viewer, so those stay visible.
+        _viewer_allowed = {"⭐ Boss Dashboard", "💡 Business Insights", "📈 Full Analysis", "🤖 AI Assistant"}
+        nav_options = [p for p in nav_options if p in _viewer_allowed]
     if st.session_state.role == auth.ROLE_ADMIN:
         nav_options.append("🔐 Admin Panel")
     page = st.radio("Navigate", nav_options, label_visibility="collapsed")
@@ -2399,25 +2414,26 @@ elif page == "📈 Full Analysis":
                     (st.success if ok else st.error)(msg)
 
         st.divider()
-        st.subheader("✅ Action Tracker")
-        st.caption("Top Actions ko yahan add karke tick karte jao — persist rahega.")
-        new_action = st.text_input("+ Add an action item", key="intel_new_action")
-        if st.button("Add", key="intel_add_action") and new_action.strip() and can_edit():
-            st.session_state.intel_action_checks.append({"text": new_action.strip(), "done": False})
-            ws.save_light(st.session_state, st.session_state.workspace_id)
-            st.rerun()
-        for i, item in enumerate(list(st.session_state.intel_action_checks)):
-            ac1, ac2 = st.columns([9, 1])
-            with ac1:
-                checked = st.checkbox(item["text"], value=item["done"], key=f"intel_action_{i}", disabled=not can_edit())
-                if checked != item["done"]:
-                    st.session_state.intel_action_checks[i]["done"] = checked
-                    ws.save_light(st.session_state, st.session_state.workspace_id)
-            with ac2:
-                if can_edit() and st.button("🗑️", key=f"intel_action_del_{i}"):
-                    st.session_state.intel_action_checks.pop(i)
-                    ws.save_light(st.session_state, st.session_state.workspace_id)
-                    st.rerun()
+        st.subheader("🧬 Segment & Behaviour Breakdown")
+        st.caption("Ye numbers upar kahin nahi dikhaye gaye the — customer repeat behaviour aur extra "
+                   "category fields (jaise status, tier, group) ka apna analysis.")
+        rpt = facts.get("repeat", {})
+        extra = facts.get("extra_breakdowns", [])
+        if not rpt.get("available") and not extra:
+            st.caption("Is dataset mein customer column ya extra low-cardinality category column nahi mila "
+                       "isliye yahan dikhane ke liye kuch nahi hai.")
+        if rpt.get("available"):
+            rc1, rc2, rc3 = st.columns(3)
+            rc1.metric("Unique Customers", f"{rpt['unique_customers']:,}")
+            rc2.metric("Repeat Customers (2+ orders)", f"{rpt['repeat_customers']:,}")
+            rc3.metric("Repeat Rate", f"{rpt['repeat_rate_pct']}%")
+        if extra:
+            ecols = st.columns(min(3, len(extra)))
+            for i, b in enumerate(extra):
+                with ecols[i % len(ecols)]:
+                    st.markdown(f"**{b['label']}**")
+                    st.dataframe(pd.DataFrame(b["counts"]).rename(columns={"name": "Value", "count": "Count"}),
+                                 use_container_width=True, hide_index=True)
 
         # ---- Optional AI write-up — deeper narrative, NOT the primary content anymore ----
         st.divider()
@@ -2445,30 +2461,9 @@ elif page == "📈 Full Analysis":
                     st.download_button("⬇️ Download AI write-up (.md)", data=st.session_state._intel_narrative,
                                         file_name="ai_writeup.md", mime="text/markdown", key="intel_ai_dl")
 
-        if api_key:
-            st.divider()
-            st.subheader("💬 Follow-up Questions")
-            st.caption("Is report ke baare mein kuch aur poochna hai? Answers real SQL se grounded hote hain.")
-            for turn in st.session_state.intel_qa_history:
-                with st.chat_message(turn["role"]):
-                    st.markdown(turn["content"])
-            qa_question = st.chat_input("e.g. \"Which month had the highest revenue?\"", key="intel_qa_input")
-            if qa_question:
-                st.session_state.intel_qa_history.append({"role": "user", "content": qa_question})
-                with st.chat_message("user"):
-                    st.markdown(qa_question)
-                with st.chat_message("assistant"):
-                    with st.spinner("Sochte hain..."):
-                        kpis_for_qa = de.compute_kpis(df, meta)
-                        qa_result = ac.ask(qa_question, df, meta, kpis_for_qa, st.session_state.dashboard_charts,
-                                           api_key, history=st.session_state.intel_qa_history[:-1])
-                    if qa_result["error"]:
-                        st.error(qa_result["error"])
-                    else:
-                        st.markdown(qa_result["answer"])
-                        st.session_state.intel_qa_history.append({"role": "assistant", "content": qa_result["answer"]})
-
         st.divider()
+        st.caption("Is analysis ke baare mein kuch aur poochna hai? **🤖 AI Assistant** page par jaake "
+                   "seedha sawaal pooch sakte ho — wahaan pura chat history bhi milega.")
         if st.button("⬅️ Back to Page 1", key="intel_back_part1"):
             st.session_state.intel_part = 1
             st.rerun()
@@ -3245,9 +3240,41 @@ report, without you writing a single formula.
   wallpaper image for the exported PDF.
 - Any chart can be **swapped** for another variant of the same family without
   going back to Page 1.
+- **🔍 Zoom**: every chart has a zoom slider above it — drag either handle to
+  zoom into a crowded stretch of data labels. Whatever zoom is showing on
+  screen is exactly what shows up in the **Download PDF** export too, so
+  what your boss sees on paper always matches what you were looking at.
 - **Download PDF**: produces a clean, print-ready report with only the finished
   KPIs, charts and insights — no buttons, no settings panels, nothing that would
   look unprofessional in front of your boss.
+
+**💡 Business Insights** *(only shown when the loaded dataset has a matching
+column — e.g. a "Payment Page Title" style field; hidden entirely for datasets
+where it wouldn't apply)*
+- A ready-made, plain-language breakdown built specifically for payment-link /
+  booking-style data: revenue and bookings per page/title, which ones are
+  winning or fading, and a short written summary — no setup required.
+
+**📈 Full Analysis**
+- The deep-dive report, split into two pages you flip between at the top:
+  - **Page 1**: data understanding & cleaning notes, the full KPI scorecard,
+    revenue trend & forecast, anomalies, correlations, and every top/bottom
+    breakdown (product, customer, location, channel) — all calculated
+    directly from the data with plain code, never guessed.
+  - **Page 2**: past performance and future outlook in plain sentences, AI-written
+    Key Insights + Recommended Actions grounded ONLY in the numbers from Page 1,
+    an optional longer AI write-up, a repeat-customer and extra-category
+    breakdown (payment status, skill/tier group, age bands, etc. — whatever
+    your data has), and a snapshot/email/download option so you can track this
+    report over time.
+- A "🎚️ Manage Slicers" control lets you pick any field and instantly re-run
+  every number and every AI section for just that slice.
+
+**🤖 AI Assistant**
+- A chat box grounded in your actual data — every answer is generated by first
+  running a real SQL-style query against your dataset, never guessed from
+  memory. Good for one-off questions ("which month had the highest revenue?")
+  that don't need a full dashboard or report.
 
 **🗂 Data Table (Page 4)**
 - SQL-style access to the raw data: pick which columns to `SELECT`, add a filter
@@ -3256,7 +3283,9 @@ report, without you writing a single formula.
 
 **⚙️ Settings**
 - Reset the default look of the Boss Dashboard, change your own password, and
-  (for client accounts) create Report Viewer logins for your own team.
+  (for client accounts) create Report Viewer logins for your own team. A Report
+  Viewer login can see Boss Dashboard, Business Insights, Full Analysis and the
+  AI Assistant — full control on Boss Dashboard, read-only everywhere else.
 
 **Performance note:** column detection, KPI math and chart aggregation are all
 done with vectorized pandas/NumPy operations, so the same tool comfortably
