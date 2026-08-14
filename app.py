@@ -1938,10 +1938,6 @@ elif page == "⭐ Boss Dashboard":
         st.subheader("📄 Export")
         report_title = st.text_input("Report title", st.session_state.dashboard_name or "Sports Performance & Payments Report")
         subtitle = st.text_input("Subtitle", f"Prepared for management review — {pd.Timestamp.today().date()}")
-        filters_summary = ", ".join(
-            [f"{k.replace('p2_','')}: {v}" for k, v in st.session_state.filters.items()
-             if k.startswith("p2_") and v not in (None, [], ())]
-        ) or "None"
 
         if st.button("⬇️ Generate & Download PDF", type="primary"):
             render_errors = []
@@ -1984,7 +1980,6 @@ elif page == "⭐ Boss Dashboard":
                     kpis=pdf_kpis,
                     chart_items=[c for c in chart_png_items if c["png_bytes"]],
                     theme=pdf_theme,
-                    filters_summary=filters_summary,
                 )
             st.download_button("📥 Click to download report.pdf", data=pdf_bytes,
                                 file_name="sports_analytics_report.pdf", mime="application/pdf",
