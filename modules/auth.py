@@ -67,6 +67,11 @@ ROLE_REPORT_VIEWER = "report_viewer"   # restricted viewer a CLIENT can self-ser
                                         # page (read-only) — kept as-is for backward compatibility.
 ALL_ROLES = (ROLE_ADMIN, ROLE_CLIENT, ROLE_VIEWER, ROLE_REPORT_VIEWER)
 
+TRIAL_DAYS = 15   # a "free" plan account stops working entirely this many days after
+                  # it was FIRST put on the free plan — not a daily reset, a hard cutoff.
+                  # (Daily AI/PDF/row caps in usage_limits.py are separate and keep
+                  # resetting every day WHILE the trial is still active.)
+
 
 def _hash(pw: str, salt: bytes = None) -> str:
     """Salted PBKDF2-SHA256 (200k iterations) — stored as 'saltHex:hashHex'.
@@ -178,6 +183,33 @@ def get_plan(username: str) -> str:
     return (user or {}).get("plan", "standard")
 
 
+def get_trial_status(username: str) -> dict:
+    """For a 'free' plan account: {'expired': bool, 'days_left': int}. For a
+    'standard' account: {'expired': False, 'days_left': None} (no trial clock
+    applies at all)."""
+    store = _load_store()
+    user = store["users"].get((username or "").strip()) or {}
+    if user.get("plan") != "free":
+        return {"expired": False, "days_left": None}
+    trial_start = user.get("trial_start")
+    if not trial_start:
+        return {"expired": False, "days_left": TRIAL_DAYS}
+    elapsed_days = (time.time() - trial_start) / 86400
+    days_left = max(0, int(TRIAL_DAYS - elapsed_days) + (1 if (TRIAL_DAYS - elapsed_days) % 1 > 0 else 0))
+    return {"expired": elapsed_days >= TRIAL_DAYS, "days_left": days_left}
+
+
+def reset_trial(username: str):
+    """Admin action: grants an existing 'free' account a brand-new TRIAL_DAYS
+    window starting now (e.g. after they've paid, or as a goodwill extension).
+    No-op if the account isn't on the free plan."""
+    store = _load_store()
+    user = store["users"].get((username or "").strip())
+    if user and user.get("plan") == "free":
+        user["trial_start"] = time.time()
+        _save_store(store)
+
+
 def verify_admin_login(username: str, password_plain: str) -> bool:
     """Stricter check used ONLY by the separate Admin Panel login form -
     succeeds only for accounts with role == admin, even if the password is
@@ -204,7 +236,8 @@ def list_users():
     store = _load_store()
     return [
         {"username": u, "role": info["role"], "workspace_id": info.get("workspace_id", u),
-         "email": info.get("email", ""), "plan": info.get("plan", "standard")}
+         "email": info.get("email", ""), "plan": info.get("plan", "standard"),
+         "trial_start": info.get("trial_start")}
         for u, info in store["users"].items()
     ]
 
@@ -233,24 +266,33 @@ def create_or_update_user(username: str, password_plain: str, role: str, workspa
     email: optional, but required if the account should be able to use
       "Forgot password" (the reset link goes to this address).
     plan: "standard" (default, unlimited) or "free" (capped — see
-      usage_limits.py for the actual limits). Lets you give trial/beta
-      accounts real usage caps without touching their role or workspace."""
+      usage_limits.py for the daily caps, AND a hard TRIAL_DAYS cutoff below).
+      Lets you give trial/beta accounts real usage caps without touching
+      their role or workspace."""
     username = (username or "").strip()
     if not username or not password_plain or role not in ALL_ROLES:
         raise ValueError("Username, password and a valid role are required.")
     store = _load_store()
+    existing = store["users"].get(username, {})
     ws_id = (workspace_id or "").strip() or username
     entry = {"password_hash": _hash(password_plain), "role": role, "workspace_id": ws_id}
     if email:
         entry["email"] = email.strip().lower()
-    elif username in store["users"] and store["users"][username].get("email"):
-        entry["email"] = store["users"][username]["email"]   # keep existing email on an update that didn't touch it
+    elif existing.get("email"):
+        entry["email"] = existing["email"]   # keep existing email on an update that didn't touch it
     if plan in ("standard", "free"):
         entry["plan"] = plan
-    elif username in store["users"] and store["users"][username].get("plan"):
-        entry["plan"] = store["users"][username]["plan"]   # keep existing plan on an update that didn't touch it
+    elif existing.get("plan"):
+        entry["plan"] = existing["plan"]   # keep existing plan on an update that didn't touch it
     else:
         entry["plan"] = "standard"
+    if entry["plan"] == "free":
+        # Only stamp a FRESH trial_start the first time this account goes onto
+        # the free plan (i.e. it didn't already have one) - re-saving the same
+        # account (password reset, role tweak, etc.) must NOT silently renew
+        # the trial clock. Use reset_trial() below to explicitly grant a new
+        # trial window to an existing account.
+        entry["trial_start"] = existing.get("trial_start") or time.time()
     store["users"][username] = entry
     _save_store(store)
 
@@ -260,6 +302,22 @@ def set_email(username: str, email: str):
     if username not in store["users"]:
         raise ValueError(f"User '{username}' does not exist.")
     store["users"][username]["email"] = (email or "").strip().lower()
+    _save_store(store)
+
+
+def set_plan(username: str, plan: str):
+    """Changes an existing account's plan WITHOUT touching its password —
+    unlike calling create_or_update_user() (which requires a password arg).
+    Switching to 'free' stamps a fresh trial_start only if it didn't already
+    have one; switching to 'standard' just lifts the cap/trial entirely."""
+    if plan not in ("standard", "free"):
+        raise ValueError("plan must be 'standard' or 'free'.")
+    store = _load_store()
+    if username not in store["users"]:
+        raise ValueError(f"User '{username}' does not exist.")
+    store["users"][username]["plan"] = plan
+    if plan == "free" and not store["users"][username].get("trial_start"):
+        store["users"][username]["trial_start"] = time.time()
     _save_store(store)
 
 
