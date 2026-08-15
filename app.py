@@ -711,6 +711,47 @@ if not st.session_state.authenticated:
     st.stop()
 
 
+def render_plan_comparison():
+    """Free vs Standard comparison table — shown both as its own nav page for
+    logged-in users, and inside the trial-expired blocking screen below."""
+    st.markdown("### 🆓 Free  vs  💎 Standard")
+    rows = [
+        ("AI requests", f"{ul.FREE_PLAN_LIMITS['ai_calls']} per day", "Unlimited"),
+        ("PDF exports", f"{ul.FREE_PLAN_LIMITS['pdf_exports']} per day", "Unlimited"),
+        ("Data size", f"Up to {ul.FREE_PLAN_LIMITS['max_rows']:,} rows", "Unlimited rows"),
+        ("How long it works", f"{auth.TRIAL_DAYS} days total, then access stops", "Forever"),
+        ("Boss Dashboard, Custom Builder, Full Analysis", "✅ Included", "✅ Included"),
+        ("Branding / white-label", "✅ Included", "✅ Included"),
+        ("Priority support", "—", "✅ Included"),
+    ]
+    df_plan = pd.DataFrame(rows, columns=["Feature", "🆓 Free", "💎 Standard"])
+    st.table(df_plan.set_index("Feature"))
+    st.caption(f"Free plan is meant for trying the tool out — full access for {auth.TRIAL_DAYS} days, "
+               f"with generous-but-capped daily usage. After that, upgrade to Standard to keep going "
+               f"with everything unlocked and unlimited.")
+
+
+if st.session_state.plan == "free" and st.session_state.role != auth.ROLE_ADMIN:
+    _trial = auth.get_trial_status(st.session_state.username)
+    if _trial["expired"]:
+        st.title("⏳ Your free trial has ended")
+        st.warning(f"Your {auth.TRIAL_DAYS}-day free trial finished. Upgrade to Standard to keep using "
+                   f"the tool — your data is safe and waiting, it isn't deleted.")
+        render_plan_comparison()
+        st.info("📩 Contact your admin to upgrade this account to Standard.")
+        if st.button("Log out"):
+            auth.destroy_session(st.session_state.get("_session_token"))
+            st.session_state.authenticated = False
+            st.session_state.username = None
+            st.session_state.role = None
+            st.session_state.plan = "standard"
+            st.session_state.workspace_id = None
+            st.session_state._session_token = None
+            _clear_session_cookie()
+            st.rerun()
+        st.stop()
+
+
 # ==================================================================================
 # HELPERS
 # ==================================================================================
@@ -1381,7 +1422,7 @@ with st.sidebar:
     sync_workspace_from_disk()
 
     nav_options = ["📥 Connect Data", "📊 Raw Analysis", "🧩 Custom Builder", "⭐ Boss Dashboard",
-                    "📈 Full Analysis", "🗂 Data Table", "🤖 AI Assistant", "⚙️ Settings"]
+                    "📈 Full Analysis", "🗂 Data Table", "🤖 AI Assistant", "⚙️ Settings", "💎 Plans"]
     # "💡 Business Insights" only makes sense for datasets that actually have a
     # Payment Page Title-shaped column (e.g. "Badminton AMD Mondays") - this app
     # is used by many different clients with unrelated datasets, so the tab
@@ -1395,6 +1436,10 @@ with st.sidebar:
     page = st.radio("Navigate", nav_options, label_visibility="collapsed")
     st.session_state.page = page
     st.divider()
+    if st.session_state.plan == "free" and st.session_state.role != auth.ROLE_ADMIN:
+        _trial_sb = auth.get_trial_status(st.session_state.username)
+        if _trial_sb["days_left"] is not None:
+            st.caption(f"🆓 Free trial: **{_trial_sb['days_left']} day(s) left**")
     if st.session_state.data_source_name:
         st.success(f"Loaded: {st.session_state.data_source_name}")
         if st.session_state.df_raw is not None:
@@ -3325,6 +3370,22 @@ every page to narrow down what's rendered on screen.
         """)
 
 
+elif page == "💎 Plans":
+    st.title("💎 Plans")
+    if st.session_state.plan == "free" and st.session_state.role != auth.ROLE_ADMIN:
+        _trial_pp = auth.get_trial_status(st.session_state.username)
+        if _trial_pp["days_left"] is not None:
+            st.info(f"🆓 You're on the **Free** plan — **{_trial_pp['days_left']} day(s) left** "
+                   f"in your {auth.TRIAL_DAYS}-day trial.")
+    else:
+        st.success("💎 You're on the **Standard** plan — unlimited, no trial clock.")
+    st.caption("")
+    render_plan_comparison()
+    st.divider()
+    st.markdown("**Want to upgrade to Standard?** Contact your admin — they can switch your account "
+               "over from the Admin Panel in one click, and none of your data or dashboards are affected.")
+
+
 elif page == "🔐 Admin Panel":
     if st.session_state.role != auth.ROLE_ADMIN:
         st.error("You don't have access to this page.")
@@ -3367,7 +3428,9 @@ elif page == "🔐 Admin Panel":
                 "Plan", ["Standard (unlimited)", "Free (capped — for trials/demos)"], horizontal=True,
                 help=f"Free plan caps: {ul.FREE_PLAN_LIMITS['ai_calls']} AI requests/day, "
                      f"{ul.FREE_PLAN_LIMITS['pdf_exports']} PDF exports/day, "
-                     f"{ul.FREE_PLAN_LIMITS['max_rows']:,} row max on loaded data. Resets daily at UTC midnight.",
+                     f"{ul.FREE_PLAN_LIMITS['max_rows']:,} row max on loaded data (resets daily at UTC "
+                     f"midnight) — AND the whole account stops working after {auth.TRIAL_DAYS} days total, "
+                     f"regardless of daily usage, until upgraded to Standard.",
             )
 
             client_options = auth.list_client_usernames()
@@ -3433,6 +3496,25 @@ elif page == "🔐 Admin Panel":
                         st.rerun()
                     except ValueError as e:
                         st.error(str(e))
+                _sel_plan = auth.get_plan(sel_user)
+                if _sel_plan == "free":
+                    _sel_trial = auth.get_trial_status(sel_user)
+                    st.caption(f"🆓 Free plan — {_sel_trial['days_left']} day(s) left"
+                              + (" (expired)" if _sel_trial["expired"] else ""))
+                    if st.button(f"🔄 Reset trial ({auth.TRIAL_DAYS} fresh days)", use_container_width=True):
+                        auth.reset_trial(sel_user)
+                        st.success(f"Trial reset for '{sel_user}' — {auth.TRIAL_DAYS} fresh days.")
+                        st.rerun()
+                    if st.button("⬆️ Upgrade to Standard (unlimited)", use_container_width=True):
+                        auth.set_plan(sel_user, "standard")
+                        st.success(f"'{sel_user}' upgraded to Standard (unlimited) — password unchanged.")
+                        st.rerun()
+                else:
+                    st.caption("💎 Standard plan (unlimited)")
+                    if st.button("⬇️ Move to Free plan", use_container_width=True):
+                        auth.set_plan(sel_user, "free")
+                        st.success(f"'{sel_user}' moved to Free plan — {auth.TRIAL_DAYS}-day trial starts now.")
+                        st.rerun()
 
     with tab_mypw:
         st.subheader("Change my own admin password")
