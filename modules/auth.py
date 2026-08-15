@@ -68,12 +68,40 @@ ROLE_REPORT_VIEWER = "report_viewer"   # restricted viewer a CLIENT can self-ser
 ALL_ROLES = (ROLE_ADMIN, ROLE_CLIENT, ROLE_VIEWER, ROLE_REPORT_VIEWER)
 
 
-def _hash(pw: str) -> str:
-    return hashlib.sha256(pw.encode("utf-8")).hexdigest()
+def _hash(pw: str, salt: bytes = None) -> str:
+    """Salted PBKDF2-SHA256 (200k iterations) — stored as 'saltHex:hashHex'.
+    Old accounts (created before this change) had a bare unsalted-SHA256 hex
+    string as their password_hash; _verify_password below still recognizes
+    that legacy format so nobody gets locked out, and silently upgrades that
+    account to the new salted format the next time they successfully log in."""
+    if salt is None:
+        salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, 200_000)
+    return salt.hex() + ":" + dk.hex()
+
+
+def _verify_password(pw: str, stored_hash: str) -> bool:
+    if not stored_hash:
+        return False
+    if ":" in stored_hash:
+        salt_hex, _, dk_hex = stored_hash.partition(":")
+        try:
+            salt = bytes.fromhex(salt_hex)
+        except ValueError:
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, 200_000)
+        return dk.hex() == dk_hex
+    # legacy unsalted sha256 (pre-upgrade accounts)
+    return hashlib.sha256(pw.encode("utf-8")).hexdigest() == stored_hash
+
+
+def _is_legacy_hash(stored_hash: str) -> bool:
+    return bool(stored_hash) and ":" not in stored_hash
 
 
 def _default_store():
-    return {"users": {"admin": {"password_hash": _hash("admin123"), "role": ROLE_ADMIN, "workspace_id": "admin"}}}
+    return {"users": {"admin": {"password_hash": _hash("admin123"), "role": ROLE_ADMIN,
+                                "workspace_id": "admin", "plan": "standard"}}}
 
 
 def _migrate_if_old_format(raw: dict) -> dict:
@@ -95,6 +123,7 @@ def _migrate_if_old_format(raw: dict) -> dict:
 
     for uname, info in raw["users"].items():
         info.setdefault("workspace_id", uname)
+        info.setdefault("plan", "standard")   # existing accounts stay unlimited — nobody gets newly capped by surprise
         if info.get("role") not in ALL_ROLES:
             info["role"] = ROLE_VIEWER
     return raw
@@ -127,12 +156,26 @@ def _save_store(store: dict):
 # LOGIN
 # --------------------------------------------------------------------------------
 def verify_login(username: str, password_plain: str):
-    """Returns the role string ("admin"/"client"/"viewer") on success, or None."""
+    """Returns the role string ("admin"/"client"/"viewer") on success, or None.
+    On a successful login through a legacy (pre-salt) password hash, silently
+    upgrades that account's stored hash to the new salted format - no user
+    action needed, no disruption, just quietly more secure from here on."""
     store = _load_store()
-    user = store["users"].get((username or "").strip())
-    if user and _hash(password_plain or "") == user["password_hash"]:
+    uname = (username or "").strip()
+    user = store["users"].get(uname)
+    if user and _verify_password(password_plain or "", user["password_hash"]):
+        if _is_legacy_hash(user["password_hash"]):
+            user["password_hash"] = _hash(password_plain or "")
+            _save_store(store)
         return user["role"]
     return None
+
+
+def get_plan(username: str) -> str:
+    """Returns 'standard' (unlimited) or 'free' (capped — see usage_limits.py)."""
+    store = _load_store()
+    user = store["users"].get((username or "").strip())
+    return (user or {}).get("plan", "standard")
 
 
 def verify_admin_login(username: str, password_plain: str) -> bool:
@@ -160,7 +203,8 @@ def get_workspace_id(username: str) -> str:
 def list_users():
     store = _load_store()
     return [
-        {"username": u, "role": info["role"], "workspace_id": info.get("workspace_id", u), "email": info.get("email", "")}
+        {"username": u, "role": info["role"], "workspace_id": info.get("workspace_id", u),
+         "email": info.get("email", ""), "plan": info.get("plan", "standard")}
         for u, info in store["users"].items()
     ]
 
@@ -177,7 +221,8 @@ def list_client_usernames():
     return [u["username"] for u in list_users() if u["role"] == ROLE_CLIENT]
 
 
-def create_or_update_user(username: str, password_plain: str, role: str, workspace_id: str = None, email: str = None):
+def create_or_update_user(username: str, password_plain: str, role: str, workspace_id: str = None,
+                          email: str = None, plan: str = None):
     """Creates a new account or updates an existing one's password/role/link.
     workspace_id: which data workspace this account should read/write.
       - If omitted/blank, defaults to the account's own username (a fresh,
@@ -186,7 +231,10 @@ def create_or_update_user(username: str, password_plain: str, role: str, workspa
       - For a viewer account, pass an existing CLIENT's username here to
         link the viewer to that client's live data instead.
     email: optional, but required if the account should be able to use
-      "Forgot password" (the reset link goes to this address)."""
+      "Forgot password" (the reset link goes to this address).
+    plan: "standard" (default, unlimited) or "free" (capped — see
+      usage_limits.py for the actual limits). Lets you give trial/beta
+      accounts real usage caps without touching their role or workspace."""
     username = (username or "").strip()
     if not username or not password_plain or role not in ALL_ROLES:
         raise ValueError("Username, password and a valid role are required.")
@@ -197,6 +245,12 @@ def create_or_update_user(username: str, password_plain: str, role: str, workspa
         entry["email"] = email.strip().lower()
     elif username in store["users"] and store["users"][username].get("email"):
         entry["email"] = store["users"][username]["email"]   # keep existing email on an update that didn't touch it
+    if plan in ("standard", "free"):
+        entry["plan"] = plan
+    elif username in store["users"] and store["users"][username].get("plan"):
+        entry["plan"] = store["users"][username]["plan"]   # keep existing plan on an update that didn't touch it
+    else:
+        entry["plan"] = "standard"
     store["users"][username] = entry
     _save_store(store)
 
