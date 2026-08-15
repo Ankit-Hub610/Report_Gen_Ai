@@ -42,6 +42,7 @@ from modules import ai_chat as ac
 from modules import email_service as es
 from modules import intel_engine as ie
 from modules import ppt_engine as ppt
+from modules import usage_limits as ul
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -55,7 +56,12 @@ except ImportError:
 st.set_page_config(page_title="RA-I Created by Ankit_Solanki", page_icon="🏆", layout="wide")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-SAMPLE_PATH = os.path.join(APP_DIR, "sample_data", "sample_sports_payments.csv")
+SAMPLE_PATH = os.path.join(APP_DIR, "sample_data", "sample_sports_payments.csv")  # kept for backward-compat
+SAMPLE_DATASETS = {
+    "🏸 Sports / court bookings & payments": "sample_sports_payments.csv",
+    "🛍️ E-commerce / D2C sales": "sample_ecommerce_sales.csv",
+    "🧾 Freelancer / agency invoices": "sample_agency_invoices.csv",
+}
 
 DEFAULT_THEME = {
     "bg_color": "#0E1117",
@@ -121,6 +127,7 @@ def init_state():
     ss.setdefault("authenticated", False)
     ss.setdefault("username", None)
     ss.setdefault("role", None)
+    ss.setdefault("plan", "standard")   # "standard" (unlimited) or "free" (capped, see usage_limits.py)
     ss.setdefault("workspace_id", None)      # which data workspace this account owns (Phase 4: multi-tenant)
     ss.setdefault("view_as_workspace", None)  # admin-only: workspace_id currently being viewed/managed instead of their own
     ss.setdefault("_loaded_workspace_id", None)  # which workspace's data is currently sitting in session_state
@@ -199,12 +206,11 @@ def can_edit() -> bool:
 def can_edit_dashboard() -> bool:
     """Like can_edit(), but ALSO true for a 'report_viewer' (a restricted
     account a client can self-serve create for their own boss/manager —
-    see Settings → My Report Viewers) — but ONLY on the Boss Dashboard page.
-    A report_viewer can also see Business Insights / Full Analysis / AI
-    Assistant, but those stay read-only for them (use can_edit(), not this,
-    for anything on those pages) — Boss Dashboard is the one page where a
-    viewer gets full control of what they see: pin/unpin cards, manage
-    slicers, tweak the theme, zoom charts, export PDF — same as a client."""
+    see Settings → My Report Viewers). A report_viewer only ever sees the
+    Boss Dashboard page at all (everything else is hidden from their
+    sidebar), but gets FULL control of what they do see there: pin/unpin
+    cards, manage slicers, tweak the theme, export PDF — same as a client,
+    just scoped to that one page."""
     return st.session_state.role in (auth.ROLE_ADMIN, auth.ROLE_CLIENT, auth.ROLE_REPORT_VIEWER)
 
 
@@ -215,7 +221,7 @@ def _render_chart_with_zoom(fig, zoom_key: str, widget_key: str, editable: bool 
     and the caller then reuses that same fig for the PDF export, so whatever zoom
     is showing on screen is exactly what appears in the exported PDF too. Returns
     the (possibly zoom-applied) fig so the caller can hand it to chart_png_items."""
-    zoom = (st.session_state.get("dashboard_zoom") or {}).get(zoom_key, [0, 100])
+    zoom = st.session_state.dashboard_zoom.get(zoom_key, [0, 100])
     if editable:
         zc1, zc2 = st.columns([1, 20])
         with zc1:
@@ -259,17 +265,8 @@ def sync_workspace_from_disk(force: bool = False):
     if not workspace_changed and not force:
         return
     if workspace_changed:
-        # Dict-typed persisted keys need to reset to {}, not None - list-typed ones
-        # already got that right below. "filters" is patched explicitly right after
-        # this loop, so it doesn't need to be listed here too.
-        _dict_reset_keys = {"dashboard_zoom", "intel_role_overrides"}
         for k in ws.PERSISTED_KEYS:
-            if isinstance(ss.get(k), list):
-                ss[k] = []
-            elif k in _dict_reset_keys:
-                ss[k] = {}
-            else:
-                ss[k] = None
+            ss[k] = [] if isinstance(ss.get(k), list) else None
         ss["filters"] = {}
         ss["p3_sql_result"] = None  # SQL Query tab result belongs to the previous workspace — drop it on switch
         ss["p3_sql_error"] = None
@@ -574,7 +571,7 @@ def login_screen():
         with _lc2:
             _img_html = _logo_img_html(_logo, _logo_mime, brand.get("logo_width", 220))
             _render_glow_target("brand_glow_logo", "logo", brand, _img_html)
-    st.markdown("<h1 style='text-align:center;'>Research | Analysis | Intelligence </h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align:center;'>Research | Analysis | Intteligance </h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
@@ -589,6 +586,7 @@ def login_screen():
                     st.session_state.username = u.strip()
                     st.session_state.role = role
                     st.session_state.workspace_id = auth.get_workspace_id(u.strip())
+                    st.session_state.plan = auth.get_plan(u.strip())
                     _token = auth.create_session(u.strip())
                     st.session_state._session_token = _token
                     _set_session_cookie(_token)  # survives a browser refresh, but not copy-paste into another browser
@@ -705,6 +703,7 @@ if not st.session_state.authenticated:
         st.session_state.username = _resolved_user
         st.session_state.role = auth.get_role(_resolved_user)
         st.session_state.workspace_id = auth.get_workspace_id(_resolved_user)
+        st.session_state.plan = auth.get_plan(_resolved_user)
         st.session_state._session_token = _session_token
 
 if not st.session_state.authenticated:
@@ -776,14 +775,29 @@ def load_file(uploaded_file):
 
 
 def _apply_loaded_df(df, source_name):
+    df, cap_note = _enforce_row_cap(df)
     st.session_state.df_raw = df
     st.session_state.meta = de.profile_columns(df)
-    st.session_state.data_source_name = source_name
+    st.session_state.data_source_name = source_name + (f" {cap_note}" if cap_note else "")
     st.session_state.filters = {}
     st.session_state.dashboard_charts = []
     st.session_state.pinned_kpis = []
     st.session_state.dashboard_slicers = []
     st.session_state.data_source_is_db = False   # a fresh file/sample load — any previous DB link no longer applies
+    if cap_note:
+        st.warning(f"🆓 Free plan is capped at {ul.FREE_PLAN_LIMITS['max_rows']:,} rows — "
+                   f"loaded the first {ul.FREE_PLAN_LIMITS['max_rows']:,} rows of this file. "
+                   f"Ask your admin to upgrade your plan for full data.")
+
+
+def _enforce_row_cap(df):
+    """Truncates df to the free-plan row cap, if this account is on 'free'.
+    Returns (possibly-truncated df, short note-or-None to append to the
+    displayed source name so it's obvious the data was capped)."""
+    cap = ul.row_limit_for_plan(st.session_state.get("plan", "standard"))
+    if cap is not None and len(df) > cap:
+        return df.head(cap).copy(), f"(capped to {cap:,} rows — free plan)"
+    return df, None
 
 
 def _refresh_loaded_df(df, source_name):
@@ -793,9 +807,10 @@ def _refresh_loaded_df(df, source_name):
     (a refresh should feel like 'this table just got new rows', not 'start
     the dashboard over from scratch'). Used by the manual Refresh button and
     by auto-sync."""
+    df, cap_note = _enforce_row_cap(df)
     st.session_state.df_raw = df
     st.session_state.meta = de.profile_columns(df)
-    st.session_state.data_source_name = source_name
+    st.session_state.data_source_name = source_name + (f" {cap_note}" if cap_note else "")
     st.session_state.db_last_refreshed_at = time.time()
 
 
@@ -851,17 +866,23 @@ def load_files(uploaded_files, combine_mode="stack"):
     return combined
 
 
-def load_sample():
-    if not os.path.exists(SAMPLE_PATH):
+def load_sample(filename: str = "sample_sports_payments.csv"):
+    """Loads one of the built-in demo datasets (see SAMPLE_DATASETS above) so a
+    brand-new user can see the whole tool working in one click, before trusting
+    it with their own data. Offering more than one industry's worth of sample
+    data (not just sports) makes the "this works on ANY data" claim obvious
+    immediately, instead of the user having to take our word for it."""
+    sample_path = os.path.join(APP_DIR, "sample_data", filename)
+    if not os.path.exists(sample_path):
         st.error("Sample file not found.")
         return
-    with open(SAMPLE_PATH, "rb") as f:
+    with open(sample_path, "rb") as f:
         data = _read_upload(f)
-    sheets = _load_and_clean(data, "sample_sports_payments.csv")
+    sheets = _load_and_clean(data, filename)
     df = sheets["Sheet1"]
     st.session_state.df_raw = df
     st.session_state.meta = de.profile_columns(df)
-    st.session_state.data_source_name = "sample_sports_payments.csv (demo data)"
+    st.session_state.data_source_name = f"{filename} (demo data)"
     st.session_state.filters = {}
     st.session_state.dashboard_charts = []
     st.session_state.pinned_kpis = []
@@ -1368,12 +1389,7 @@ with st.sidebar:
     if st.session_state.df_raw is not None and ppt.detect_title_column(st.session_state.df_raw, st.session_state.meta):
         nav_options.insert(4, "💡 Business Insights")  # right after Boss Dashboard
     if st.session_state.role == auth.ROLE_REPORT_VIEWER:
-        # A viewer's job is to read the finished picture, not build it - so Connect
-        # Data / Raw Analysis / Custom Builder / Data Table / Settings stay hidden.
-        # But the three "here's what's going on" pages (and the chatbot to ask
-        # follow-ups about them) ARE useful to a viewer, so those stay visible.
-        _viewer_allowed = {"⭐ Boss Dashboard", "💡 Business Insights", "📈 Full Analysis", "🤖 AI Assistant"}
-        nav_options = [p for p in nav_options if p in _viewer_allowed]
+        nav_options = ["⭐ Boss Dashboard"]   # nothing else exists for this account, not even Settings
     if st.session_state.role == auth.ROLE_ADMIN:
         nav_options.append("🔐 Admin Panel")
     page = st.radio("Navigate", nav_options, label_visibility="collapsed")
@@ -1508,11 +1524,12 @@ if page == "📥 Connect Data":
                                 st.session_state._last_upload_sig = sig
                                 st.rerun()
             with sample_col:
-                st.write("")
-                st.write("")
+                sample_choice = st.selectbox("Try with sample data", list(SAMPLE_DATASETS.keys()),
+                                              key="sample_dataset_choice", label_visibility="collapsed")
                 if st.button("🎯 Load Sample Data", use_container_width=True):
-                    load_sample()
+                    load_sample(SAMPLE_DATASETS[sample_choice])
                     st.rerun()
+                st.caption("3 industries available — proves this works on any data, not just one kind.")
 
         # ---------------- DATABASE CONNECT ----------------
         with src_tab_db:
@@ -1936,10 +1953,21 @@ elif page == "⭐ Boss Dashboard":
 
         st.divider()
         st.subheader("📄 Export")
+        _pdf_remaining = ul.remaining(st.session_state.workspace_id, st.session_state.plan, "pdf_exports")
+        if _pdf_remaining is not None:
+            st.caption(f"🆓 Free plan: {_pdf_remaining} PDF export(s) left today.")
         report_title = st.text_input("Report title", st.session_state.dashboard_name or "Sports Performance & Payments Report")
         subtitle = st.text_input("Subtitle", f"Prepared for management review — {pd.Timestamp.today().date()}")
+        filters_summary = ", ".join(
+            [f"{k.replace('p2_','')}: {v}" for k, v in st.session_state.filters.items()
+             if k.startswith("p2_") and v not in (None, [], ())]
+        ) or "None"
 
         if st.button("⬇️ Generate & Download PDF", type="primary"):
+            pdf_ok, pdf_limit_msg = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "pdf_exports")
+            if not pdf_ok:
+                st.error(f"🚫 {pdf_limit_msg}")
+                st.stop()
             render_errors = []
             with st.spinner(f"Rendering {len(chart_png_items)} chart(s) to images for the PDF... "
                              f"(this is the only step that needs to be slow)"):
@@ -1980,6 +2008,7 @@ elif page == "⭐ Boss Dashboard":
                     kpis=pdf_kpis,
                     chart_items=[c for c in chart_png_items if c["png_bytes"]],
                     theme=pdf_theme,
+                    filters_summary=filters_summary,
                 )
             st.download_button("📥 Click to download report.pdf", data=pdf_bytes,
                                 file_name="sports_analytics_report.pdf", mime="application/pdf",
@@ -2409,26 +2438,25 @@ elif page == "📈 Full Analysis":
                     (st.success if ok else st.error)(msg)
 
         st.divider()
-        st.subheader("🧬 Segment & Behaviour Breakdown")
-        st.caption("Ye numbers upar kahin nahi dikhaye gaye the — customer repeat behaviour aur extra "
-                   "category fields (jaise status, tier, group) ka apna analysis.")
-        rpt = facts.get("repeat", {})
-        extra = facts.get("extra_breakdowns", [])
-        if not rpt.get("available") and not extra:
-            st.caption("Is dataset mein customer column ya extra low-cardinality category column nahi mila "
-                       "isliye yahan dikhane ke liye kuch nahi hai.")
-        if rpt.get("available"):
-            rc1, rc2, rc3 = st.columns(3)
-            rc1.metric("Unique Customers", f"{rpt['unique_customers']:,}")
-            rc2.metric("Repeat Customers (2+ orders)", f"{rpt['repeat_customers']:,}")
-            rc3.metric("Repeat Rate", f"{rpt['repeat_rate_pct']}%")
-        if extra:
-            ecols = st.columns(min(3, len(extra)))
-            for i, b in enumerate(extra):
-                with ecols[i % len(ecols)]:
-                    st.markdown(f"**{b['label']}**")
-                    st.dataframe(pd.DataFrame(b["counts"]).rename(columns={"name": "Value", "count": "Count"}),
-                                 use_container_width=True, hide_index=True)
+        st.subheader("✅ Action Tracker")
+        st.caption("Top Actions ko yahan add karke tick karte jao — persist rahega.")
+        new_action = st.text_input("+ Add an action item", key="intel_new_action")
+        if st.button("Add", key="intel_add_action") and new_action.strip() and can_edit():
+            st.session_state.intel_action_checks.append({"text": new_action.strip(), "done": False})
+            ws.save_light(st.session_state, st.session_state.workspace_id)
+            st.rerun()
+        for i, item in enumerate(list(st.session_state.intel_action_checks)):
+            ac1, ac2 = st.columns([9, 1])
+            with ac1:
+                checked = st.checkbox(item["text"], value=item["done"], key=f"intel_action_{i}", disabled=not can_edit())
+                if checked != item["done"]:
+                    st.session_state.intel_action_checks[i]["done"] = checked
+                    ws.save_light(st.session_state, st.session_state.workspace_id)
+            with ac2:
+                if can_edit() and st.button("🗑️", key=f"intel_action_del_{i}"):
+                    st.session_state.intel_action_checks.pop(i)
+                    ws.save_light(st.session_state, st.session_state.workspace_id)
+                    st.rerun()
 
         # ---- Optional AI write-up — deeper narrative, NOT the primary content anymore ----
         st.divider()
@@ -2443,6 +2471,10 @@ elif page == "📈 Full Analysis":
             else:
                 gen_clicked = st.button("✨ Generate / Refresh AI write-up", type="primary", key="intel_gen_report")
                 if gen_clicked or (st.session_state._intel_narrative is None and False):
+                    ai_ok, ai_limit_msg = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "ai_calls")
+                    if not ai_ok:
+                        st.error(f"🚫 {ai_limit_msg}")
+                        st.stop()
                     with st.spinner("AI report likh raha hai..."):
                         facts_text = ie.facts_to_prompt_text(facts)
                         result = ac.generate_report_narrative(facts_text, api_key, st.session_state.intel_language)
@@ -2450,15 +2482,43 @@ elif page == "📈 Full Analysis":
                         st.error(result["error"])
                     else:
                         st.session_state._intel_narrative = result["report"]
+                _ai_remaining = ul.remaining(st.session_state.workspace_id, st.session_state.plan, "ai_calls")
+                if _ai_remaining is not None:
+                    st.caption(f"🆓 Free plan: {_ai_remaining} AI request(s) left today (shared across AI Assistant + this write-up).")
 
                 if st.session_state._intel_narrative:
                     st.markdown(st.session_state._intel_narrative)
                     st.download_button("⬇️ Download AI write-up (.md)", data=st.session_state._intel_narrative,
                                         file_name="ai_writeup.md", mime="text/markdown", key="intel_ai_dl")
 
+        if api_key:
+            st.divider()
+            st.subheader("💬 Follow-up Questions")
+            st.caption("Is report ke baare mein kuch aur poochna hai? Answers real SQL se grounded hote hain.")
+            for turn in st.session_state.intel_qa_history:
+                with st.chat_message(turn["role"]):
+                    st.markdown(turn["content"])
+            qa_question = st.chat_input("e.g. \"Which month had the highest revenue?\"", key="intel_qa_input")
+            if qa_question:
+                st.session_state.intel_qa_history.append({"role": "user", "content": qa_question})
+                with st.chat_message("user"):
+                    st.markdown(qa_question)
+                with st.chat_message("assistant"):
+                    ai_ok, ai_limit_msg = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "ai_calls")
+                    if not ai_ok:
+                        st.error(f"🚫 {ai_limit_msg}")
+                        st.stop()
+                    with st.spinner("Sochte hain..."):
+                        kpis_for_qa = de.compute_kpis(df, meta)
+                        qa_result = ac.ask(qa_question, df, meta, kpis_for_qa, st.session_state.dashboard_charts,
+                                           api_key, history=st.session_state.intel_qa_history[:-1])
+                    if qa_result["error"]:
+                        st.error(qa_result["error"])
+                    else:
+                        st.markdown(qa_result["answer"])
+                        st.session_state.intel_qa_history.append({"role": "assistant", "content": qa_result["answer"]})
+
         st.divider()
-        st.caption("Is analysis ke baare mein kuch aur poochna hai? **🤖 AI Assistant** page par jaake "
-                   "seedha sawaal pooch sakte ho — wahaan pura chat history bhi milega.")
         if st.button("⬅️ Back to Page 1", key="intel_back_part1"):
             st.session_state.intel_part = 1
             st.rerun()
@@ -2755,6 +2815,9 @@ elif page == "🤖 AI Assistant":
         st.stop()
 
     kpis = de.compute_kpis(df_raw, meta)
+    _ai_remaining_top = ul.remaining(st.session_state.workspace_id, st.session_state.plan, "ai_calls")
+    if _ai_remaining_top is not None:
+        st.caption(f"🆓 Free plan: {_ai_remaining_top} AI request(s) left today.")
 
     for turn in st.session_state.ai_chat_history:
         with st.chat_message(turn["role"]):
@@ -2770,6 +2833,10 @@ elif page == "🤖 AI Assistant":
         with st.chat_message("user"):
             st.markdown(question)
         with st.chat_message("assistant"):
+            ai_ok, ai_limit_msg = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "ai_calls")
+            if not ai_ok:
+                st.error(f"🚫 {ai_limit_msg}")
+                st.stop()
             with st.spinner("Analysing your data..."):
                 result = ac.ask(question, df_raw, meta, kpis, st.session_state.dashboard_charts,
                                  api_key, history=st.session_state.ai_chat_history[:-1])
@@ -3235,41 +3302,9 @@ report, without you writing a single formula.
   wallpaper image for the exported PDF.
 - Any chart can be **swapped** for another variant of the same family without
   going back to Page 1.
-- **🔍 Zoom**: every chart has a zoom slider above it — drag either handle to
-  zoom into a crowded stretch of data labels. Whatever zoom is showing on
-  screen is exactly what shows up in the **Download PDF** export too, so
-  what your boss sees on paper always matches what you were looking at.
 - **Download PDF**: produces a clean, print-ready report with only the finished
   KPIs, charts and insights — no buttons, no settings panels, nothing that would
   look unprofessional in front of your boss.
-
-**💡 Business Insights** *(only shown when the loaded dataset has a matching
-column — e.g. a "Payment Page Title" style field; hidden entirely for datasets
-where it wouldn't apply)*
-- A ready-made, plain-language breakdown built specifically for payment-link /
-  booking-style data: revenue and bookings per page/title, which ones are
-  winning or fading, and a short written summary — no setup required.
-
-**📈 Full Analysis**
-- The deep-dive report, split into two pages you flip between at the top:
-  - **Page 1**: data understanding & cleaning notes, the full KPI scorecard,
-    revenue trend & forecast, anomalies, correlations, and every top/bottom
-    breakdown (product, customer, location, channel) — all calculated
-    directly from the data with plain code, never guessed.
-  - **Page 2**: past performance and future outlook in plain sentences, AI-written
-    Key Insights + Recommended Actions grounded ONLY in the numbers from Page 1,
-    an optional longer AI write-up, a repeat-customer and extra-category
-    breakdown (payment status, skill/tier group, age bands, etc. — whatever
-    your data has), and a snapshot/email/download option so you can track this
-    report over time.
-- A "🎚️ Manage Slicers" control lets you pick any field and instantly re-run
-  every number and every AI section for just that slice.
-
-**🤖 AI Assistant**
-- A chat box grounded in your actual data — every answer is generated by first
-  running a real SQL-style query against your dataset, never guessed from
-  memory. Good for one-off questions ("which month had the highest revenue?")
-  that don't need a full dashboard or report.
 
 **🗂 Data Table (Page 4)**
 - SQL-style access to the raw data: pick which columns to `SELECT`, add a filter
@@ -3278,9 +3313,7 @@ where it wouldn't apply)*
 
 **⚙️ Settings**
 - Reset the default look of the Boss Dashboard, change your own password, and
-  (for client accounts) create Report Viewer logins for your own team. A Report
-  Viewer login can see Boss Dashboard, Business Insights, Full Analysis and the
-  AI Assistant — full control on Boss Dashboard, read-only everywhere else.
+  (for client accounts) create Report Viewer logins for your own team.
 
 **Performance note:** column detection, KPI math and chart aggregation are all
 done with vectorized pandas/NumPy operations, so the same tool comfortably
@@ -3307,8 +3340,8 @@ elif page == "🔐 Admin Panel":
     with tab_users:
         st.subheader("Existing accounts")
         users = auth.list_users()
-        st.table([{"Username": u["username"], "Role": u["role"], "Data workspace": u["workspace_id"],
-                    "Email": u["email"] or "—"} for u in users])
+        st.table([{"Username": u["username"], "Role": u["role"], "Plan": u.get("plan", "standard"),
+                   "Data workspace": u["workspace_id"], "Email": u["email"] or "—"} for u in users])
 
         st.divider()
         st.subheader("Create a new account")
@@ -3330,6 +3363,12 @@ elif page == "🔐 Admin Panel":
             np2 = st.text_input("Confirm password", type="password")
             nu_email = st.text_input("Email (optional, but needed for this account's 'Forgot password' to work)")
             role_choice = st.radio("Role", ["Client", "Viewer", "Report Viewer", "Admin"], horizontal=True)
+            plan_choice = st.radio(
+                "Plan", ["Standard (unlimited)", "Free (capped — for trials/demos)"], horizontal=True,
+                help=f"Free plan caps: {ul.FREE_PLAN_LIMITS['ai_calls']} AI requests/day, "
+                     f"{ul.FREE_PLAN_LIMITS['pdf_exports']} PDF exports/day, "
+                     f"{ul.FREE_PLAN_LIMITS['max_rows']:,} row max on loaded data. Resets daily at UTC midnight.",
+            )
 
             client_options = auth.list_client_usernames()
             link_choice = None
@@ -3350,11 +3389,13 @@ elif page == "🔐 Admin Panel":
                     role_map = {"Client": auth.ROLE_CLIENT, "Viewer": auth.ROLE_VIEWER,
                                 "Report Viewer": auth.ROLE_REPORT_VIEWER, "Admin": auth.ROLE_ADMIN}
                     role = role_map[role_choice]
+                    plan = "free" if plan_choice.startswith("Free") else "standard"
                     workspace_id = None  # defaults to the account's own username
                     if role in (auth.ROLE_VIEWER, auth.ROLE_REPORT_VIEWER) and link_choice and link_choice.startswith("Share data with client: "):
                         workspace_id = link_choice.replace("Share data with client: ", "")
-                    auth.create_or_update_user(nu.strip(), np1, role, workspace_id=workspace_id, email=nu_email.strip())
-                    st.success(f"Account '{nu.strip()}' saved as {role_choice}"
+                    auth.create_or_update_user(nu.strip(), np1, role, workspace_id=workspace_id,
+                                               email=nu_email.strip(), plan=plan)
+                    st.success(f"Account '{nu.strip()}' saved as {role_choice} ({plan_choice})"
                                + (f", sharing data with '{workspace_id}'." if workspace_id else ", with its own data workspace."))
                     st.rerun()
 
