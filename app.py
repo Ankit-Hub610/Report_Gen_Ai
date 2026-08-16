@@ -572,7 +572,7 @@ def login_screen():
         with _lc2:
             _img_html = _logo_img_html(_logo, _logo_mime, brand.get("logo_width", 220))
             _render_glow_target("brand_glow_logo", "logo", brand, _img_html)
-    st.markdown("<h1 style='text-align:center;'>Research | Analysis | Intteligance </h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align:center;'>Research | Analysis | Intellegance </h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
@@ -710,6 +710,16 @@ if not st.session_state.authenticated:
 if not st.session_state.authenticated:
     login_screen()
     st.stop()
+
+# Always recompute the CURRENT plan/subscription status from disk on every
+# rerun (credentials.json is tiny - this is a cheap read), instead of only
+# trusting whatever was cached in session_state at login/cookie-restore
+# time. This is what makes an admin's approval (or a subscription's natural
+# expiry) show up the moment the client next clicks/navigates ANYTHING -
+# no more needing to log out and log back in just to see it. The 💎 Plans
+# page below additionally has its own short auto-refresh timer, for the
+# case where someone is just sitting there staring at the page waiting.
+st.session_state.plan = auth.get_effective_plan(st.session_state.username)
 
 
 def render_plan_comparison():
@@ -3504,6 +3514,13 @@ every page to narrow down what's rendered on screen.
 
 elif page == "💎 Plans":
     st.title("💎 Plans")
+    if st.session_state.role != auth.ROLE_ADMIN:
+        # Same reasoning as the admin's own 15s "Live" pending-requests
+        # refresh: someone sitting on THIS page waiting for their upgrade
+        # to be approved shouldn't have to click anything (or log back in)
+        # to see it land - just re-check every 20s while they're here.
+        if AUTOREFRESH_AVAILABLE:
+            st_autorefresh(interval=20 * 1000, key="plans_page_autorefresh")
     if st.session_state.plan == "free" and st.session_state.role != auth.ROLE_ADMIN:
         _trial_pp = auth.get_trial_status(st.session_state.username)
         if _trial_pp["days_left"] is not None:
@@ -3770,6 +3787,8 @@ elif page == "🔐 Admin Panel":
                         st.caption(f"Submitted: {datetime.datetime.fromtimestamp(r['submitted_at']).strftime('%d %b %Y %H:%M')}")
                     with rc2:
                         st.code(r["utr"], language=None)
+                        if r.get("format_flag"):
+                            st.caption(f"⚠️ {r['format_flag']}")
                     with rc3:
                         if st.button("✅ Approve", key=f"pay_approve_{r['id']}", use_container_width=True):
                             ok_dec, msg_dec, uname_dec, plan_type_dec = pay.decide_request(r["id"], True)
