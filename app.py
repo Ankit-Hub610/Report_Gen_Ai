@@ -42,6 +42,7 @@ from modules import ai_chat as ac
 from modules import email_service as es
 from modules import intel_engine as ie
 from modules import ppt_engine as ppt
+from modules import voice_engine as ve
 from modules import usage_limits as ul
 from modules import payments as pay
 
@@ -50,6 +51,12 @@ try:
     AUTOREFRESH_AVAILABLE = True
 except ImportError:
     AUTOREFRESH_AVAILABLE = False
+
+try:
+    from streamlit_mic_recorder import speech_to_text
+    MIC_AVAILABLE = True
+except ImportError:
+    MIC_AVAILABLE = False
 
 # ==================================================================================
 # PAGE CONFIG
@@ -175,6 +182,8 @@ def init_state():
     # 📈 Full Analysis page
     ss.setdefault("intel_role_overrides", {})   # user-confirmed column-role mapping (persisted)
     ss.setdefault("intel_language", "English")  # persisted — last-picked narrative language
+    ss.setdefault("assistant_name", None)   # None = show "री" (see voice_engine.get_assistant_name)
+    ss.setdefault("voice_language", "English")  # persisted — last-picked voice assistant language
     ss.setdefault("intel_action_checks", [])    # persisted — [{text, done}] Top-Actions tracker
     ss.setdefault("intel_part", 1)              # session-only — which half of the report is showing (1 or 2)
     ss.setdefault("_intel_cache_key", None)     # session-only — fingerprint of last-computed facts
@@ -1066,6 +1075,85 @@ def load_sample(filename: str = "sample_sports_payments.csv"):
     st.session_state.dashboard_charts = []
     st.session_state.pinned_kpis = []
     st.session_state.dashboard_slicers = []
+
+
+def render_voice_assistant(page_key: str, walkthrough_segments: list,
+                            df=None, meta=None, kpis=None, dashboard_charts=None):
+    """The 🎤 voice assistant block — used on Full Analysis, Business
+    Insights, and Boss Dashboard. Same three pieces everywhere (see
+    modules/voice_engine.py docstring for the full reasoning):
+      1. Push-to-talk mic button -> browser speech-to-text (free, no key)
+      2. Question answered by the SAME engine as the 🤖 AI Assistant page
+         (real SQL against the real data, not a guess)
+      3. Answer spoken aloud via the browser's own text-to-speech (free, no key)
+    Plus a Guided Walkthrough that steps through `walkthrough_segments`
+    (built from data already computed on the calling page - never invented
+    here) with Play/Next/Previous, each step spoken aloud too.
+    """
+    assistant_name = ve.get_assistant_name(st.session_state.plan, st.session_state.get("assistant_name"))
+    lang_label = st.session_state.get("voice_language", "English")
+
+    with st.expander(f"🎤 {assistant_name} — poochiye ya guided walkthrough suniye", expanded=False):
+        if not MIC_AVAILABLE:
+            st.caption("⚠️ Voice needs the `streamlit-mic-recorder` package — not installed here yet.")
+            return
+
+        vc1, vc2 = st.columns([1, 3])
+        with vc1:
+            st.session_state.voice_language = st.selectbox(
+                "Language", list(ve.LANG_CODES.keys()),
+                index=list(ve.LANG_CODES.keys()).index(lang_label),
+                key=f"{page_key}_voice_lang")
+        lang_code = ve.LANG_CODES[st.session_state.voice_language]
+
+        # ---- Guided walkthrough ----
+        st.markdown("**▶️ Guided Walkthrough**")
+        wk_key = f"{page_key}_wk_step"
+        st.session_state.setdefault(wk_key, 0)
+        step = st.session_state[wk_key]
+        if walkthrough_segments:
+            step = max(0, min(step, len(walkthrough_segments) - 1))
+            seg = walkthrough_segments[step]
+            st.info(f"**{seg['title']}** ({step + 1}/{len(walkthrough_segments)})\n\n{seg['text']}")
+            wb1, wb2, wb3 = st.columns(3)
+            with wb1:
+                if st.button("🔊 Sunaiye is step ko", key=f"{page_key}_wk_play"):
+                    st.components.v1.html(ve.tts_html(seg["text"], lang_code), height=0)
+            with wb2:
+                if st.button("⬅️ Pichla", key=f"{page_key}_wk_prev", disabled=step == 0):
+                    st.session_state[wk_key] = step - 1
+                    st.rerun()
+            with wb3:
+                if st.button("➡️ Agla", key=f"{page_key}_wk_next", disabled=step >= len(walkthrough_segments) - 1):
+                    st.session_state[wk_key] = step + 1
+                    st.rerun()
+        else:
+            st.caption("Is page ke liye abhi walkthrough banane layak kuch nahi hai.")
+
+        st.divider()
+
+        # ---- Push-to-talk Q&A ----
+        st.markdown(f"**🎤 {assistant_name} se poochiye**")
+        api_key = ac.get_api_key() or st.session_state.ai_groq_key
+        if not api_key:
+            st.caption("⚠️ Ye 🤖 AI Assistant page jaisi hi API key use karta hai — pehle wahan se ek free "
+                       "OpenRouter key set karein (Admin Panel), tab yahan bhi kaam karega.")
+            return
+        transcript = speech_to_text(language=lang_code, start_prompt=f"🎤 Bolo, {assistant_name}",
+                                     stop_prompt="⏹️ Ruko", just_once=True, use_container_width=True,
+                                     key=f"{page_key}_stt")
+        if transcript:
+            st.caption(f"Aapne poocha: *{transcript}*")
+            if df is not None:
+                with st.spinner(f"{assistant_name} soch rahi hai..."):
+                    result = ac.ask(transcript, df, meta or {}, kpis or [], dashboard_charts or [], api_key)
+                if result.get("error"):
+                    st.error(result["error"])
+                elif result.get("answer"):
+                    st.success(result["answer"])
+                    st.components.v1.html(ve.tts_html(result["answer"], lang_code), height=0)
+            else:
+                st.warning("Data load nahi hai abhi, is sawaal ka jawab nahi de sakte.")
 
 
 def render_filters(df, meta, key_prefix=""):
@@ -2061,9 +2149,16 @@ elif page == "⭐ Boss Dashboard":
 
     st.divider()
 
+    pinned_custom_charts = [c for c in st.session_state.custom_charts if c.get("pinned")]
+    _pinned_kpi_lines = [f"{k['label']}: {k.get('value_display', k.get('value'))}" for k in pinned]
+    _n_charts = len(st.session_state.dashboard_charts) + len(pinned_custom_charts)
+    render_voice_assistant("boss", ve.walkthrough_boss_dashboard(_pinned_kpi_lines, _n_charts),
+                            df=df, meta=meta, kpis=all_kpis, dashboard_charts=st.session_state.dashboard_charts)
+
+    st.divider()
+
     # ---- Selected charts ----
     st.subheader("Selected Charts")
-    pinned_custom_charts = [c for c in st.session_state.custom_charts if c.get("pinned")]
     chart_png_items = []
 
     if not st.session_state.dashboard_charts and not pinned_custom_charts:
@@ -2283,6 +2378,19 @@ elif page == "💡 Business Insights":
         st.warning(f"⚠️ {n_unparsed:,} row(s) ka title format samajh nahi aaya (Sport/Code/Day pattern match nahi hua) "
                     "— unhe **DATA REVIEW REQUIRED** maana gaya hai, guess nahi kiya gaya.")
 
+    def _top_row(table, name_col):
+        if table is None or table.empty:
+            return None
+        r = table.iloc[0]
+        return {"name": r[name_col], "revenue": r.get("Captured Revenue", 0)}
+
+    decisions = ppt.management_decisions(sport_t, code_t, day_t, page_t)
+    _wk_bi = ve.walkthrough_business_insights(
+        _top_row(sport_t, "Sport"), _top_row(code_t, "Code / Location"), _top_row(day_t, "Day"),
+        hs, len(decisions))
+    render_voice_assistant("bi", _wk_bi, df=df, meta=meta, kpis=de.compute_kpis(df, meta),
+                            dashboard_charts=st.session_state.dashboard_charts)
+
     st.divider()
     st.subheader("🏆 Sport Analysis")
     st.dataframe(sport_t, use_container_width=True, hide_index=True)
@@ -2311,7 +2419,6 @@ elif page == "💡 Business Insights":
     st.subheader("🧭 Management Decisions")
     st.caption("Evidence-based hi — koi bhi decision revenue ke alawa capacity/cost/profit data maangta hai "
                "to wo explicitly 'DATA REQUIRED' bolega, guess nahi karega.")
-    decisions = ppt.management_decisions(sport_t, code_t, day_t, page_t)
     if not decisions:
         st.info("Abhi koi strong 🟢/🟡/🔴 signal nahi mila — data thoda aur accumulate hone dein.")
     else:
@@ -2418,6 +2525,19 @@ elif page == "📈 Full Analysis":
                      horizontal=True, index=st.session_state.intel_part - 1, key="intel_part_radio",
                      label_visibility="collapsed")
     st.session_state.intel_part = 1 if part.startswith("📋 Page 1") else 2
+
+    _missing_roles = [role_labels[k] for k in ("revenue", "date", "customer") if not roles.get(k)]
+    _f = facts["financials"]
+    _kpi_lines = []
+    if _f.get("total_revenue") is not None:
+        _kpi_lines.append(f"Total revenue {de._fmt_num(_f['total_revenue'])}")
+    if _f.get("total_orders"):
+        _kpi_lines.append(f"{_f['total_orders']:,} total orders")
+    if _f.get("customer_count"):
+        _kpi_lines.append(f"{_f['customer_count']:,} customers")
+    _wk = ve.walkthrough_full_analysis(_missing_roles, _kpi_lines, st.session_state._intel_narrative)
+    render_voice_assistant("intel", _wk, df=df, meta=meta, kpis=de.compute_kpis(df, meta),
+                            dashboard_charts=st.session_state.dashboard_charts)
     st.divider()
 
     # ==========================================================================
@@ -3257,6 +3377,23 @@ elif page == "⚙️ Settings":
                             st.error(str(e))
 
     with tab_defaults:
+        if st.session_state.role in (auth.ROLE_CLIENT, auth.ROLE_ADMIN):
+            st.subheader("🎤 Voice Assistant Name")
+            if st.session_state.plan == "standard" or st.session_state.role == auth.ROLE_ADMIN:
+                st.caption("This is the name shown/spoken on the 🎤 voice assistant "
+                           "(Full Analysis, Business Insights, Boss Dashboard). Leave blank for the default, 'री'.")
+                _new_assistant_name = st.text_input("Assistant name", value=st.session_state.assistant_name or "",
+                                                     placeholder="री", key="assistant_name_input")
+                if st.button("💾 Save assistant name", key="save_assistant_name"):
+                    st.session_state.assistant_name = _new_assistant_name.strip() or None
+                    ws.save_light(st.session_state, st.session_state.workspace_id)
+                    st.success(f"Saved — assistant will now be called "
+                               f"'{ve.get_assistant_name('standard', st.session_state.assistant_name)}'.")
+            else:
+                st.caption(f"On the Free plan, the voice assistant is always called "
+                           f"**'{ve.DEFAULT_ASSISTANT_NAME}'**. Custom naming is a 💎 Standard-plan perk.")
+            st.divider()
+
         if st.session_state.role == auth.ROLE_ADMIN:
             st.subheader("App Branding")
             st.caption("The title shown at the top of the sidebar for **every account** on this app "
@@ -3536,6 +3673,21 @@ report, without you writing a single formula.
 - Chat history is saved per workspace and auto-deleted after 5 days.
 - Free-plan accounts get a limited number of AI requests per day (see 💎 Plans);
   Standard is unlimited.
+
+**🎤 Voice Assistant (new)**
+- Appears as a "🎤 <name>" section on Full Analysis, Business Insights, and
+  Boss Dashboard. Default name is **"री"** — Standard-plan clients can rename
+  it in Settings.
+- **🎤 Push-to-talk Q&A**: tap the mic, ask a question out loud, the answer
+  comes back both written and spoken — same SQL-grounded engine as 🤖 AI
+  Assistant, just by voice.
+- **▶️ Guided Walkthrough**: steps through that page's key numbers out loud,
+  one point at a time (Play / Next / Previous) — built entirely from data
+  already on the page, nothing invented.
+- Supports **English, Hindi, and Gujarati**. English and Hindi recognize/speak
+  reliably in most browsers; Gujarati support depends on the browser/device
+  and may be less consistent — that's a browser/OS limitation, not something
+  this app controls.
 
 **⚙️ Settings**
 - Reset the default look of the Boss Dashboard, change your own password, and
