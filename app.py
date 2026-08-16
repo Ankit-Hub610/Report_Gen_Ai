@@ -1092,6 +1092,12 @@ def render_voice_assistant(page_key: str, walkthrough_segments: list,
     """
     assistant_name = ve.get_assistant_name(st.session_state.plan, st.session_state.get("assistant_name"))
     lang_label = st.session_state.get("voice_language", "English")
+    if lang_label not in ve.LANG_CODES:
+        # Guards against a stale value left over from an older deploy (e.g. a
+        # language option that used to exist and no longer does) crashing the
+        # whole page with a ValueError on .index() below.
+        lang_label = "English"
+        st.session_state.voice_language = lang_label
 
     with st.expander(f"🎤 {assistant_name} — poochiye ya guided walkthrough suniye", expanded=False):
         if not MIC_AVAILABLE:
@@ -3125,6 +3131,9 @@ elif page == "🤖 AI Assistant":
     _ai_remaining_top = ul.remaining(st.session_state.workspace_id, st.session_state.plan, "ai_calls")
     if _ai_remaining_top is not None:
         st.caption(f"🆓 Free plan: {_ai_remaining_top} AI request(s) left today.")
+
+    render_voice_assistant("ai_page", [], df=df_raw, meta=meta, kpis=kpis,
+                           dashboard_charts=st.session_state.dashboard_charts)
 
     for turn in st.session_state.ai_chat_history:
         with st.chat_message(turn["role"]):
