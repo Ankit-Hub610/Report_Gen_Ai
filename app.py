@@ -1082,7 +1082,7 @@ def render_voice_assistant(page_key: str, walkthrough_segments: list,
     """The 🎤 voice assistant — one simple thing: ask anything out loud (or by
     typing), about your data or anything else, and get an answer back
     (spoken aloud too). No walkthrough, no extra modes — just ask.
-      1. Push-to-talk mic button -> browser speech-to-text (free, no key)
+      1. Mic icon -> browser speech-to-text (free, no key)
       2. Question answered by the SAME engine as the 🤖 AI Assistant page —
          grounded in real SQL when it's about your data, free conversation
          otherwise (see ai_chat.py's system prompt)
@@ -1100,67 +1100,65 @@ def render_voice_assistant(page_key: str, walkthrough_segments: list,
         lang_label = "English"
         st.session_state.voice_language = lang_label
 
-    with st.expander(f"🎤 {assistant_name} se poochiye — data ke baare mein ya kuch bhi", expanded=False):
-        if not MIC_AVAILABLE:
-            st.caption("⚠️ Voice needs the `streamlit-mic-recorder` package — not installed here yet.")
-            return
+    st.markdown(f"##### 🎤 {assistant_name}")
+    if not MIC_AVAILABLE:
+        st.caption("⚠️ Voice needs the `streamlit-mic-recorder` package — not installed here yet.")
+        return
 
-        vc1, vc2 = st.columns([1, 3])
-        with vc1:
-            st.session_state.voice_language = st.selectbox(
-                "Language", list(ve.LANG_CODES.keys()),
-                index=list(ve.LANG_CODES.keys()).index(lang_label),
-                key=f"{page_key}_voice_lang", label_visibility="collapsed")
-        lang_code = ve.LANG_CODES[st.session_state.voice_language]
+    api_key = ac.get_api_key() or st.session_state.ai_groq_key
+    if not api_key:
+        st.caption("⚠️ Ye 🤖 AI Assistant page jaisi hi API key use karta hai — pehle wahan se ek free "
+                   "OpenRouter key set karein (Admin Panel), tab yahan bhi kaam karega.")
+        return
 
-        api_key = ac.get_api_key() or st.session_state.ai_groq_key
-        if not api_key:
-            st.caption("⚠️ Ye 🤖 AI Assistant page jaisi hi API key use karta hai — pehle wahan se ek free "
-                       "OpenRouter key set karein (Admin Panel), tab yahan bhi kaam karega.")
-            return
+    draft_key = f"{page_key}_voice_draft"
+    last_heard_key = f"{page_key}_voice_last_heard"
+    st.session_state.setdefault(draft_key, "")
 
-        draft_key = f"{page_key}_voice_draft"
-        last_heard_key = f"{page_key}_voice_last_heard"
-        st.session_state.setdefault(draft_key, "")
+    # One tight row: [language] [text input] [mic icon] [send icon] [clear icon] —
+    # everything you need to ask a question, no stacked full-width buttons.
+    lang_col, input_col, mic_col, send_col, clear_col = st.columns([1.3, 6, 0.6, 0.6, 0.6])
+    with lang_col:
+        st.session_state.voice_language = st.selectbox(
+            "Language", list(ve.LANG_CODES.keys()), index=list(ve.LANG_CODES.keys()).index(lang_label),
+            key=f"{page_key}_voice_lang", label_visibility="collapsed")
+    lang_code = ve.LANG_CODES[st.session_state.voice_language]
 
-        raw_transcript = speech_to_text(language=lang_code, start_prompt=f"🎤 Bolo, {assistant_name}",
-                                        stop_prompt="⏹️ Ruko", just_once=True, use_container_width=True,
-                                        key=f"{page_key}_stt")
-        # speech_to_text can keep handing back the SAME transcript on reruns that have
-        # nothing to do with a new recording - which made it look like the assistant
-        # was "stuck repeating" the first thing you ever said. Only treat it as new
-        # speech the FIRST time this exact value shows up.
-        if raw_transcript and raw_transcript != st.session_state.get(last_heard_key):
-            st.session_state[last_heard_key] = raw_transcript
-            st.session_state[draft_key] = raw_transcript
+    with mic_col:
+        raw_transcript = speech_to_text(language=lang_code, start_prompt="🎤", stop_prompt="⏹️",
+                                        just_once=True, use_container_width=True, key=f"{page_key}_stt")
+    # speech_to_text can keep handing back the SAME transcript on reruns that have
+    # nothing to do with a new recording - which made it look like the assistant
+    # was "stuck repeating" the first thing you ever said. Only treat it as new
+    # speech the FIRST time this exact value shows up.
+    if raw_transcript and raw_transcript != st.session_state.get(last_heard_key):
+        st.session_state[last_heard_key] = raw_transcript
+        st.session_state[draft_key] = raw_transcript
 
-        st.session_state[draft_key] = st.text_area(
-            "Jo suna gaya wo yahan dikhta hai — chahe to type/edit karke bhi poochh sakte hain",
-            value=st.session_state[draft_key], key=f"{page_key}_voice_draft_box", height=80,
-            placeholder="Mic dabao aur boliye, ya seedha yahan type kar dijiye — data ke baare mein ya kuch bhi...",
+    with input_col:
+        st.session_state[draft_key] = st.text_input(
+            "Ask", value=st.session_state[draft_key], key=f"{page_key}_voice_draft_box",
+            placeholder=f"{assistant_name} se poochiye — data ke baare mein ya kuch bhi...",
             label_visibility="collapsed")
+    with send_col:
+        do_ask = st.button("🚀", key=f"{page_key}_voice_ask_btn", use_container_width=True,
+                           disabled=not st.session_state[draft_key].strip(), help="Poochiye")
+    with clear_col:
+        if st.button("🗑️", key=f"{page_key}_voice_clear_btn", use_container_width=True, help="Clear"):
+            st.session_state[draft_key] = ""
+            st.rerun()
 
-        ask_col1, ask_col2 = st.columns([1, 1])
-        with ask_col1:
-            do_ask = st.button(f"🚀 {assistant_name} se poochiye", type="primary",
-                               key=f"{page_key}_voice_ask_btn", use_container_width=True,
-                               disabled=not st.session_state[draft_key].strip())
-        with ask_col2:
-            if st.button("🗑️ Clear", key=f"{page_key}_voice_clear_btn", use_container_width=True):
-                st.session_state[draft_key] = ""
-                st.rerun()
-
-        if do_ask:
-            question_text = st.session_state[draft_key].strip()
-            st.caption(f"Aapne poocha: *{question_text}*")
-            with st.spinner(f"{assistant_name} soch rahi hai..."):
-                result = ac.ask(question_text, df if df is not None else pd.DataFrame(),
-                                meta or {}, kpis or [], dashboard_charts or [], api_key)
-            if result.get("error"):
-                st.error(result["error"])
-            elif result.get("answer"):
-                st.success(result["answer"])
-                st.components.v1.html(ve.tts_html(result["answer"], lang_code), height=0)
+    if do_ask:
+        question_text = st.session_state[draft_key].strip()
+        st.caption(f"Aapne poocha: *{question_text}*")
+        with st.spinner(f"{assistant_name} soch rahi hai..."):
+            result = ac.ask(question_text, df if df is not None else pd.DataFrame(),
+                            meta or {}, kpis or [], dashboard_charts or [], api_key)
+        if result.get("error"):
+            st.error(result["error"])
+        elif result.get("answer"):
+            st.success(result["answer"])
+            st.components.v1.html(ve.tts_html(result["answer"], lang_code), height=0)
 
 
 def render_filters(df, meta, key_prefix=""):
@@ -2159,8 +2157,6 @@ elif page == "⭐ Boss Dashboard":
     pinned_custom_charts = [c for c in st.session_state.custom_charts if c.get("pinned")]
     _pinned_kpi_lines = [f"{k['label']}: {k.get('value_display', k.get('value'))}" for k in pinned]
     _n_charts = len(st.session_state.dashboard_charts) + len(pinned_custom_charts)
-    render_voice_assistant("boss", ve.walkthrough_boss_dashboard(_pinned_kpi_lines, _n_charts),
-                            df=df, meta=meta, kpis=all_kpis, dashboard_charts=st.session_state.dashboard_charts)
 
     st.divider()
 
@@ -2392,11 +2388,6 @@ elif page == "💡 Business Insights":
         return {"name": r[name_col], "revenue": r.get("Captured Revenue", 0)}
 
     decisions = ppt.management_decisions(sport_t, code_t, day_t, page_t)
-    _wk_bi = ve.walkthrough_business_insights(
-        _top_row(sport_t, "Sport"), _top_row(code_t, "Code / Location"), _top_row(day_t, "Day"),
-        hs, len(decisions))
-    render_voice_assistant("bi", _wk_bi, df=df, meta=meta, kpis=de.compute_kpis(df, meta),
-                            dashboard_charts=st.session_state.dashboard_charts)
 
     st.divider()
     st.subheader("🏆 Sport Analysis")
@@ -2542,9 +2533,6 @@ elif page == "📈 Full Analysis":
         _kpi_lines.append(f"{_f['total_orders']:,} total orders")
     if _f.get("customer_count"):
         _kpi_lines.append(f"{_f['customer_count']:,} customers")
-    _wk = ve.walkthrough_full_analysis(_missing_roles, _kpi_lines, st.session_state._intel_narrative)
-    render_voice_assistant("intel", _wk, df=df, meta=meta, kpis=de.compute_kpis(df, meta),
-                            dashboard_charts=st.session_state.dashboard_charts)
     st.divider()
 
     # ==========================================================================
