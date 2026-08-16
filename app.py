@@ -3742,7 +3742,20 @@ elif page == "🔐 Admin Panel":
 
         st.divider()
         st.subheader("⏳ Pending requests")
-        st.caption("Someone paid via UPI and submitted their transaction reference. **Verify the UTR "
+        auto_col1, auto_col2 = st.columns([3, 1])
+        with auto_col2:
+            pay_auto_refresh = st.checkbox("🔄 Live (auto-refresh)", value=True, key="pay_auto_refresh",
+                                           help="Automatically checks for newly submitted requests every 15 "
+                                                "seconds, so you don't have to keep refreshing the page or "
+                                                "logging back in to see one show up.")
+        if pay_auto_refresh:
+            if AUTOREFRESH_AVAILABLE:
+                st_autorefresh(interval=15 * 1000, key="pay_requests_autorefresh")
+            else:
+                st.caption("⚠️ Auto-refresh needs the `streamlit-autorefresh` package — not installed here, "
+                          "so this tab still needs a manual refresh for now.")
+        with auto_col1:
+            st.caption("Someone paid via UPI and submitted their transaction reference. **Verify the UTR "
                   "actually shows up in your own GPay/bank statement before approving** — this is the "
                   "one manual step that keeps this whole flow honest without a payment gateway.")
         pending_reqs = pay.list_requests(pay.STATUS_PENDING)
