@@ -3492,15 +3492,64 @@ report, without you writing a single formula.
 - **Download PDF**: produces a clean, print-ready report with only the finished
   KPIs, charts and insights — no buttons, no settings panels, nothing that would
   look unprofessional in front of your boss.
+- **🔄 Refresh** button: if a linked Report Viewer (or you, in another browser)
+  changed something on this same dashboard, click Refresh to pull their latest
+  changes in — this only syncs on demand, not automatically in the background.
+
+**💡 Business Insights (new)**
+- Only appears in the sidebar when your loaded dataset actually has a
+  **Payment Page Title**-shaped column (e.g. `"Badminton AMD Mondays"`) — hidden
+  entirely for any dataset that doesn't, so it never gets in the way otherwise.
+- Automatically splits that title into **Sport → Code/Location → Day**. Anything
+  that can't be reliably split is labelled **"DATA REVIEW REQUIRED"** rather
+  than guessed at.
+- Gives you Sport, Code/Location, Day, and detailed Payment Page tables — each
+  with revenue, transactions, capture/failure/refund rate, average transaction
+  value, revenue share, and rank.
+- **Health Score**: a weighted score (payment success, failure rate, refund
+  rate, current activity) with a full breakdown of how it was calculated.
+- **Management Decisions**: a 🟢 Scale / 🟡 Optimize / 🔵 Maintain / 🔴 Reduce
+  list, each with the actual evidence behind it. Anything that would need data
+  this tool doesn't have (capacity, cost, profit) is labelled **"DATA
+  REQUIRED"** instead of guessed.
+
+**📈 Full Analysis**
+- A deeper, structured look at the *whole* dataset (not just what's pinned to a
+  dashboard): data understanding, cleaning notes, KPI analysis, and a plain-language
+  past → present → future summary — in **English or Hindi**.
+- Auto-detects which columns are Revenue, Cost, Customer, Product, Date, etc. —
+  confirmable/editable in the Column Mapping panel if the auto-detection guesses
+  wrong for your data.
+- Every number here comes straight from your data — nothing is invented, and
+  anything the tool can't determine from what's loaded is labelled **"DATA
+  REQUIRED"** rather than assumed.
 
 **🗂 Data Table (Page 4)**
 - SQL-style access to the raw data: pick which columns to `SELECT`, add a filter
   in pandas/SQL-like syntax (e.g. `Amount > 100000 and Status == 'Paid'`), sort,
   and export the exact slice you need as CSV.
 
+**🤖 AI Assistant**
+- Ask questions about your data in plain language — answers are grounded in
+  real SQL run against your actual dataset, not guesses, with the underlying
+  query shown as proof under each reply.
+- Chat history is saved per workspace and auto-deleted after 5 days.
+- Free-plan accounts get a limited number of AI requests per day (see 💎 Plans);
+  Standard is unlimited.
+
 **⚙️ Settings**
 - Reset the default look of the Boss Dashboard, change your own password, and
   (for client accounts) create Report Viewer logins for your own team.
+
+**💎 Plans**
+- Compare Free vs Standard, and see your own current plan status (trial days
+  left, or subscription renewal date).
+- Upgrade/renew via UPI: pick Monthly or Yearly, pay via any UPI app, then
+  submit your transaction reference (UTR) for an admin to verify and approve —
+  this is a manual, human-checked step on purpose (see the Admin Panel for why),
+  so it can take a little while, not instantly.
+- Your plan status refreshes automatically — no need to log out and back in
+  after an admin approves your upgrade.
 
 **Performance note:** column detection, KPI math and chart aggregation are all
 done with vectorized pandas/NumPy operations, so the same tool comfortably
