@@ -34,3 +34,6 @@ streamlit-autorefresh  # powers the auto-refresh toggle on Database Connector qu
 PyMuPDF                # renders a PDF's first page to PNG for the Settings -> App Branding
                         # "Login page logo" upload (only needed if someone uploads a PDF logo;
                         # PNG/JPG logos work without it)
+streamlit-mic-recorder  # 🎤 voice assistant push-to-talk button (Full Analysis, Business
+                        # Insights, Boss Dashboard) - records + transcribes via the browser's
+                        # own speech recognition, no API key needed for this part
