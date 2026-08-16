@@ -18,6 +18,7 @@ plotly==6.8.0  # PINNED — was unpinned before, so Streamlit Cloud silently ins
                # "ValueError" crash on every Line/Area chart. Pinning stops that
                # from happening again on a future redeploy.
 reportlab
+qrcode        # generates the scannable UPI QR code on the 💎 Plans page's "Pay via UPI" flow
 openpyxl      # needed to read/write .xlsx files (pd.ExcelFile)
 kaleido==0.2.1  # PINNED — newer kaleido (1.x) needs a headless Chrome browser that
                    # isn't available on Streamlit Cloud by default, so fig.to_image()
