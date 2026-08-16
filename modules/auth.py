@@ -67,11 +67,6 @@ ROLE_REPORT_VIEWER = "report_viewer"   # restricted viewer a CLIENT can self-ser
                                         # page (read-only) — kept as-is for backward compatibility.
 ALL_ROLES = (ROLE_ADMIN, ROLE_CLIENT, ROLE_VIEWER, ROLE_REPORT_VIEWER)
 
-TRIAL_DAYS = 15   # a "free" plan account stops working entirely this many days after
-                  # it was FIRST put on the free plan — not a daily reset, a hard cutoff.
-                  # (Daily AI/PDF/row caps in usage_limits.py are separate and keep
-                  # resetting every day WHILE the trial is still active.)
-
 
 def _hash(pw: str, salt: bytes = None) -> str:
     """Salted PBKDF2-SHA256 (200k iterations) — stored as 'saltHex:hashHex'.
@@ -106,7 +101,8 @@ def _is_legacy_hash(stored_hash: str) -> bool:
 
 def _default_store():
     return {"users": {"admin": {"password_hash": _hash("admin123"), "role": ROLE_ADMIN,
-                                "workspace_id": "admin", "plan": "standard"}}}
+                                "workspace_id": "admin", "plan": "standard",
+                                "free_started_at": None, "plan_expires_at": None, "billing_cycle": None}}}
 
 
 def _migrate_if_old_format(raw: dict) -> dict:
@@ -129,6 +125,15 @@ def _migrate_if_old_format(raw: dict) -> dict:
     for uname, info in raw["users"].items():
         info.setdefault("workspace_id", uname)
         info.setdefault("plan", "standard")   # existing accounts stay unlimited — nobody gets newly capped by surprise
+        # Free-trial clock: an existing free-plan account that predates this field
+        # gets a FRESH trial starting now, rather than being treated as having
+        # started TRIAL_DAYS ago (which would instantly expire them by surprise).
+        if info.get("plan") == "free":
+            info.setdefault("free_started_at", time.time())
+        else:
+            info.setdefault("free_started_at", None)
+        info.setdefault("plan_expires_at", None)   # None = no subscription expiry (permanent Standard)
+        info.setdefault("billing_cycle", None)      # "monthly" / "yearly" / None — display only
         if info.get("role") not in ALL_ROLES:
             info["role"] = ROLE_VIEWER
     return raw
@@ -177,37 +182,100 @@ def verify_login(username: str, password_plain: str):
 
 
 def get_plan(username: str) -> str:
-    """Returns 'standard' (unlimited) or 'free' (capped — see usage_limits.py)."""
+    """Returns the RAW stored plan — 'standard' or 'free'. This does NOT
+    account for a lapsed monthly/yearly subscription; use get_effective_plan()
+    for anything that decides what to actually show/allow a user."""
     store = _load_store()
     user = store["users"].get((username or "").strip())
     return (user or {}).get("plan", "standard")
 
 
+TRIAL_DAYS = 14   # how many days a brand-new "free" account can fully use the app before being blocked
+
+
 def get_trial_status(username: str) -> dict:
-    """For a 'free' plan account: {'expired': bool, 'days_left': int}. For a
-    'standard' account: {'expired': False, 'days_left': None} (no trial clock
-    applies at all)."""
+    """For FREE-plan accounts: how many trial days are left, and whether the
+    trial has run out. Always safe to call on a standard-plan account too
+    (returns full days left / not expired — callers gate on plan themselves,
+    this just never crashes either way)."""
     store = _load_store()
     user = store["users"].get((username or "").strip()) or {}
-    if user.get("plan") != "free":
-        return {"expired": False, "days_left": None}
-    trial_start = user.get("trial_start")
-    if not trial_start:
-        return {"expired": False, "days_left": TRIAL_DAYS}
-    elapsed_days = (time.time() - trial_start) / 86400
-    days_left = max(0, int(TRIAL_DAYS - elapsed_days) + (1 if (TRIAL_DAYS - elapsed_days) % 1 > 0 else 0))
-    return {"expired": elapsed_days >= TRIAL_DAYS, "days_left": days_left}
+    started = user.get("free_started_at") or time.time()
+    elapsed_days = (time.time() - started) / 86400.0
+    days_left = max(0, TRIAL_DAYS - int(elapsed_days))
+    return {"days_left": days_left, "expired": elapsed_days >= TRIAL_DAYS}
 
 
-def reset_trial(username: str):
-    """Admin action: grants an existing 'free' account a brand-new TRIAL_DAYS
-    window starting now (e.g. after they've paid, or as a goodwill extension).
-    No-op if the account isn't on the free plan."""
+def get_subscription_status(username: str) -> dict:
+    """For STANDARD-plan accounts that came from a paid monthly/yearly
+    request (see set_plan's duration_days): whether that subscription has
+    lapsed. A permanently-granted Standard account (admin gave it manually,
+    no duration_days) has expires_at=None and is NEVER 'expired' here."""
     store = _load_store()
-    user = store["users"].get((username or "").strip())
-    if user and user.get("plan") == "free":
-        user["trial_start"] = time.time()
-        _save_store(store)
+    user = store["users"].get((username or "").strip()) or {}
+    exp = user.get("plan_expires_at")
+    if not exp:
+        return {"expires_at": None, "days_left": None, "expired": False, "billing_cycle": None}
+    days_left = max(0, int((exp - time.time()) / 86400.0))
+    return {"expires_at": exp, "days_left": days_left, "expired": time.time() >= exp,
+            "billing_cycle": user.get("billing_cycle")}
+
+
+def get_effective_plan(username: str) -> str:
+    """The plan the app should actually TREAT this account as having right
+    now, accounting for a lapsed subscription: 'free', 'standard', or
+    'expired_standard' (was paid Standard, subscription ran out — this is
+    what triggers the 'renew your subscription' screen, distinct from the
+    'upgrade from free trial' screen since the messaging is different)."""
+    plan = get_plan(username)
+    if plan == "standard" and get_subscription_status(username)["expired"]:
+        return "expired_standard"
+    return plan
+
+
+def set_plan(username: str, plan: str, duration_days: int = None, billing_cycle: str = None) -> None:
+    """Changes an account's plan.
+
+    plan: 'free' or 'standard'.
+    duration_days: ONLY meaningful when plan='standard'. Pass 30 for a
+      monthly subscription, 365 for yearly (etc.) — this sets a real expiry,
+      and get_effective_plan() will report 'expired_standard' once it
+      passes, triggering the renew screen. Omit/None for a PERMANENT
+      Standard grant (e.g. an admin manually upgrading someone with no
+      payment tracked, or your own admin account) — this never expires.
+    billing_cycle: optional label ('monthly'/'yearly') stored purely so the
+      Admin Panel can show what someone's on — has no effect on logic.
+
+    Moving TO 'free' always resets the trial clock to start now (so the
+    Admin Panel's 'Reset trial' button gives genuinely fresh days) and
+    clears any leftover subscription expiry.
+    """
+    store = _load_store()
+    uname = (username or "").strip()
+    if uname not in store["users"]:
+        return
+    entry = store["users"][uname]
+    entry["plan"] = "free" if plan == "free" else "standard"
+    if entry["plan"] == "free":
+        entry["free_started_at"] = time.time()
+        entry["plan_expires_at"] = None
+        entry["billing_cycle"] = None
+    else:
+        if duration_days:
+            entry["plan_expires_at"] = time.time() + float(duration_days) * 86400.0
+            entry["billing_cycle"] = billing_cycle
+        else:
+            entry["plan_expires_at"] = None   # permanent grant — never expires
+            entry["billing_cycle"] = None
+    _save_store(store)
+
+
+def reset_trial(username: str) -> None:
+    """Gives a free-plan account a fresh TRIAL_DAYS-day clock, starting now.
+    Thin wrapper — set_plan('free', ...) already does this as part of moving
+    someone onto the free plan; this is for the case where they're ALREADY
+    on free and just need the clock restarted."""
+    set_plan(username, "free")
 
 
 def verify_admin_login(username: str, password_plain: str) -> bool:
@@ -237,7 +305,7 @@ def list_users():
     return [
         {"username": u, "role": info["role"], "workspace_id": info.get("workspace_id", u),
          "email": info.get("email", ""), "plan": info.get("plan", "standard"),
-         "trial_start": info.get("trial_start")}
+         "billing_cycle": info.get("billing_cycle"), "plan_expires_at": info.get("plan_expires_at")}
         for u, info in store["users"].items()
     ]
 
@@ -266,33 +334,36 @@ def create_or_update_user(username: str, password_plain: str, role: str, workspa
     email: optional, but required if the account should be able to use
       "Forgot password" (the reset link goes to this address).
     plan: "standard" (default, unlimited) or "free" (capped — see
-      usage_limits.py for the daily caps, AND a hard TRIAL_DAYS cutoff below).
-      Lets you give trial/beta accounts real usage caps without touching
-      their role or workspace."""
+      usage_limits.py for the actual limits). Lets you give trial/beta
+      accounts real usage caps without touching their role or workspace."""
     username = (username or "").strip()
     if not username or not password_plain or role not in ALL_ROLES:
         raise ValueError("Username, password and a valid role are required.")
     store = _load_store()
-    existing = store["users"].get(username, {})
     ws_id = (workspace_id or "").strip() or username
     entry = {"password_hash": _hash(password_plain), "role": role, "workspace_id": ws_id}
     if email:
         entry["email"] = email.strip().lower()
-    elif existing.get("email"):
-        entry["email"] = existing["email"]   # keep existing email on an update that didn't touch it
+    elif username in store["users"] and store["users"][username].get("email"):
+        entry["email"] = store["users"][username]["email"]   # keep existing email on an update that didn't touch it
     if plan in ("standard", "free"):
         entry["plan"] = plan
-    elif existing.get("plan"):
-        entry["plan"] = existing["plan"]   # keep existing plan on an update that didn't touch it
+    elif username in store["users"] and store["users"][username].get("plan"):
+        entry["plan"] = store["users"][username]["plan"]   # keep existing plan on an update that didn't touch it
     else:
         entry["plan"] = "standard"
+    # Keep the trial/subscription fields consistent no matter which path set
+    # entry["plan"] just above, so get_trial_status/get_subscription_status
+    # never see a free/standard account missing these.
+    existing = store["users"].get(username, {})
     if entry["plan"] == "free":
-        # Only stamp a FRESH trial_start the first time this account goes onto
-        # the free plan (i.e. it didn't already have one) - re-saving the same
-        # account (password reset, role tweak, etc.) must NOT silently renew
-        # the trial clock. Use reset_trial() below to explicitly grant a new
-        # trial window to an existing account.
-        entry["trial_start"] = existing.get("trial_start") or time.time()
+        entry["free_started_at"] = existing.get("free_started_at") or time.time()
+        entry["plan_expires_at"] = None
+        entry["billing_cycle"] = None
+    else:
+        entry["free_started_at"] = None
+        entry["plan_expires_at"] = existing.get("plan_expires_at")   # preserve any subscription expiry on an unrelated edit
+        entry["billing_cycle"] = existing.get("billing_cycle")
     store["users"][username] = entry
     _save_store(store)
 
@@ -302,22 +373,6 @@ def set_email(username: str, email: str):
     if username not in store["users"]:
         raise ValueError(f"User '{username}' does not exist.")
     store["users"][username]["email"] = (email or "").strip().lower()
-    _save_store(store)
-
-
-def set_plan(username: str, plan: str):
-    """Changes an existing account's plan WITHOUT touching its password —
-    unlike calling create_or_update_user() (which requires a password arg).
-    Switching to 'free' stamps a fresh trial_start only if it didn't already
-    have one; switching to 'standard' just lifts the cap/trial entirely."""
-    if plan not in ("standard", "free"):
-        raise ValueError("plan must be 'standard' or 'free'.")
-    store = _load_store()
-    if username not in store["users"]:
-        raise ValueError(f"User '{username}' does not exist.")
-    store["users"][username]["plan"] = plan
-    if plan == "free" and not store["users"][username].get("trial_start"):
-        store["users"][username]["trial_start"] = time.time()
     _save_store(store)
 
 
