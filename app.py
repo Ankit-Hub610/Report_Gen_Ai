@@ -1079,16 +1079,17 @@ def load_sample(filename: str = "sample_sports_payments.csv"):
 
 def render_voice_assistant(page_key: str, walkthrough_segments: list,
                             df=None, meta=None, kpis=None, dashboard_charts=None):
-    """The 🎤 voice assistant block — used on Full Analysis, Business
-    Insights, and Boss Dashboard. Same three pieces everywhere (see
-    modules/voice_engine.py docstring for the full reasoning):
+    """The 🎤 voice assistant — one simple thing: ask anything out loud (or by
+    typing), about your data or anything else, and get an answer back
+    (spoken aloud too). No walkthrough, no extra modes — just ask.
       1. Push-to-talk mic button -> browser speech-to-text (free, no key)
-      2. Question answered by the SAME engine as the 🤖 AI Assistant page
-         (real SQL against the real data, not a guess)
+      2. Question answered by the SAME engine as the 🤖 AI Assistant page —
+         grounded in real SQL when it's about your data, free conversation
+         otherwise (see ai_chat.py's system prompt)
       3. Answer spoken aloud via the browser's own text-to-speech (free, no key)
-    Plus a Guided Walkthrough that steps through `walkthrough_segments`
-    (built from data already computed on the calling page - never invented
-    here) with Play/Next/Previous, each step spoken aloud too.
+    `walkthrough_segments` is kept as a parameter so existing call sites
+    don't need to change, but it's no longer used — this was simplified
+    down to just the ask-anything flow.
     """
     assistant_name = ve.get_assistant_name(st.session_state.plan, st.session_state.get("assistant_name"))
     lang_label = st.session_state.get("voice_language", "English")
@@ -1099,7 +1100,7 @@ def render_voice_assistant(page_key: str, walkthrough_segments: list,
         lang_label = "English"
         st.session_state.voice_language = lang_label
 
-    with st.expander(f"🎤 {assistant_name} — poochiye ya guided walkthrough suniye", expanded=False):
+    with st.expander(f"🎤 {assistant_name} se poochiye — data ke baare mein ya kuch bhi", expanded=False):
         if not MIC_AVAILABLE:
             st.caption("⚠️ Voice needs the `streamlit-mic-recorder` package — not installed here yet.")
             return
@@ -1109,57 +1110,57 @@ def render_voice_assistant(page_key: str, walkthrough_segments: list,
             st.session_state.voice_language = st.selectbox(
                 "Language", list(ve.LANG_CODES.keys()),
                 index=list(ve.LANG_CODES.keys()).index(lang_label),
-                key=f"{page_key}_voice_lang")
+                key=f"{page_key}_voice_lang", label_visibility="collapsed")
         lang_code = ve.LANG_CODES[st.session_state.voice_language]
 
-        # ---- Guided walkthrough ----
-        st.markdown("**▶️ Guided Walkthrough**")
-        wk_key = f"{page_key}_wk_step"
-        st.session_state.setdefault(wk_key, 0)
-        step = st.session_state[wk_key]
-        if walkthrough_segments:
-            step = max(0, min(step, len(walkthrough_segments) - 1))
-            seg = walkthrough_segments[step]
-            st.info(f"**{seg['title']}** ({step + 1}/{len(walkthrough_segments)})\n\n{seg['text']}")
-            wb1, wb2, wb3 = st.columns(3)
-            with wb1:
-                if st.button("🔊 Sunaiye is step ko", key=f"{page_key}_wk_play"):
-                    st.components.v1.html(ve.tts_html(seg["text"], lang_code), height=0)
-            with wb2:
-                if st.button("⬅️ Pichla", key=f"{page_key}_wk_prev", disabled=step == 0):
-                    st.session_state[wk_key] = step - 1
-                    st.rerun()
-            with wb3:
-                if st.button("➡️ Agla", key=f"{page_key}_wk_next", disabled=step >= len(walkthrough_segments) - 1):
-                    st.session_state[wk_key] = step + 1
-                    st.rerun()
-        else:
-            st.caption("Is page ke liye abhi walkthrough banane layak kuch nahi hai.")
-
-        st.divider()
-
-        # ---- Push-to-talk Q&A ----
-        st.markdown(f"**🎤 {assistant_name} se poochiye**")
         api_key = ac.get_api_key() or st.session_state.ai_groq_key
         if not api_key:
             st.caption("⚠️ Ye 🤖 AI Assistant page jaisi hi API key use karta hai — pehle wahan se ek free "
                        "OpenRouter key set karein (Admin Panel), tab yahan bhi kaam karega.")
             return
-        transcript = speech_to_text(language=lang_code, start_prompt=f"🎤 Bolo, {assistant_name}",
-                                     stop_prompt="⏹️ Ruko", just_once=True, use_container_width=True,
-                                     key=f"{page_key}_stt")
-        if transcript:
-            st.caption(f"Aapne poocha: *{transcript}*")
-            if df is not None:
-                with st.spinner(f"{assistant_name} soch rahi hai..."):
-                    result = ac.ask(transcript, df, meta or {}, kpis or [], dashboard_charts or [], api_key)
-                if result.get("error"):
-                    st.error(result["error"])
-                elif result.get("answer"):
-                    st.success(result["answer"])
-                    st.components.v1.html(ve.tts_html(result["answer"], lang_code), height=0)
-            else:
-                st.warning("Data load nahi hai abhi, is sawaal ka jawab nahi de sakte.")
+
+        draft_key = f"{page_key}_voice_draft"
+        last_heard_key = f"{page_key}_voice_last_heard"
+        st.session_state.setdefault(draft_key, "")
+
+        raw_transcript = speech_to_text(language=lang_code, start_prompt=f"🎤 Bolo, {assistant_name}",
+                                        stop_prompt="⏹️ Ruko", just_once=True, use_container_width=True,
+                                        key=f"{page_key}_stt")
+        # speech_to_text can keep handing back the SAME transcript on reruns that have
+        # nothing to do with a new recording - which made it look like the assistant
+        # was "stuck repeating" the first thing you ever said. Only treat it as new
+        # speech the FIRST time this exact value shows up.
+        if raw_transcript and raw_transcript != st.session_state.get(last_heard_key):
+            st.session_state[last_heard_key] = raw_transcript
+            st.session_state[draft_key] = raw_transcript
+
+        st.session_state[draft_key] = st.text_area(
+            "Jo suna gaya wo yahan dikhta hai — chahe to type/edit karke bhi poochh sakte hain",
+            value=st.session_state[draft_key], key=f"{page_key}_voice_draft_box", height=80,
+            placeholder="Mic dabao aur boliye, ya seedha yahan type kar dijiye — data ke baare mein ya kuch bhi...",
+            label_visibility="collapsed")
+
+        ask_col1, ask_col2 = st.columns([1, 1])
+        with ask_col1:
+            do_ask = st.button(f"🚀 {assistant_name} se poochiye", type="primary",
+                               key=f"{page_key}_voice_ask_btn", use_container_width=True,
+                               disabled=not st.session_state[draft_key].strip())
+        with ask_col2:
+            if st.button("🗑️ Clear", key=f"{page_key}_voice_clear_btn", use_container_width=True):
+                st.session_state[draft_key] = ""
+                st.rerun()
+
+        if do_ask:
+            question_text = st.session_state[draft_key].strip()
+            st.caption(f"Aapne poocha: *{question_text}*")
+            with st.spinner(f"{assistant_name} soch rahi hai..."):
+                result = ac.ask(question_text, df if df is not None else pd.DataFrame(),
+                                meta or {}, kpis or [], dashboard_charts or [], api_key)
+            if result.get("error"):
+                st.error(result["error"])
+            elif result.get("answer"):
+                st.success(result["answer"])
+                st.components.v1.html(ve.tts_html(result["answer"], lang_code), height=0)
 
 
 def render_filters(df, meta, key_prefix=""):
