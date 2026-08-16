@@ -48,6 +48,8 @@ PERSISTED_KEYS = [
     "intel_action_checks",   # 🧠 Intelligence Report — ticked/unticked state of the Top Actions checklist
     "intel_language",        # 🧠 Intelligence Report — last-picked narrative language (English/Hindi)
     "intel_role_overrides",  # 🧠 Intelligence Report — user-confirmed column-role mapping
+    "assistant_name",         # 🎤 voice assistant's name — "री" on Free, customizable on Standard
+    "voice_language",         # 🎤 voice assistant — last-picked language (English/Hindi/Gujarati)
 ]
 # NOTE: db_queries / db_conn_uri (external Database Connector state) are
 # INTENTIONALLY excluded from persistence - a database connection string
