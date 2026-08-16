@@ -4,29 +4,53 @@ payments.py
 A REAL (not fake/auto-trust) manual payment flow for before you have a proper
 payment gateway (Razorpay etc.) set up:
 
-  1. Admin sets a UPI ID + monthly price once (Admin Panel).
-  2. A free-plan user sees a "Pay via UPI" button/QR on the Plans page, pays
-     via GPay/PhonePe/any UPI app to that UPI ID, then submits the UPI
-     transaction reference number (UTR) they got as proof.
+  1. Admin sets a UPI ID + Monthly/Yearly price once (Admin Panel).
+  2. A free-plan user picks Monthly or Yearly, pays via GPay/PhonePe/any UPI
+     app to that UPI ID, then submits the UPI transaction reference number
+     (UTR) they got as proof.
   3. That creates a PENDING request — nobody is upgraded yet.
   4. Admin sees pending requests in the Admin Panel, checks the UTR actually
-     shows up in their own GPay/bank statement, and clicks Approve — THAT is
-     what actually flips the account to Standard. Reject is also available
-     (e.g. duplicate/fake UTR).
+     shows up in their own GPay/bank statement (for the right amount, on
+     the right day), and clicks Approve — THAT is what actually flips the
+     account to Standard. Reject is also available (e.g. duplicate/fake
+     UTR), and an approved-by-mistake request can later be Reversed.
 
-This is intentionally NOT automatic — a personal UPI ID has no API to verify
-payments against, so any "instant auto-upgrade" from just a typed-in UTR would
-be trivially fake-able (anyone could type in a random string and get free
-Standard access). A human check-and-approve step is what makes this real. Once
-a proper gateway (Razorpay etc.) is wired up later, THAT flow can be fully
-automatic (signature-verified) — this module is the honest stopgap before that.
+WHY THIS ISN'T FULLY AUTOMATIC: a personal UPI ID has no API to verify
+payments against, so an "instant auto-upgrade" from just a typed-in UTR
+would be trivially fake-able — anyone could type in a random string and get
+free Standard access. A human check-and-approve step is what makes this
+real. What THIS module can do — and does — is make it hard to slip a
+low-effort fake past that human check:
+
+  - UTR SANITY CHECK (utr_quality()): rejects empty/placeholder/too-short
+    input outright at submit time (e.g. "test", "0000000000", "123"), and
+    flags (but doesn't block — real bank statement formats do vary) any UTR
+    that doesn't match the common 12-digit UPI reference shape, so the
+    admin sees a clear "double-check this one" signal instead of having to
+    eyeball every entry themselves.
+  - DUPLICATE UTR CHECK: a real transaction reference is unique and can
+    never legitimately be submitted twice (by the same person OR a
+    different one) — blocked outright, checked against every request ever
+    submitted regardless of its status.
+  - FIXED AMOUNT: the amount tied to a request is always the admin's
+    configured Monthly/Yearly price, never something the user types in — so
+    nobody can submit "₹1 paid" and ask for a ₹999 plan.
+  - ONE PENDING REQUEST AT A TIME per user — no piling up duplicate/spam
+    submissions to bury the admin's queue.
+
+None of this is proof of payment on its own — the admin's own bank/UPI-app
+check is still what actually confirms the money arrived. It's what turns
+"trust a random typed string" into "a human verifies one specific,
+already-sanity-checked claim." Once a proper gateway (Razorpay etc.) is
+wired up later, THAT flow can be fully automatic (signature-verified) — this
+module is the honest, harder-to-abuse stopgap before that.
 """
 
 import json
 import os
+import re
 import time
 import urllib.parse
-import uuid
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _STORE_DIR = os.path.join(APP_DIR, "workspace_state")
@@ -36,7 +60,7 @@ _REQUESTS_FILE = os.path.join(_STORE_DIR, "_payment_requests.json")
 STATUS_PENDING = "pending"
 STATUS_APPROVED = "approved"
 STATUS_REJECTED = "rejected"
-STATUS_REVERSED = "reversed"   # an approval that turned out to be wrong (e.g. half-paid) and was undone
+STATUS_REVERSED = "reversed"
 
 PLAN_MONTHLY = "monthly"
 PLAN_YEARLY = "yearly"
@@ -44,10 +68,10 @@ PLAN_DURATION_DAYS = {PLAN_MONTHLY: 30, PLAN_YEARLY: 365}
 
 
 # ---------------------------------------------------------------------------
-# CONFIG — the admin's UPI ID + monthly/yearly price (one shared config, not per-user)
+# CONFIG — the admin's UPI ID + Monthly/Yearly price (one shared config)
 # ---------------------------------------------------------------------------
 def get_config() -> dict:
-    defaults = {"upi_id": "", "payee_name": "", "monthly_price": 299, "yearly_price": 2999}
+    defaults = {"upi_id": "", "payee_name": "", "monthly_price": 299.0, "yearly_price": 2999.0}
     if not os.path.isfile(_CONFIG_FILE):
         return defaults
     try:
@@ -107,6 +131,43 @@ def qr_png_bytes(upi_link: str):
 
 
 # ---------------------------------------------------------------------------
+# UTR SANITY CHECK — not proof of payment, but catches low-effort fakes
+# ---------------------------------------------------------------------------
+_JUNK_UTRS = {"na", "n/a", "none", "test", "testing", "xxxx", "xxxxxxxxxxxx",
+              "123", "0", "000000000000", "123456789012", "111111111111", "testtest"}
+_TYPICAL_UTR_RE = re.compile(r"^\d{12}$")            # the standard GPay/PhonePe/most-banks UPI reference shape
+_PLAUSIBLE_UTR_RE = re.compile(r"^[A-Za-z0-9]{6,25}$")  # generously covers other real bank statement formats
+
+
+def utr_quality(utr: str) -> dict:
+    """Best-effort sanity check on a submitted UTR/UPI reference. NOT proof
+    of payment — there's no gateway API to verify against here — this only
+    catches input that couldn't possibly be a real reference, and flags
+    anything unusual for the admin to double-check.
+    Returns {"ok": bool, "typical_format": bool, "reason": str|None}.
+    ok=False means "reject this at submit time" (empty/placeholder/too
+    short). ok=True but typical_format=False means "let it through, but
+    show the admin a caution flag" — real bank UTR formats genuinely vary,
+    so this must never hard-block a legitimate payer."""
+    u = (utr or "").strip()
+    if not u:
+        return {"ok": False, "typical_format": False, "reason": "Please enter your UPI transaction reference (UTR) number."}
+    if u.lower() in _JUNK_UTRS or len(set(u.lower())) <= 1:
+        return {"ok": False, "typical_format": False,
+                "reason": "That doesn't look like a real transaction reference — please paste the exact UTR/reference ID from your UPI app."}
+    if len(u) < 6:
+        return {"ok": False, "typical_format": False,
+                "reason": "Too short to be a real UPI transaction reference (these are normally 12 digits)."}
+    if not _PLAUSIBLE_UTR_RE.match(u):
+        return {"ok": False, "typical_format": False,
+                "reason": "A UPI reference is normally just letters/numbers, around 12 characters — please re-check what you pasted."}
+    is_typical = bool(_TYPICAL_UTR_RE.match(u))
+    return {"ok": True, "typical_format": is_typical,
+            "reason": None if is_typical else
+            "Doesn't match the usual 12-digit UPI reference format — double-check it carefully in your bank/UPI app before approving."}
+
+
+# ---------------------------------------------------------------------------
 # REQUEST QUEUE
 # ---------------------------------------------------------------------------
 def _load_requests():
@@ -128,27 +189,27 @@ def _save_requests(requests_list):
 
 
 def submit_request(username: str, workspace_id: str, utr: str, amount: float, plan_type: str = PLAN_MONTHLY) -> tuple:
-    """User submits proof-of-payment. Returns (ok, message). Blocks duplicate
-    UTRs (accidental double-submit) and blocks a second PENDING request from
-    the same user (edit/cancel the first instead of piling up)."""
+    """User submits proof-of-payment. Returns (ok, message).
+    Rejects obviously-fake UTRs outright (see utr_quality()), blocks
+    duplicate UTRs (a real one can never legitimately be reused — checked
+    against every request ever submitted, not just pending ones), and
+    blocks a second PENDING request from the same user (they'd have to wait
+    for the first to be reviewed rather than piling up submissions)."""
     utr = (utr or "").strip()
-    if not utr:
-        return False, "Please enter your UPI transaction reference (UTR) number."
+    quality = utr_quality(utr)
+    if not quality["ok"]:
+        return False, quality["reason"]
     reqs = _load_requests()
     if any(r["utr"].lower() == utr.lower() for r in reqs):
         return False, "This transaction reference has already been submitted."
     if any(r["username"] == username and r["status"] == STATUS_PENDING for r in reqs):
         return False, "You already have a pending request awaiting approval — please wait for it to be reviewed."
     reqs.append({
-        # A plain f"{timestamp}_{username}" ID used to collide when the same
-        # user submitted twice within the same second, which made Approve/
-        # Reject silently act on the WRONG (often already-decided) request.
-        # uuid4 is unique regardless of timing, no matter how fast requests
-        # come in.
-        "id": uuid.uuid4().hex,
+        "id": f"{int(time.time())}_{username}",
         "username": username, "workspace_id": workspace_id,
         "utr": utr, "amount": amount, "plan_type": plan_type if plan_type in PLAN_DURATION_DAYS else PLAN_MONTHLY,
         "status": STATUS_PENDING,
+        "format_flag": quality["reason"],  # None for a typical-looking UTR, else the caution message for the admin
         "submitted_at": time.time(), "decided_at": None,
     })
     _save_requests(reqs)
@@ -181,21 +242,17 @@ def decide_request(request_id: str, approve: bool):
 
 
 def reverse_decision(request_id: str):
-    """Undoes a mistaken APPROVAL mid-way — e.g. the UTR turned out to be for
-    a half payment, or was approved by mistake. Flips the request to
-    STATUS_REVERSED (kept in history, clearly distinguishable from a normal
-    approval/rejection) and tells the caller (app.py) which username needs
-    to be downgraded back off Standard. Only works on an already-APPROVED
-    request — rejecting a pending one doesn't need this, and re-reversing an
-    already-reversed one is a no-op (returns an error instead of silently
-    doing nothing, so the admin UI can show why the button didn't work)."""
+    """Undoes a mistaken Approve (e.g. only a partial amount actually came
+    through, spotted after the fact). Returns (ok, message, username-or-None).
+    Only valid on a currently-APPROVED request — caller (app.py) is
+    responsible for moving the account back to Free via auth.set_plan()."""
     reqs = _load_requests()
     for r in reqs:
         if r["id"] == request_id:
             if r["status"] != STATUS_APPROVED:
-                return False, "Only an already-approved request can be reversed.", None
+                return False, "Only an approved request can be reversed.", None
             r["status"] = STATUS_REVERSED
-            r["reversed_at"] = time.time()
+            r["decided_at"] = time.time()
             _save_requests(reqs)
-            return True, "Reversed — this account has been moved back off Standard.", r["username"]
+            return True, "Approval reversed.", r["username"]
     return False, "Request not found.", None
