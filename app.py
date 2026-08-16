@@ -587,7 +587,7 @@ def login_screen():
                     st.session_state.username = u.strip()
                     st.session_state.role = role
                     st.session_state.workspace_id = auth.get_workspace_id(u.strip())
-                    st.session_state.plan = auth.get_plan(u.strip())
+                    st.session_state.plan = auth.get_effective_plan(u.strip())
                     _token = auth.create_session(u.strip())
                     st.session_state._session_token = _token
                     _set_session_cookie(_token)  # survives a browser refresh, but not copy-paste into another browser
@@ -704,7 +704,7 @@ if not st.session_state.authenticated:
         st.session_state.username = _resolved_user
         st.session_state.role = auth.get_role(_resolved_user)
         st.session_state.workspace_id = auth.get_workspace_id(_resolved_user)
-        st.session_state.plan = auth.get_plan(_resolved_user)
+        st.session_state.plan = auth.get_effective_plan(_resolved_user)
         st.session_state._session_token = _session_token
 
 if not st.session_state.authenticated:
@@ -732,21 +732,61 @@ def render_plan_comparison():
                f"with everything unlocked and unlimited.")
 
 
-def render_upi_upgrade_flow():
-    """The actual 'pay and request upgrade' UI — a real (admin-verified, not
-    auto-trust) manual UPI flow, since there's no payment gateway wired up
-    yet. Used on both the 💎 Plans page and the trial-expired blocking screen."""
+def render_pricing_cards(key_prefix: str = "") -> str:
+    """Two side-by-side pricing cards (Monthly / Yearly), styled like a real
+    pricing page — not a plain radio button list. Returns the plan_type
+    ('monthly' or 'yearly') the person has selected. Selection is kept in
+    session_state so it survives the rerun a card click triggers."""
+    pay_cfg = pay.get_config()
+    state_key = f"{key_prefix}selected_plan_type"
+    st.session_state.setdefault(state_key, pay.PLAN_MONTHLY)
+
+    yearly_monthly_equiv = pay_cfg["yearly_price"] / 12
+    savings_pct = 0
+    if pay_cfg["monthly_price"] > 0:
+        savings_pct = round(100 * (1 - yearly_monthly_equiv / pay_cfg["monthly_price"]))
+
+    c1, c2 = st.columns(2)
+    with c1:
+        with st.container(border=True):
+            picked = st.session_state[state_key] == pay.PLAN_MONTHLY
+            st.markdown(f"#### 📅 Monthly {'✅' if picked else ''}")
+            st.markdown(f"## ₹{pay_cfg['monthly_price']:.0f}")
+            st.caption("per month, cancel anytime")
+            if st.button("Choose Monthly", key=f"{key_prefix}pick_monthly",
+                        type="primary" if picked else "secondary", use_container_width=True):
+                st.session_state[state_key] = pay.PLAN_MONTHLY
+                st.rerun()
+    with c2:
+        with st.container(border=True):
+            picked = st.session_state[state_key] == pay.PLAN_YEARLY
+            badge = f" 🏷️ Save {savings_pct}%" if savings_pct > 0 else ""
+            st.markdown(f"#### 🗓️ Yearly {'✅' if picked else ''}{badge}")
+            st.markdown(f"## ₹{pay_cfg['yearly_price']:.0f}")
+            st.caption(f"per year (≈ ₹{yearly_monthly_equiv:.0f}/month)")
+            if st.button("Choose Yearly", key=f"{key_prefix}pick_yearly",
+                        type="primary" if picked else "secondary", use_container_width=True):
+                st.session_state[state_key] = pay.PLAN_YEARLY
+                st.rerun()
+    return st.session_state[state_key]
+
+
+def render_upi_upgrade_flow(plan_type: str, key_prefix: str = ""):
+    """The actual 'pay and request upgrade' UI for ONE selected plan
+    (monthly or yearly) — a real (admin-verified, not auto-trust) manual UPI
+    flow, since there's no payment gateway wired up yet."""
     pay_cfg = pay.get_config()
     if not pay_cfg["upi_id"]:
         st.markdown("**Want to upgrade to Standard?** Contact your admin to arrange payment.")
         return
+    amount = pay_cfg["yearly_price"] if plan_type == pay.PLAN_YEARLY else pay_cfg["monthly_price"]
     st.caption("Pay via any UPI app (GPay, PhonePe, Paytm, etc.), then submit your transaction "
               "reference below. An admin verifies and activates your account — usually within "
               "a few hours, not instant (this keeps the process honest without a payment gateway yet).")
     upi_col1, upi_col2 = st.columns([1, 1])
-    upi_link = pay.build_upi_link(pay_cfg["monthly_price"], f"Standard plan - {st.session_state.username}")
+    upi_link = pay.build_upi_link(amount, f"Standard ({plan_type}) - {st.session_state.username}")
     with upi_col1:
-        st.metric("Monthly price", f"₹{pay_cfg['monthly_price']:.0f}")
+        st.metric(f"{plan_type.title()} price", f"₹{amount:.0f}")
         st.markdown(f"**Pay to UPI ID:** `{pay_cfg['upi_id']}`")
         if pay_cfg.get("payee_name"):
             st.caption(f"Payee name: {pay_cfg['payee_name']}")
@@ -757,14 +797,14 @@ def render_upi_upgrade_flow():
             st.image(qr_bytes, caption="Scan with any UPI app", width=180)
 
     st.divider()
-    with st.form(f"upi_submit_form_{st.session_state.page}"):
+    with st.form(f"{key_prefix}upi_submit_form_{plan_type}"):
         utr_input = st.text_input("UPI transaction reference / UTR number",
                                   help="Shown in your UPI app right after payment succeeds "
                                        "(e.g. GPay: tap the payment → 'UPI transaction ID').")
         submitted_utr = st.form_submit_button("Submit for verification", type="primary")
     if submitted_utr:
         ok_utr, msg_utr = pay.submit_request(st.session_state.username, st.session_state.workspace_id,
-                                             utr_input, pay_cfg["monthly_price"])
+                                             utr_input, amount, plan_type=plan_type)
         (st.success if ok_utr else st.error)(msg_utr)
 
     my_reqs = [r for r in pay.list_requests() if r["username"] == st.session_state.username]
@@ -772,9 +812,23 @@ def render_upi_upgrade_flow():
         st.caption("Your submitted requests:")
         st.dataframe(pd.DataFrame([
             {"Submitted": datetime.datetime.fromtimestamp(r["submitted_at"]).strftime("%d %b %Y %H:%M"),
-             "UTR": r["utr"], "Amount": f"₹{r['amount']:.0f}", "Status": r["status"].title()}
+             "Plan": r.get("plan_type", "monthly").title(), "UTR": r["utr"], "Amount": f"₹{r['amount']:.0f}",
+             "Status": r["status"].title()}
             for r in my_reqs
         ]), use_container_width=True, hide_index=True)
+
+
+@st.dialog("💎 Upgrade to Standard")
+def upgrade_dialog():
+    """The popup — this is what makes upgrading feel like a real product's
+    pricing modal (Notion/Slack-style) instead of a plain page section.
+    Triggered by an 'Upgrade' button; everything happens inside this modal
+    without leaving whatever page the person was on."""
+    chosen = render_pricing_cards(key_prefix="dlg_")
+    st.divider()
+    render_upi_upgrade_flow(chosen, key_prefix="dlg_")
+    if st.button("Close", key="dlg_close_upgrade"):
+        st.rerun()
 
 
 if st.session_state.plan == "free" and st.session_state.role != auth.ROLE_ADMIN:
@@ -786,7 +840,9 @@ if st.session_state.plan == "free" and st.session_state.role != auth.ROLE_ADMIN:
         render_plan_comparison()
         st.divider()
         st.subheader("⬆️ Upgrade to Standard")
-        render_upi_upgrade_flow()
+        _chosen_plan = render_pricing_cards(key_prefix="trial_expired_")
+        st.divider()
+        render_upi_upgrade_flow(_chosen_plan, key_prefix="trial_expired_")
         if st.button("Log out"):
             auth.destroy_session(st.session_state.get("_session_token"))
             st.session_state.authenticated = False
@@ -798,6 +854,30 @@ if st.session_state.plan == "free" and st.session_state.role != auth.ROLE_ADMIN:
             _clear_session_cookie()
             st.rerun()
         st.stop()
+
+if st.session_state.plan == "expired_standard" and st.session_state.role != auth.ROLE_ADMIN:
+    st.title("🔁 Your subscription has ended")
+    _sub = auth.get_subscription_status(st.session_state.username)
+    _cycle = (_sub.get("billing_cycle") or "monthly").title()
+    st.warning(f"Your {_cycle} Standard subscription has ended — renew to keep everything unlocked. "
+               f"Your data is safe and waiting, nothing has been deleted.")
+    render_plan_comparison()
+    st.divider()
+    st.subheader("🔁 Renew your subscription")
+    _chosen_plan_renew = render_pricing_cards(key_prefix="sub_expired_")
+    st.divider()
+    render_upi_upgrade_flow(_chosen_plan_renew, key_prefix="sub_expired_")
+    if st.button("Log out", key="logout_sub_expired"):
+        auth.destroy_session(st.session_state.get("_session_token"))
+        st.session_state.authenticated = False
+        st.session_state.username = None
+        st.session_state.role = None
+        st.session_state.plan = "standard"
+        st.session_state.workspace_id = None
+        st.session_state._session_token = None
+        _clear_session_cookie()
+        st.rerun()
+    st.stop()
 
 
 # ==================================================================================
@@ -3429,17 +3509,25 @@ elif page == "💎 Plans":
         if _trial_pp["days_left"] is not None:
             st.info(f"🆓 You're on the **Free** plan — **{_trial_pp['days_left']} day(s) left** "
                    f"in your {auth.TRIAL_DAYS}-day trial.")
-    else:
-        st.success("💎 You're on the **Standard** plan — unlimited, no trial clock.")
+    elif st.session_state.role != auth.ROLE_ADMIN:
+        _sub_pp = auth.get_subscription_status(st.session_state.username)
+        if _sub_pp["expires_at"]:
+            st.success(f"💎 You're on the **Standard** plan ({(_sub_pp['billing_cycle'] or 'monthly').title()}) "
+                      f"— renews/expires in **{_sub_pp['days_left']} day(s)**.")
+        else:
+            st.success("💎 You're on the **Standard** plan — unlimited, no expiry.")
     st.caption("")
     render_plan_comparison()
     st.divider()
 
-    if st.session_state.plan == "free" and st.session_state.role != auth.ROLE_ADMIN:
-        st.subheader("⬆️ Upgrade to Standard")
-        render_upi_upgrade_flow()
-    elif st.session_state.role != auth.ROLE_ADMIN:
-        st.caption("You're already on Standard — nothing to upgrade. 🎉")
+    if st.session_state.role != auth.ROLE_ADMIN:
+        if st.session_state.plan == "free":
+            if st.button("🚀 Upgrade to Standard", type="primary"):
+                upgrade_dialog()
+        else:
+            if st.button("🔁 Renew / change plan"):
+                upgrade_dialog()
+            st.caption("You're already on Standard — this is only needed if you want to renew early or switch between Monthly/Yearly.")
 
 
 elif page == "🔐 Admin Panel":
@@ -3567,7 +3655,12 @@ elif page == "🔐 Admin Panel":
                         st.success(f"'{sel_user}' upgraded to Standard (unlimited) — password unchanged.")
                         st.rerun()
                 else:
-                    st.caption("💎 Standard plan (unlimited)")
+                    _sel_sub = auth.get_subscription_status(sel_user)
+                    if _sel_sub["expires_at"]:
+                        st.caption(f"💎 Standard plan ({(_sel_sub['billing_cycle'] or 'monthly').title()}) — "
+                                  f"{_sel_sub['days_left']} day(s) left" + (" (expired)" if _sel_sub["expired"] else ""))
+                    else:
+                        st.caption("💎 Standard plan (permanent — no expiry)")
                     if st.button("⬇️ Move to Free plan", use_container_width=True):
                         auth.set_plan(sel_user, "free")
                         st.success(f"'{sel_user}' moved to Free plan — {auth.TRIAL_DAYS}-day trial starts now.")
@@ -3628,17 +3721,22 @@ elif page == "🔐 Admin Panel":
 
     with tab_payments:
         st.subheader("UPI payment configuration")
-        st.caption("This is the UPI ID + monthly price shown to Free-plan users on the 💎 Plans page "
-                  "and on the trial-expired screen. Leave UPI ID blank to hide the whole 'Pay via UPI' "
-                  "section (they'll just see 'contact your admin' instead).")
+        st.caption("This is the UPI ID + Monthly/Yearly price shown to Free-plan users on the 💎 Plans page "
+                  "and on the trial/subscription-expired screens. Leave UPI ID blank to hide the whole "
+                  "'Pay via UPI' section (they'll just see 'contact your admin' instead).")
         _pay_cfg = pay.get_config()
         with st.form("payment_config_form"):
             cfg_upi_id = st.text_input("Your UPI ID", value=_pay_cfg["upi_id"],
                                        placeholder="yourname@okhdfcbank / yourname@okicici / etc.")
             cfg_payee_name = st.text_input("Payee name shown to users (optional)", value=_pay_cfg["payee_name"])
-            cfg_price = st.number_input("Monthly price (₹)", min_value=0.0, value=float(_pay_cfg["monthly_price"]), step=50.0)
+            cfg_price_col1, cfg_price_col2 = st.columns(2)
+            with cfg_price_col1:
+                cfg_price = st.number_input("Monthly price (₹)", min_value=0.0, value=float(_pay_cfg["monthly_price"]), step=50.0)
+            with cfg_price_col2:
+                cfg_yearly_price = st.number_input("Yearly price (₹)", min_value=0.0, value=float(_pay_cfg["yearly_price"]), step=100.0,
+                                                   help="Should normally be less than 12x the monthly price, so 'Save X%' has something to show.")
             if st.form_submit_button("💾 Save payment config", type="primary"):
-                pay.set_config(cfg_upi_id, cfg_payee_name, cfg_price)
+                pay.set_config(cfg_upi_id, cfg_payee_name, cfg_price, cfg_yearly_price)
                 st.success("Saved.")
                 st.rerun()
 
@@ -3655,16 +3753,17 @@ elif page == "🔐 Admin Panel":
                 with st.container(border=True):
                     rc1, rc2, rc3 = st.columns([2, 2, 1])
                     with rc1:
-                        st.markdown(f"**{r['username']}** — ₹{r['amount']:.0f}")
+                        st.markdown(f"**{r['username']}** — ₹{r['amount']:.0f} ({r.get('plan_type', 'monthly').title()})")
                         st.caption(f"Submitted: {datetime.datetime.fromtimestamp(r['submitted_at']).strftime('%d %b %Y %H:%M')}")
                     with rc2:
                         st.code(r["utr"], language=None)
                     with rc3:
                         if st.button("✅ Approve", key=f"pay_approve_{r['id']}", use_container_width=True):
-                            ok_dec, msg_dec, uname_dec = pay.decide_request(r["id"], True)
+                            ok_dec, msg_dec, uname_dec, plan_type_dec = pay.decide_request(r["id"], True)
                             if ok_dec and uname_dec:
-                                auth.set_plan(uname_dec, "standard")
-                                st.success(f"'{uname_dec}' upgraded to Standard.")
+                                duration = pay.PLAN_DURATION_DAYS.get(plan_type_dec, 30)
+                                auth.set_plan(uname_dec, "standard", duration_days=duration, billing_cycle=plan_type_dec)
+                                st.success(f"'{uname_dec}' upgraded to Standard ({plan_type_dec}, {duration} days).")
                             else:
                                 st.error(msg_dec)
                             st.rerun()
@@ -3673,15 +3772,35 @@ elif page == "🔐 Admin Panel":
                             st.warning("Rejected.")
                             st.rerun()
 
-        past_reqs = pay.list_requests(pay.STATUS_APPROVED) + pay.list_requests(pay.STATUS_REJECTED)
+        past_reqs = pay.list_requests(pay.STATUS_APPROVED) + pay.list_requests(pay.STATUS_REJECTED) + pay.list_requests(pay.STATUS_REVERSED)
         if past_reqs:
             with st.expander(f"📜 Past decisions ({len(past_reqs)})", expanded=False):
-                st.dataframe(pd.DataFrame([
-                    {"Username": r["username"], "UTR": r["utr"], "Amount": f"₹{r['amount']:.0f}",
-                     "Status": r["status"].title(),
-                     "Decided": datetime.datetime.fromtimestamp(r["decided_at"]).strftime("%d %b %Y %H:%M") if r["decided_at"] else "—"}
-                    for r in sorted(past_reqs, key=lambda x: x.get("decided_at") or 0, reverse=True)
-                ]), use_container_width=True, hide_index=True)
+                st.caption("Approved a request by mistake (e.g. only a partial amount actually came through)? "
+                          "**Disable** immediately undoes it — the account is moved straight back off Standard "
+                          "(back to Free with a fresh trial), and the row below is marked Reversed so you keep "
+                          "a record of what happened. This does NOT un-submit the request or refund anything — "
+                          "it only fixes the account's access.")
+                for r in sorted(past_reqs, key=lambda x: x.get("decided_at") or 0, reverse=True):
+                    with st.container(border=True):
+                        pc1, pc2, pc3, pc4, pc5 = st.columns([2, 2, 1.4, 1.6, 1.4])
+                        pc1.markdown(f"**{r['username']}**")
+                        pc1.caption(r["utr"])
+                        pc2.markdown(f"₹{r['amount']:.0f} ({r.get('plan_type', 'monthly').title()})")
+                        _status_badge = {"approved": "✅ Approved", "rejected": "❌ Rejected",
+                                         "reversed": "↩️ Reversed"}.get(r["status"], r["status"].title())
+                        pc3.markdown(_status_badge)
+                        _decided = datetime.datetime.fromtimestamp(r["decided_at"]).strftime("%d %b %Y %H:%M") if r["decided_at"] else "—"
+                        pc4.caption(f"Decided: {_decided}")
+                        with pc5:
+                            if r["status"] == pay.STATUS_APPROVED:
+                                if st.button("🚫 Disable", key=f"pay_reverse_{r['id']}", use_container_width=True):
+                                    ok_rev, msg_rev, uname_rev = pay.reverse_decision(r["id"])
+                                    if ok_rev and uname_rev:
+                                        auth.set_plan(uname_rev, "free")
+                                        st.success(f"'{uname_rev}' moved back to Free. {msg_rev}")
+                                    else:
+                                        st.error(msg_rev)
+                                    st.rerun()
 
     with tab_admin_about:
         st.subheader("Admin Panel — what only you can see")
