@@ -26,6 +26,7 @@ import json
 import os
 import time
 import urllib.parse
+import uuid
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _STORE_DIR = os.path.join(APP_DIR, "workspace_state")
@@ -35,29 +36,34 @@ _REQUESTS_FILE = os.path.join(_STORE_DIR, "_payment_requests.json")
 STATUS_PENDING = "pending"
 STATUS_APPROVED = "approved"
 STATUS_REJECTED = "rejected"
+STATUS_REVERSED = "reversed"   # an approval that turned out to be wrong (e.g. half-paid) and was undone
+
+PLAN_MONTHLY = "monthly"
+PLAN_YEARLY = "yearly"
+PLAN_DURATION_DAYS = {PLAN_MONTHLY: 30, PLAN_YEARLY: 365}
 
 
 # ---------------------------------------------------------------------------
-# CONFIG — the admin's UPI ID + monthly price (one shared config, not per-user)
+# CONFIG — the admin's UPI ID + monthly/yearly price (one shared config, not per-user)
 # ---------------------------------------------------------------------------
 def get_config() -> dict:
+    defaults = {"upi_id": "", "payee_name": "", "monthly_price": 299, "yearly_price": 2999}
     if not os.path.isfile(_CONFIG_FILE):
-        return {"upi_id": "", "payee_name": "", "monthly_price": 299}
+        return defaults
     try:
         with open(_CONFIG_FILE, "r") as f:
             cfg = json.load(f)
-        cfg.setdefault("upi_id", "")
-        cfg.setdefault("payee_name", "")
-        cfg.setdefault("monthly_price", 299)
+        for k, v in defaults.items():
+            cfg.setdefault(k, v)
         return cfg
     except Exception:
-        return {"upi_id": "", "payee_name": "", "monthly_price": 299}
+        return defaults
 
 
-def set_config(upi_id: str, payee_name: str, monthly_price: float):
+def set_config(upi_id: str, payee_name: str, monthly_price: float, yearly_price: float):
     os.makedirs(_STORE_DIR, exist_ok=True)
     cfg = {"upi_id": (upi_id or "").strip(), "payee_name": (payee_name or "").strip(),
-           "monthly_price": float(monthly_price)}
+           "monthly_price": float(monthly_price), "yearly_price": float(yearly_price)}
     tmp = _CONFIG_FILE + ".tmp"
     with open(tmp, "w") as f:
         json.dump(cfg, f)
@@ -121,7 +127,7 @@ def _save_requests(requests_list):
     os.replace(tmp, _REQUESTS_FILE)
 
 
-def submit_request(username: str, workspace_id: str, utr: str, amount: float) -> tuple:
+def submit_request(username: str, workspace_id: str, utr: str, amount: float, plan_type: str = PLAN_MONTHLY) -> tuple:
     """User submits proof-of-payment. Returns (ok, message). Blocks duplicate
     UTRs (accidental double-submit) and blocks a second PENDING request from
     the same user (edit/cancel the first instead of piling up)."""
@@ -134,9 +140,15 @@ def submit_request(username: str, workspace_id: str, utr: str, amount: float) ->
     if any(r["username"] == username and r["status"] == STATUS_PENDING for r in reqs):
         return False, "You already have a pending request awaiting approval — please wait for it to be reviewed."
     reqs.append({
-        "id": f"{int(time.time())}_{username}",
+        # A plain f"{timestamp}_{username}" ID used to collide when the same
+        # user submitted twice within the same second, which made Approve/
+        # Reject silently act on the WRONG (often already-decided) request.
+        # uuid4 is unique regardless of timing, no matter how fast requests
+        # come in.
+        "id": uuid.uuid4().hex,
         "username": username, "workspace_id": workspace_id,
-        "utr": utr, "amount": amount, "status": STATUS_PENDING,
+        "utr": utr, "amount": amount, "plan_type": plan_type if plan_type in PLAN_DURATION_DAYS else PLAN_MONTHLY,
+        "status": STATUS_PENDING,
         "submitted_at": time.time(), "decided_at": None,
     })
     _save_requests(reqs)
@@ -152,17 +164,38 @@ def list_requests(status: str = None):
 
 
 def decide_request(request_id: str, approve: bool):
-    """Admin action. Returns (ok, message, username-or-None). Caller (app.py)
-    is responsible for actually calling auth.set_plan(username, 'standard')
+    """Admin action. Returns (ok, message, username-or-None, plan_type-or-None).
+    Caller (app.py) is responsible for actually calling auth.set_plan(...)
     when approve=True — kept separate so this module has no dependency on
     auth.py."""
     reqs = _load_requests()
     for r in reqs:
         if r["id"] == request_id:
             if r["status"] != STATUS_PENDING:
-                return False, "This request was already decided.", None
+                return False, "This request was already decided.", None, None
             r["status"] = STATUS_APPROVED if approve else STATUS_REJECTED
             r["decided_at"] = time.time()
             _save_requests(reqs)
-            return True, ("Approved." if approve else "Rejected."), r["username"]
+            return True, ("Approved." if approve else "Rejected."), r["username"], r.get("plan_type", PLAN_MONTHLY)
+    return False, "Request not found.", None, None
+
+
+def reverse_decision(request_id: str):
+    """Undoes a mistaken APPROVAL mid-way — e.g. the UTR turned out to be for
+    a half payment, or was approved by mistake. Flips the request to
+    STATUS_REVERSED (kept in history, clearly distinguishable from a normal
+    approval/rejection) and tells the caller (app.py) which username needs
+    to be downgraded back off Standard. Only works on an already-APPROVED
+    request — rejecting a pending one doesn't need this, and re-reversing an
+    already-reversed one is a no-op (returns an error instead of silently
+    doing nothing, so the admin UI can show why the button didn't work)."""
+    reqs = _load_requests()
+    for r in reqs:
+        if r["id"] == request_id:
+            if r["status"] != STATUS_APPROVED:
+                return False, "Only an already-approved request can be reversed.", None
+            r["status"] = STATUS_REVERSED
+            r["reversed_at"] = time.time()
+            _save_requests(reqs)
+            return True, "Reversed — this account has been moved back off Standard.", r["username"]
     return False, "Request not found.", None
