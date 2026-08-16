@@ -717,7 +717,7 @@ def render_plan_comparison():
     st.markdown("### 🆓 Free  vs  💎 Standard")
     rows = [
         ("AI requests", f"{ul.FREE_PLAN_LIMITS['ai_calls']} per day", "Unlimited"),
-        ("PDF exports", f"{ul.FREE_PLAN_LIMITS['pdf_exports']} per day", "Unlimited"),
+        ("PDF exports", f"{ul.FREE_PLAN_LIMITS['pdf_exports']} per day, watermarked", "Unlimited, no watermark"),
         ("Data size", f"Up to {ul.FREE_PLAN_LIMITS['max_rows']:,} rows", "Unlimited rows"),
         ("How long it works", f"{auth.TRIAL_DAYS} days total, then access stops", "Forever"),
         ("Boss Dashboard, Custom Builder, Full Analysis", "✅ Included", "✅ Included"),
@@ -2000,7 +2000,9 @@ elif page == "⭐ Boss Dashboard":
         st.subheader("📄 Export")
         _pdf_remaining = ul.remaining(st.session_state.workspace_id, st.session_state.plan, "pdf_exports")
         if _pdf_remaining is not None:
-            st.caption(f"🆓 Free plan: {_pdf_remaining} PDF export(s) left today.")
+            st.caption(f"🆓 Free plan: {_pdf_remaining} PDF export(s) left today. "
+                      f"Free-plan PDFs carry a small watermark — upgrade to Standard for clean, "
+                      f"client-ready exports.")
         report_title = st.text_input("Report title", st.session_state.dashboard_name or "Sports Performance & Payments Report")
         subtitle = st.text_input("Subtitle", f"Prepared for management review — {pd.Timestamp.today().date()}")
         filters_summary = ", ".join(
@@ -2054,6 +2056,8 @@ elif page == "⭐ Boss Dashboard":
                     chart_items=[c for c in chart_png_items if c["png_bytes"]],
                     theme=pdf_theme,
                     filters_summary=filters_summary,
+                    watermark=("FREE TRIAL — UPGRADE FOR CLEAN REPORTS"
+                              if st.session_state.plan == "free" else None),
                 )
             st.download_button("📥 Click to download report.pdf", data=pdf_bytes,
                                 file_name="sports_analytics_report.pdf", mime="application/pdf",
