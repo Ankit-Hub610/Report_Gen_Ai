@@ -389,3 +389,120 @@ def render_pivot_table(display_df: pd.DataFrame, report: dict):
     """
     html = display_df.to_html(classes="pivot-table", index=False, border=0, na_rep="")
     st.markdown(css + f"<div class='pivot-wrap'>{html}</div>", unsafe_allow_html=True)
+
+
+# ==================================================================================
+# PIVOTCHART — a chart built directly from the pivot's own (already-aggregated,
+# already-grouped) result, same idea as Excel's PivotChart. Deliberately simple:
+# operates on raw_df (real numbers, not the Excel-formatted display strings) and
+# needs at least one Row field to have an x-axis to plot against.
+# ==================================================================================
+CHART_TYPES = ["Bar", "Line", "Pie"]
+
+
+def build_pivot_chart(raw_df: pd.DataFrame, report: dict, chart_type: str = "Bar"):
+    """Returns a plotly Figure, or None if there's nothing sensible to chart
+    (no Row field, or no numeric measure columns)."""
+    import plotly.graph_objects as go
+
+    rows = report.get("rows", [])
+    if not rows or raw_df is None or raw_df.empty:
+        return None
+
+    plot_df = raw_df[raw_df[rows[0]] != "Grand Total"].copy() if rows else raw_df.copy()
+    if plot_df.empty:
+        return None
+
+    if len(rows) == 1:
+        x_labels = plot_df[rows[0]].astype(str)
+    else:
+        x_labels = plot_df[rows].astype(str).agg(" / ".join, axis=1)
+
+    measure_cols = [c for c in plot_df.columns if c not in rows and pd.api.types.is_numeric_dtype(plot_df[c])]
+    if not measure_cols:
+        return None
+    # Keep charts readable — cap at 8 measure/series columns and 30 x-axis categories
+    measure_cols = measure_cols[:8]
+    if len(x_labels) > 30:
+        plot_df = plot_df.iloc[:30]
+        x_labels = x_labels.iloc[:30]
+
+    fig = go.Figure()
+    style = report.get("style", {})
+    palette = ["#2C6E49", "#3969AC", "#E68310", "#7F3C8D", "#11A579", "#F2B701", "#E73F74", "#80BA5A"]
+
+    if chart_type == "Pie":
+        # Pie only really makes sense for a single measure — use the first one
+        m = measure_cols[0]
+        fig.add_trace(go.Pie(labels=x_labels, values=plot_df[m], hole=0.35))
+        fig.update_layout(title=f"{report.get('title', 'Pivot')} — {m}")
+    else:
+        trace_cls = go.Bar if chart_type == "Bar" else go.Scatter
+        for i, m in enumerate(measure_cols):
+            kwargs = {"x": x_labels, "y": plot_df[m], "name": m}
+            if chart_type == "Bar":
+                kwargs["marker_color"] = palette[i % len(palette)]
+            else:
+                kwargs["mode"] = "lines+markers"
+                kwargs["line"] = dict(color=palette[i % len(palette)])
+            fig.add_trace(trace_cls(**kwargs))
+        fig.update_layout(barmode="group", title=report.get("title", "Pivot Chart"),
+                          xaxis_title=" / ".join(rows), legend_title_text="")
+
+    fig.update_layout(template="plotly_white", font=dict(size=style.get("font_size", 13)),
+                      margin=dict(l=40, r=20, t=50, b=40), height=420)
+    return fig
+
+
+# ==================================================================================
+# PDF EXPORT — table + optional chart, one pivot report per call. Kept
+# self-contained (own reportlab flow) rather than reusing pdf_export.py's
+# Boss-Dashboard-shaped report builder, since a pivot report's layout
+# (one table, optionally wide) is different enough to want its own simple flow.
+# ==================================================================================
+def export_pivot_pdf(report: dict, display_df: pd.DataFrame, chart_png_bytes: bytes = None) -> bytes:
+    import io
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.units import cm
+    from reportlab.lib import colors as rl_colors
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER
+
+    buf = io.BytesIO()
+    is_wide = len(display_df.columns) > 6
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4) if is_wide else A4,
+                            topMargin=1.5 * cm, bottomMargin=1.5 * cm, leftMargin=1.2 * cm, rightMargin=1.2 * cm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("PivotTitle", parent=styles["Title"], alignment=TA_CENTER,
+                                 textColor=rl_colors.HexColor(report.get("style", {}).get("header_bg", "#2C6E49")))
+    story = [Paragraph(report.get("title", "Pivot Report"), title_style), Spacer(1, 10)]
+
+    if chart_png_bytes:
+        story.append(RLImage(io.BytesIO(chart_png_bytes), width=24 * cm if is_wide else 16 * cm,
+                             height=(24 * cm if is_wide else 16 * cm) * 0.42))
+        story.append(Spacer(1, 14))
+
+    header_bg = rl_colors.HexColor(report.get("style", {}).get("header_bg", "#2C6E49"))
+    header_fc = rl_colors.HexColor(report.get("style", {}).get("header_font_color", "#FFFFFF"))
+    striped = report.get("style", {}).get("striped", True)
+
+    table_data = [list(display_df.columns)] + display_df.astype(str).values.tolist()
+    tbl = Table(table_data, repeatRows=1)
+    tstyle = [
+        ("BACKGROUND", (0, 0), (-1, 0), header_bg),
+        ("TEXTCOLOR", (0, 0), (-1, 0), header_fc),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.5, rl_colors.HexColor("#999999")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),   # grand-total row, if present
+    ]
+    if striped:
+        for r in range(1, len(table_data)):
+            if r % 2 == 0:
+                tstyle.append(("BACKGROUND", (0, r), (-1, r), rl_colors.HexColor("#F2F2F2")))
+    tbl.setStyle(TableStyle(tstyle))
+    story.append(tbl)
+
+    doc.build(story)
+    return buf.getvalue()
