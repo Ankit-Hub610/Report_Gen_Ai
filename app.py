@@ -42,9 +42,9 @@ from modules import ai_chat as ac
 from modules import email_service as es
 from modules import intel_engine as ie
 from modules import ppt_engine as ppt
-from modules import voice_engine as ve
 from modules import usage_limits as ul
 from modules import payments as pay
+from modules import pivot_engine as pv
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -52,12 +52,10 @@ try:
 except ImportError:
     AUTOREFRESH_AVAILABLE = False
 
-try:
-    from streamlit_mic_recorder import speech_to_text
-    MIC_AVAILABLE = True
-except ImportError:
-    MIC_AVAILABLE = False
-
+# 🎤 Voice assistant (mic input + text-to-speech) is temporarily disabled per
+# request — modules/voice_engine.py and the streamlit-mic-recorder dependency
+# are left untouched so this can be switched back on later without rebuilding
+# anything, just by restoring the UI block that used to call them.
 # ==================================================================================
 # PAGE CONFIG
 # ==================================================================================
@@ -145,6 +143,9 @@ def init_state():
     ss.setdefault("theme", copy.deepcopy(DEFAULT_THEME))
     ss.setdefault("dashboard_charts", [])   # list of dicts: {family, variant} chosen for Boss Dashboard
     ss.setdefault("pinned_kpis", [])        # list of kpi labels pinned to dashboard
+    ss.setdefault("pivot_reports", [])      # 📐 Pivot Table — list of pivot report dicts (see pivot_engine.py)
+    ss.setdefault("pinned_pivots", [])      # list of pivot report IDs pinned to the Boss Dashboard, plus their
+                                             # chosen chart type there: [{"report_id":.., "chart_type":"Bar"}]
     ss.setdefault("p1_kpi_filters", {})     # {kpi_label: [filter,...]} — per-card filters, Raw Analysis KPI cards
     ss.setdefault("p1_kpi_format", {})      # {kpi_label: format_code} — per-card NUMBER FORMAT (e.g. one card
                                              # shows "58.18 L", another shows "5,818,432.00", another "12.3%") —
@@ -182,10 +183,7 @@ def init_state():
     # 📈 Full Analysis page
     ss.setdefault("intel_role_overrides", {})   # user-confirmed column-role mapping (persisted)
     ss.setdefault("intel_language", "English")  # persisted — last-picked narrative language
-    ss.setdefault("assistant_name", None)   # None = show "री" (see voice_engine.get_assistant_name)
-    ss.setdefault("voice_language", "English")  # persisted — last-picked voice assistant language
-    ss.setdefault("ai_page_draft", "")   # session-only — the AI Assistant page's own typed/spoken question box
-    ss.setdefault("ai_page_voice_last_heard", None)  # session-only — dedupe guard for the AI Assistant page mic
+    ss.setdefault("ai_page_draft", "")   # session-only — the AI Assistant page's own typed question box
     ss.setdefault("intel_action_checks", [])    # persisted — [{text, done}] Top-Actions tracker
     ss.setdefault("intel_part", 1)              # session-only — which half of the report is showing (1 or 2)
     ss.setdefault("_intel_cache_key", None)     # session-only — fingerprint of last-computed facts
@@ -1571,7 +1569,7 @@ with st.sidebar:
     sync_workspace_from_disk()
 
     nav_options = ["📥 Connect Data", "📊 Raw Analysis", "🧩 Custom Builder", "⭐ Boss Dashboard",
-                    "📈 Full Analysis", "🗂 Data Table", "🤖 AI Assistant", "⚙️ Settings", "💎 Plans"]
+                    "📈 Full Analysis", "🗂 Data Table", "📐 Pivot Table", "🤖 AI Assistant", "⚙️ Settings", "💎 Plans"]
     # "💡 Business Insights" only makes sense for datasets that actually have a
     # Payment Page Title-shaped column (e.g. "Badminton AMD Mondays") - this app
     # is used by many different clients with unrelated datasets, so the tab
@@ -2082,7 +2080,7 @@ elif page == "⭐ Boss Dashboard":
     st.subheader("Selected Charts")
     chart_png_items = []
 
-    if not st.session_state.dashboard_charts and not pinned_custom_charts:
+    if not st.session_state.dashboard_charts and not pinned_custom_charts and not st.session_state.pinned_pivots:
         st.info("No charts selected yet. Go to Raw Analysis and click ⭐ Add to Boss Dashboard on any chart, "
                 "or build & pin your own on the Custom Builder page.")
     else:
@@ -2149,6 +2147,35 @@ elif page == "⭐ Boss Dashboard":
 
                 chart_png_items.append({"title": variant.get("title", fam), "insight": insight,
                                          "fig": fig, "type": fam})
+
+        if st.session_state.pinned_pivots:
+            for pin in list(st.session_state.pinned_pivots):
+                report = next((r for r in st.session_state.pivot_reports if r["id"] == pin["report_id"]), None)
+                if report is None:
+                    continue  # the report behind this pin was deleted — silently drop it, nothing to show
+                box = st.container(border=True)
+                with box:
+                    top1, top3 = st.columns([8, 1])
+                    with top1:
+                        st.markdown(f"**📐 {report.get('title', 'Pivot Report')}**")
+                    with top3:
+                        if can_edit_dashboard() and st.button("🗑️", key=f"rm_pivot_{report['id']}", help="Unpin from dashboard"):
+                            st.session_state.pinned_pivots = [p for p in st.session_state.pinned_pivots
+                                                              if p["report_id"] != report["id"]]
+                            ws.save_light(st.session_state, st.session_state.workspace_id)
+                            st.rerun()
+                    display_df_pin, raw_df_pin, err_pin = pv.build_pivot_table(df, report)
+                    if err_pin:
+                        st.warning(err_pin)
+                        continue
+                    pv.render_pivot_table(display_df_pin, report)
+                    fig_pin = pv.build_pivot_chart(raw_df_pin, report, report.get("chart_type", "Bar"))
+                    if fig_pin is not None:
+                        fig_pin = _render_chart_with_zoom(fig_pin, zoom_key=f"pivot_{report['id']}",
+                                                           widget_key=f"p2_pivot_{report['id']}",
+                                                           editable=can_edit_dashboard())
+                        chart_png_items.append({"title": report.get("title", "Pivot Report"),
+                                                "insight": "Pivot table summary.", "fig": fig_pin, "type": "Pivot"})
 
         st.divider()
         st.subheader("📄 Export")
@@ -2987,6 +3014,118 @@ elif page == "🗂 Data Table":
 
 
 # ==================================================================================
+# PAGE 3.4: PIVOT TABLE — Excel-style pivot builder (Rows/Columns/Measures),
+# PivotChart, pin-to-Boss-Dashboard, PDF export.
+# ==================================================================================
+elif page == "📐 Pivot Table":
+    st.title("📐 Pivot Table")
+    st.caption("Excel-style pivot: pick Rows / Columns / Measures, add filters or computed columns, "
+              "then chart the result and optionally pin it to your Boss Dashboard.")
+
+    if st.session_state.df_raw is None:
+        st.info("Load data on the **📥 Connect Data** page first.")
+        st.stop()
+
+    df_raw = st.session_state.df_raw
+    meta = st.session_state.meta
+    df = render_filters(df_raw, meta, key_prefix="pvt_")
+
+    reports = st.session_state.pivot_reports
+    editable = can_edit()
+
+    top_l, top_r = st.columns([4, 1])
+    with top_r:
+        if st.button("➕ New pivot report", use_container_width=True, disabled=not editable):
+            reports.append(pv.new_pivot_report(df))
+            ws.save_light(st.session_state, st.session_state.workspace_id)
+            st.rerun()
+
+    if not reports:
+        st.info("No pivot reports yet — click **➕ New pivot report** to build your first one.")
+        st.stop()
+
+    report_tabs = st.tabs([r["title"] or "Untitled" for r in reports])
+    for report, tab in zip(reports, report_tabs):
+        with tab:
+            with st.expander("🛠️ Build this pivot", expanded=not report.get("measures")):
+                pv.render_pivot_builder(df, report, key_prefix="pvt_")
+                st.divider()
+                st.markdown("**Style**")
+                pv.render_pivot_style_editor(report, key_prefix="pvt_")
+
+            display_df, raw_df, err = pv.build_pivot_table(df, report)
+            if err:
+                st.warning(err)
+                del_col, _ = st.columns([1, 5])
+                with del_col:
+                    if editable and st.button("🗑️ Delete this report", key=f"pvt_del_empty_{report['id']}"):
+                        reports.remove(report)
+                        st.session_state.pinned_pivots = [p for p in st.session_state.pinned_pivots
+                                                          if p["report_id"] != report["id"]]
+                        ws.save_light(st.session_state, st.session_state.workspace_id)
+                        st.rerun()
+                continue
+
+            pv.render_header_rename_ui(report, display_df, key_prefix="pvt_")
+            pv.render_pivot_table(display_df, report)
+
+            st.divider()
+            chart_col, action_col = st.columns([2, 3])
+            with chart_col:
+                report["chart_type"] = st.selectbox("PivotChart type", pv.CHART_TYPES,
+                                                     index=pv.CHART_TYPES.index(report.get("chart_type", "Bar"))
+                                                     if report.get("chart_type") in pv.CHART_TYPES else 0,
+                                                     key=f"pvt_charttype_{report['id']}")
+            fig = pv.build_pivot_chart(raw_df, report, report.get("chart_type", "Bar"))
+            if fig is not None:
+                st.plotly_chart(fig, use_container_width=True, key=f"pvt_chart_{report['id']}", config=ce.PLOTLY_CONFIG)
+            else:
+                st.caption("Add at least one Row field to see a PivotChart here.")
+
+            st.divider()
+            is_pinned = any(p["report_id"] == report["id"] for p in st.session_state.pinned_pivots)
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                if not is_pinned:
+                    if st.button("📌 Pin to Boss Dashboard", key=f"pvt_pin_{report['id']}",
+                                use_container_width=True, disabled=not editable):
+                        st.session_state.pinned_pivots.append({"report_id": report["id"],
+                                                                "chart_type": report.get("chart_type", "Bar")})
+                        ws.save_light(st.session_state, st.session_state.workspace_id)
+                        st.rerun()
+                else:
+                    if st.button("📌 Unpin from Boss Dashboard", key=f"pvt_unpin_{report['id']}",
+                                use_container_width=True, disabled=not editable):
+                        st.session_state.pinned_pivots = [p for p in st.session_state.pinned_pivots
+                                                          if p["report_id"] != report["id"]]
+                        ws.save_light(st.session_state, st.session_state.workspace_id)
+                        st.rerun()
+            with b2:
+                if st.button("⬇️ Download PDF", key=f"pvt_pdf_{report['id']}", use_container_width=True):
+                    pdf_ok, pdf_limit_msg = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "pdf_exports")
+                    if not pdf_ok:
+                        st.error(f"🚫 {pdf_limit_msg}")
+                    else:
+                        chart_png = None
+                        if fig is not None:
+                            try:
+                                chart_png = fig.to_image(format="png", width=1200, height=560, scale=2)
+                            except Exception:
+                                chart_png = None  # PDF still generates fine without the chart image
+                        pdf_bytes = pv.export_pivot_pdf(report, display_df, chart_png)
+                        st.download_button("📥 Click to save PDF", data=pdf_bytes,
+                                          file_name=f"{(report['title'] or 'pivot_report').replace(' ', '_')}.pdf",
+                                          mime="application/pdf", key=f"pvt_pdf_dl_{report['id']}")
+            with b3:
+                if editable and st.button("🗑️ Delete report", key=f"pvt_del_{report['id']}", use_container_width=True):
+                    reports.remove(report)
+                    st.session_state.pinned_pivots = [p for p in st.session_state.pinned_pivots
+                                                      if p["report_id"] != report["id"]]
+                    ws.save_light(st.session_state, st.session_state.workspace_id)
+                    st.rerun()
+
+
+# ==================================================================================
 # PAGE 3.5: AI ASSISTANT — free chat with your data (OpenRouter free tier)
 # ==================================================================================
 elif page == "🤖 AI Assistant":
@@ -3041,28 +3180,16 @@ elif page == "🤖 AI Assistant":
 
     for _turn_i, turn in enumerate(st.session_state.ai_chat_history):
         with st.chat_message(turn["role"]):
-            if turn["role"] == "assistant":
-                _tc1, _tc2 = st.columns([10, 1])
-                with _tc1:
-                    st.markdown(turn["content"])
-                with _tc2:
-                    if st.button("🔊", key=f"ai_hist_read_{_turn_i}", help="Jawab sunaiye"):
-                        st.components.v1.html(ve.tts_html(turn["content"], ve.LANG_CODES.get(
-                            st.session_state.get("voice_language", "English"), "en-IN")), height=0)
-            else:
-                st.markdown(turn["content"])
+            st.markdown(turn["content"])
             if turn.get("proof_df") is not None:
                 with st.expander("🔍 Proof (SQL + data used)"):
                     st.code(turn["sql_used"], language="sql")
                     st.dataframe(turn["proof_df"], use_container_width=True)
 
-    # One unified pill-shaped input box (Claude-style) instead of separate boxes —
-    # text field + language + mic + send all live inside ONE bordered/rounded
-    # container. Scoped CSS below strips the individual text-input/button borders
-    # so only the outer container's border shows, making it read as a single box.
-    # (The mic button itself renders inside its own iframe — a hard limitation of
-    # that component — so it can't be borderless like the rest, but it's tucked
-    # tightly against the send button so it still reads as one input group.)
+    # One unified pill-shaped input box (Claude-style) — text field + send
+    # button live inside ONE bordered/rounded container. Scoped CSS below
+    # strips the individual text-input/button borders so only the outer
+    # container's border shows, making it read as a single clean box.
     st.session_state.setdefault("ai_page_draft", "")
     st.markdown("""
         <style>
@@ -3082,32 +3209,14 @@ elif page == "🤖 AI Assistant":
     """, unsafe_allow_html=True)
 
     with st.container(key="ai_unified_input", border=True):
-        text_col, lang_col, mic_col, send_col = st.columns([6, 1.6, 0.8, 0.8], vertical_alignment="center")
+        text_col, send_col = st.columns([9, 1], vertical_alignment="center")
         with text_col:
             st.session_state.ai_page_draft = st.text_input(
                 "Ask", value=st.session_state.ai_page_draft, key="ai_page_draft_box",
-                placeholder="Likho, bolo, ya poochiye kuch bhi...", label_visibility="collapsed")
-        with lang_col:
-            _voice_lang_label = st.session_state.get("voice_language", "English")
-            if _voice_lang_label not in ve.LANG_CODES:
-                _voice_lang_label = "English"
-                st.session_state.voice_language = _voice_lang_label
-            st.session_state.voice_language = st.selectbox(
-                "Language", list(ve.LANG_CODES.keys()), index=list(ve.LANG_CODES.keys()).index(_voice_lang_label),
-                key="ai_page_voice_lang", label_visibility="collapsed")
-        with mic_col:
-            if MIC_AVAILABLE:
-                _raw_transcript = speech_to_text(language=ve.LANG_CODES[st.session_state.voice_language],
-                                                 start_prompt="🎤", stop_prompt="⏹️", just_once=True,
-                                                 use_container_width=True, key="ai_page_stt")
-                if _raw_transcript and _raw_transcript != st.session_state.get("ai_page_voice_last_heard"):
-                    st.session_state.ai_page_voice_last_heard = _raw_transcript
-                    st.session_state.ai_page_draft = _raw_transcript
-            else:
-                st.caption("🎤⚠️")
+                placeholder="Ask anything about your data...", label_visibility="collapsed")
         with send_col:
             _send_clicked = st.button("🚀", key="ai_page_send_btn", type="primary", use_container_width=True,
-                                      disabled=not st.session_state.ai_page_draft.strip(), help="Poochiye")
+                                      disabled=not st.session_state.ai_page_draft.strip(), help="Send")
 
     question = st.session_state.ai_page_draft.strip() if _send_clicked else None
     if question:
@@ -3127,13 +3236,7 @@ elif page == "🤖 AI Assistant":
             if result["error"]:
                 st.error(result["error"])
             else:
-                _ac1, _ac2 = st.columns([10, 1])
-                with _ac1:
-                    st.markdown(result["answer"])
-                with _ac2:
-                    if st.button("🔊", key="ai_fresh_read", help="Jawab sunaiye"):
-                        st.components.v1.html(ve.tts_html(result["answer"], ve.LANG_CODES.get(
-                            st.session_state.get("voice_language", "English"), "en-IN")), height=0)
+                st.markdown(result["answer"])
                 if result["proof_df"] is not None:
                     with st.expander("🔍 Proof (SQL + data used)"):
                         st.code(result["sql_used"], language="sql")
@@ -3360,23 +3463,6 @@ elif page == "⚙️ Settings":
                             st.error(str(e))
 
     with tab_defaults:
-        if st.session_state.role in (auth.ROLE_CLIENT, auth.ROLE_ADMIN):
-            st.subheader("🎤 Voice Assistant Name")
-            if st.session_state.plan == "standard" or st.session_state.role == auth.ROLE_ADMIN:
-                st.caption("This is the name shown/spoken on the 🎤 voice assistant "
-                           "(Full Analysis, Business Insights, Boss Dashboard). Leave blank for the default, 'री'.")
-                _new_assistant_name = st.text_input("Assistant name", value=st.session_state.assistant_name or "",
-                                                     placeholder="री", key="assistant_name_input")
-                if st.button("💾 Save assistant name", key="save_assistant_name"):
-                    st.session_state.assistant_name = _new_assistant_name.strip() or None
-                    ws.save_light(st.session_state, st.session_state.workspace_id)
-                    st.success(f"Saved — assistant will now be called "
-                               f"'{ve.get_assistant_name('standard', st.session_state.assistant_name)}'.")
-            else:
-                st.caption(f"On the Free plan, the voice assistant is always called "
-                           f"**'{ve.DEFAULT_ASSISTANT_NAME}'**. Custom naming is a 💎 Standard-plan perk.")
-            st.divider()
-
         if st.session_state.role == auth.ROLE_ADMIN:
             st.subheader("App Branding")
             st.caption("The title shown at the top of the sidebar for **every account** on this app "
@@ -3656,21 +3742,6 @@ report, without you writing a single formula.
 - Chat history is saved per workspace and auto-deleted after 5 days.
 - Free-plan accounts get a limited number of AI requests per day (see 💎 Plans);
   Standard is unlimited.
-
-**🎤 Voice Assistant (new)**
-- Appears as a "🎤 <name>" section on Full Analysis, Business Insights, and
-  Boss Dashboard. Default name is **"री"** — Standard-plan clients can rename
-  it in Settings.
-- **🎤 Push-to-talk Q&A**: tap the mic, ask a question out loud, the answer
-  comes back both written and spoken — same SQL-grounded engine as 🤖 AI
-  Assistant, just by voice.
-- **▶️ Guided Walkthrough**: steps through that page's key numbers out loud,
-  one point at a time (Play / Next / Previous) — built entirely from data
-  already on the page, nothing invented.
-- Supports **English, Hindi, and Gujarati**. English and Hindi recognize/speak
-  reliably in most browsers; Gujarati support depends on the browser/device
-  and may be less consistent — that's a browser/OS limitation, not something
-  this app controls.
 
 **⚙️ Settings**
 - Reset the default look of the Boss Dashboard, change your own password, and
