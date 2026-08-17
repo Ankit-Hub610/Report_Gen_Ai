@@ -3035,7 +3035,8 @@ elif page == "🗂 Data Table":
 elif page == "📐 Pivot Table":
     st.title("📐 Pivot Table")
     st.caption("Excel-style pivot: pick Rows / Columns / Measures, add filters or computed columns, "
-              "then chart the result and optionally pin it to your Boss Dashboard.")
+              "then chart the result and optionally pin it to your Boss Dashboard. Plus fully independent "
+              "KPI cards — see 🎴 Build cards below.")
 
     if st.session_state.df_raw is None:
         st.info("Load data on the **📥 Connect Data** page first.")
@@ -3048,8 +3049,8 @@ elif page == "📐 Pivot Table":
     st.info(
         "**📌 Base data:** same as **🗂 Data Table** — your full loaded dataset, narrowed by any filters "
         "you set right above (⬆️). Nothing else to 'select' — that filtered set IS the range.\n\n"
-        "**How to build one, step by step** (just like Excel's PivotTable Field List):\n"
-        "1. Click **🛠️ Build this pivot** below to open the field list.\n"
+        "**How to build the table, step by step** (just like Excel's PivotTable Field List):\n"
+        "1. Click **🛠️ Build this pivot (table)** below to open the field list.\n"
         "2. Under **Rows** or **Columns**, pick 1+ fields (e.g. Rows = `sport`, Columns = `payment_status`) "
         "— this is exactly like dragging a field into Excel's Rows/Columns boxes.\n"
         "3. Under **Measures**, click **➕ Add measure**, then pick a Column + Aggregation (e.g. "
@@ -3057,7 +3058,12 @@ elif page == "📐 Pivot Table":
         "4. The table appears automatically the moment you've picked at least one Row/Column field "
         "AND one measure. No separate 'run' button needed.\n"
         "5. Once it appears, scroll down for a **matching chart**, and buttons to turn it into a "
-        "**card** or **pin it to the Boss Dashboard**."
+        "**card** or **pin it to the Boss Dashboard**.\n\n"
+        "**🎴 Cards are separate** — open **🎴 Build cards** to add standalone KPI cards, each with its "
+        "own Column + Aggregation (e.g. 'Distinct Count of department') that doesn't need to be part of "
+        "the table at all. **Filters work in two layers:** the filter inside 🛠️ Build this pivot (table) "
+        "is *shared* — it narrows the table, the chart, AND every card. Each card can ALSO have its own "
+        "extra filter on top, just for that one card."
     )
 
     reports = st.session_state.pivot_reports
@@ -3077,11 +3083,31 @@ elif page == "📐 Pivot Table":
     report_tabs = st.tabs([r["title"] or "Untitled" for r in reports])
     for report, tab in zip(reports, report_tabs):
         with tab:
-            with st.expander("🛠️ Build this pivot", expanded=not report.get("measures")):
+            with st.expander("🛠️ Build this pivot (table)", expanded=not report.get("measures")):
                 pv.render_pivot_builder(df, report, key_prefix="pvt_")
                 st.divider()
                 st.markdown("**Style**")
                 pv.render_pivot_style_editor(report, key_prefix="pvt_")
+
+            with st.expander("🎴 Build cards (independent of the table above)",
+                             expanded=bool(report.get("global_measures"))):
+                st.caption("Each card is its own Column + Aggregation — it doesn't need to match anything "
+                          "used in the table's Rows/Columns/Measures. Every card also gets its own optional "
+                          "filter on top of the shared filter below (applies to the table, chart, and every card).")
+                pv.render_global_measures_builder(df, report, key_prefix="pvt_")
+
+            _cards = pv.compute_global_measures(df, report)
+            if _cards:
+                st.markdown("**🎴 Cards**")
+                ccols = st.columns(min(len(_cards), 4))
+                for _i, _c in enumerate(_cards):
+                    with ccols[_i % len(ccols)]:
+                        if _c["error"]:
+                            st.metric(_c["label"], "—")
+                            st.caption(f"⚠️ {_c['error']}")
+                        else:
+                            st.metric(_c["label"], _c["value"])
+                st.divider()
 
             display_df, raw_df, err = pv.build_pivot_table(df, report)
             if err:
@@ -3095,15 +3121,6 @@ elif page == "📐 Pivot Table":
                         ws.save_light(st.session_state, st.session_state.workspace_id)
                         st.rerun()
                 continue
-
-            _totals = pv.measure_grand_totals(raw_df, report)
-            if _totals:
-                st.markdown("**📇 At a glance**")
-                tcols = st.columns(min(len(_totals), 4))
-                for _i, _t in enumerate(_totals):
-                    with tcols[_i % len(tcols)]:
-                        st.metric(_t["label"], _t["value"])
-                st.divider()
 
             pv.render_header_rename_ui(report, display_df, key_prefix="pvt_")
             pv.render_pivot_table(display_df, report)
