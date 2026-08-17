@@ -184,7 +184,7 @@ def init_state():
     ss.setdefault("intel_language", "English")  # persisted — last-picked narrative language
     ss.setdefault("assistant_name", None)   # None = show "री" (see voice_engine.get_assistant_name)
     ss.setdefault("voice_language", "English")  # persisted — last-picked voice assistant language
-    ss.setdefault("ai_page_voice_pending", None)   # session-only — a freshly-captured mic transcript waiting to be asked
+    ss.setdefault("ai_page_draft", "")   # session-only — the AI Assistant page's own typed/spoken question box
     ss.setdefault("ai_page_voice_last_heard", None)  # session-only — dedupe guard for the AI Assistant page mic
     ss.setdefault("intel_action_checks", [])    # persisted — [{text, done}] Top-Actions tracker
     ss.setdefault("intel_part", 1)              # session-only — which half of the report is showing (1 or 2)
@@ -3039,33 +3039,6 @@ elif page == "🤖 AI Assistant":
     if _ai_remaining_top is not None:
         st.caption(f"🆓 Free plan: {_ai_remaining_top} AI request(s) left today.")
 
-    # ---- Mic: own properly-sized row (a tiny cramped column previously made the
-    # "click again to stop recording" step unreliable, so it would start listening
-    # but never actually produce a transcript). Answers always show as TEXT below —
-    # each one gets its own 🔊 button, nothing is spoken automatically. ----
-    if MIC_AVAILABLE:
-        _voice_lang_label = st.session_state.get("voice_language", "English")
-        if _voice_lang_label not in ve.LANG_CODES:
-            _voice_lang_label = "English"
-            st.session_state.voice_language = _voice_lang_label
-        mic_col, lang_col = st.columns([3, 1.3])
-        with mic_col:
-            _raw_transcript = speech_to_text(language=ve.LANG_CODES[_voice_lang_label], start_prompt="🎤 Bolo",
-                                             stop_prompt="⏹️ Ruko (bolna khatam hote hi dabao)",
-                                             just_once=True, use_container_width=True, key="ai_page_stt")
-        with lang_col:
-            st.session_state.voice_language = st.selectbox(
-                "Language", list(ve.LANG_CODES.keys()), index=list(ve.LANG_CODES.keys()).index(_voice_lang_label),
-                key="ai_page_voice_lang", label_visibility="collapsed")
-        _voice_lang_code = ve.LANG_CODES[st.session_state.voice_language]
-        # Same dedupe as the on-page assistant: a stale transcript can otherwise
-        # keep re-firing on unrelated reruns.
-        if _raw_transcript and _raw_transcript != st.session_state.get("ai_page_voice_last_heard"):
-            st.session_state.ai_page_voice_last_heard = _raw_transcript
-            st.session_state.ai_page_voice_pending = _raw_transcript
-    else:
-        st.caption("⚠️ Voice needs the `streamlit-mic-recorder` package — not installed here yet.")
-
     for _turn_i, turn in enumerate(st.session_state.ai_chat_history):
         with st.chat_message(turn["role"]):
             if turn["role"] == "assistant":
@@ -3083,11 +3056,46 @@ elif page == "🤖 AI Assistant":
                     st.code(turn["sql_used"], language="sql")
                     st.dataframe(turn["proof_df"], use_container_width=True)
 
-    question = st.chat_input("e.g. \"Which record is number 5?\" or \"What's the trend over the last 3 months?\"")
-    # A freshly-captured voice transcript is asked exactly the same way as typed text.
-    if not question and st.session_state.get("ai_page_voice_pending"):
-        question = st.session_state.ai_page_voice_pending
-        st.session_state.ai_page_voice_pending = None
+    # A normal (non-floating) input row instead of st.chat_input — st.chat_input always
+    # docks to the very bottom of the browser viewport no matter where it's called from,
+    # which is exactly why the mic (placed naturally in the page flow) and the text box
+    # (pinned far below it) ended up looking split apart. This keeps mic + text + send
+    # together, directly under the conversation.
+    st.session_state.setdefault("ai_page_draft", "")
+    if MIC_AVAILABLE:
+        _voice_lang_label = st.session_state.get("voice_language", "English")
+        if _voice_lang_label not in ve.LANG_CODES:
+            _voice_lang_label = "English"
+            st.session_state.voice_language = _voice_lang_label
+        mic_col, lang_col = st.columns([3, 1.3])
+        with mic_col:
+            _raw_transcript = speech_to_text(language=ve.LANG_CODES[_voice_lang_label], start_prompt="🎤 Bolo",
+                                             stop_prompt="⏹️ Ruko (bolna khatam hote hi dabao)",
+                                             just_once=True, use_container_width=True, key="ai_page_stt")
+        with lang_col:
+            st.session_state.voice_language = st.selectbox(
+                "Language", list(ve.LANG_CODES.keys()), index=list(ve.LANG_CODES.keys()).index(_voice_lang_label),
+                key="ai_page_voice_lang", label_visibility="collapsed")
+        # A stale transcript can otherwise keep re-firing on unrelated reruns.
+        if _raw_transcript and _raw_transcript != st.session_state.get("ai_page_voice_last_heard"):
+            st.session_state.ai_page_voice_last_heard = _raw_transcript
+            st.session_state.ai_page_draft = _raw_transcript
+    else:
+        st.caption("⚠️ Voice needs the `streamlit-mic-recorder` package — not installed here yet.")
+
+    input_col, send_col = st.columns([7, 1])
+    with input_col:
+        st.session_state.ai_page_draft = st.text_input(
+            "Ask", value=st.session_state.ai_page_draft, key="ai_page_draft_box",
+            placeholder="e.g. \"Which record is number 5?\" or \"What's the trend over the last 3 months?\"",
+            label_visibility="collapsed")
+    with send_col:
+        _send_clicked = st.button("🚀 Poochiye", key="ai_page_send_btn", type="primary", use_container_width=True,
+                                  disabled=not st.session_state.ai_page_draft.strip())
+
+    question = st.session_state.ai_page_draft.strip() if _send_clicked else None
+    if question:
+        st.session_state.ai_page_draft = ""
     if question:
         st.session_state.ai_chat_history.append({"role": "user", "content": question, "ts": time.time()})
         with st.chat_message("user"):
