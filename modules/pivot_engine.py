@@ -240,6 +240,35 @@ def build_pivot_table(df: pd.DataFrame, report: dict):
     return display_df, raw_df, None
 
 
+def measure_grand_totals(raw_df: pd.DataFrame, report: dict) -> list:
+    """One KPI-card's worth of data per measure — the grand total, Excel-
+    formatted the same way the table itself formats that measure. Backs the
+    card strip shown above the pivot table, so the headline numbers are
+    visible at a glance before scrolling into the row/column detail."""
+    if raw_df is None or raw_df.empty:
+        return []
+    row_aliases = report.get("rows", [])
+    overrides = report.get("header_overrides", {})
+    body = raw_df
+    if row_aliases and row_aliases[0] in raw_df.columns:
+        body = raw_df[raw_df[row_aliases[0]] != "Grand Total"]
+    cards = []
+    for m in report.get("measures", []):
+        lbl = overrides.get(m.get("_resolved_label"), m.get("_resolved_label"))
+        if not lbl:
+            continue
+        matching_cols = [c for c in body.columns
+                          if (str(c) == lbl or str(c).startswith(str(lbl) + " | "))
+                          and pd.api.types.is_numeric_dtype(body[c])]
+        if not matching_cols:
+            continue
+        total = body[matching_cols].sum().sum()
+        fmt_code = ms.NUMBER_FORMAT_PRESETS.get(m.get("number_format", "Auto (Cr / L / K)"), "auto")
+        cards.append({"label": lbl, "value": ms.format_value(total, fmt_code, m.get("custom_format_code", "")),
+                      "raw_value": total})
+    return cards
+
+
 # ==================================================================================
 # BUILDER UI
 # ==================================================================================
