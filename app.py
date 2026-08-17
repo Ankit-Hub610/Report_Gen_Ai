@@ -3056,42 +3056,58 @@ elif page == "🤖 AI Assistant":
                     st.code(turn["sql_used"], language="sql")
                     st.dataframe(turn["proof_df"], use_container_width=True)
 
-    # A normal (non-floating) input row instead of st.chat_input — st.chat_input always
-    # docks to the very bottom of the browser viewport no matter where it's called from,
-    # which is exactly why the mic (placed naturally in the page flow) and the text box
-    # (pinned far below it) ended up looking split apart. This keeps mic + text + send
-    # together, directly under the conversation.
+    # One unified pill-shaped input box (Claude-style) instead of separate boxes —
+    # text field + language + mic + send all live inside ONE bordered/rounded
+    # container. Scoped CSS below strips the individual text-input/button borders
+    # so only the outer container's border shows, making it read as a single box.
+    # (The mic button itself renders inside its own iframe — a hard limitation of
+    # that component — so it can't be borderless like the rest, but it's tucked
+    # tightly against the send button so it still reads as one input group.)
     st.session_state.setdefault("ai_page_draft", "")
-    if MIC_AVAILABLE:
-        _voice_lang_label = st.session_state.get("voice_language", "English")
-        if _voice_lang_label not in ve.LANG_CODES:
-            _voice_lang_label = "English"
-            st.session_state.voice_language = _voice_lang_label
-        mic_col, lang_col = st.columns([3, 1.3])
-        with mic_col:
-            _raw_transcript = speech_to_text(language=ve.LANG_CODES[_voice_lang_label], start_prompt="🎤 Bolo",
-                                             stop_prompt="⏹️ Ruko (bolna khatam hote hi dabao)",
-                                             just_once=True, use_container_width=True, key="ai_page_stt")
+    st.markdown("""
+        <style>
+        div[data-testid="stVerticalBlockBorderWrapper"]:has(div.st-key-ai_unified_input) {
+            border-radius: 26px !important; padding: 6px 10px !important;
+        }
+        div.st-key-ai_unified_input div[data-testid="stTextInput"] > div {
+            border: none !important; background: transparent !important; box-shadow: none !important;
+        }
+        div.st-key-ai_unified_input div[data-testid="stTextInput"] input {
+            background: transparent !important;
+        }
+        div.st-key-ai_unified_input button {
+            border-radius: 50% !important; height: 2.4rem !important; width: 2.4rem !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    with st.container(key="ai_unified_input", border=True):
+        text_col, lang_col, mic_col, send_col = st.columns([6, 1.6, 0.8, 0.8], vertical_alignment="center")
+        with text_col:
+            st.session_state.ai_page_draft = st.text_input(
+                "Ask", value=st.session_state.ai_page_draft, key="ai_page_draft_box",
+                placeholder="Likho, bolo, ya poochiye kuch bhi...", label_visibility="collapsed")
         with lang_col:
+            _voice_lang_label = st.session_state.get("voice_language", "English")
+            if _voice_lang_label not in ve.LANG_CODES:
+                _voice_lang_label = "English"
+                st.session_state.voice_language = _voice_lang_label
             st.session_state.voice_language = st.selectbox(
                 "Language", list(ve.LANG_CODES.keys()), index=list(ve.LANG_CODES.keys()).index(_voice_lang_label),
                 key="ai_page_voice_lang", label_visibility="collapsed")
-        # A stale transcript can otherwise keep re-firing on unrelated reruns.
-        if _raw_transcript and _raw_transcript != st.session_state.get("ai_page_voice_last_heard"):
-            st.session_state.ai_page_voice_last_heard = _raw_transcript
-            st.session_state.ai_page_draft = _raw_transcript
-    else:
-        st.caption("⚠️ Voice needs the `streamlit-mic-recorder` package — not installed here yet.")
-
-    input_col, send_col = st.columns([7, 1])
-    with input_col:
-        st.session_state.ai_page_draft = st.text_input(
-            "Ask", value=st.session_state.ai_page_draft, key="ai_page_draft_box",
-            placeholder="e.g. \"Which record is number 5?\" or \"What's the trend over the last 3 months?\"",
-            label_visibility="collapsed")
-    with send_col:
-        _send_clicked = st.button("🚀 Poochiye", key="ai_page_send_btn", type="primary", use_container_width=True,
-                                  disabled=not st.session_state.ai_page_draft.strip())
+        with mic_col:
+            if MIC_AVAILABLE:
+                _raw_transcript = speech_to_text(language=ve.LANG_CODES[st.session_state.voice_language],
+                                                 start_prompt="🎤", stop_prompt="⏹️", just_once=True,
+                                                 use_container_width=True, key="ai_page_stt")
+                if _raw_transcript and _raw_transcript != st.session_state.get("ai_page_voice_last_heard"):
+                    st.session_state.ai_page_voice_last_heard = _raw_transcript
+                    st.session_state.ai_page_draft = _raw_transcript
+            else:
+                st.caption("🎤⚠️")
+        with send_col:
+            _send_clicked = st.button("🚀", key="ai_page_send_btn", type="primary", use_container_width=True,
+                                      disabled=not st.session_state.ai_page_draft.strip(), help="Poochiye")
 
     question = st.session_state.ai_page_draft.strip() if _send_clicked else None
     if question:
