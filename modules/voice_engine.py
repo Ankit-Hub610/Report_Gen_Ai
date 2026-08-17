@@ -54,22 +54,46 @@ def get_assistant_name(plan: str, custom_name: str = None) -> str:
 # ---------------------------------------------------------------------------
 # TEXT-TO-SPEECH — tiny JS snippet, rendered via st.components.v1.html
 # ---------------------------------------------------------------------------
-def tts_html(text: str, lang_code: str, height: int = 0) -> str:
+VOICE_QUALITY_OPTIONS = {
+    "🌟 Best quality (natural-sounding, needs internet)": True,
+    "⚡ System default (works offline, more robotic)": False,
+}
+
+
+def tts_html(text: str, lang_code: str, rate: float = 1.0, pitch: float = 1.0,
+             prefer_quality: bool = True, height: int = 0) -> str:
     """Speaks `text` aloud once, in the browser, using speechSynthesis.
-    Picks a voice matching lang_code if the browser has one installed;
-    otherwise falls back to the browser's default voice (still sets the
-    lang code, which some browsers use even without a matching voice)."""
+
+    prefer_quality=True actively looks for a higher-quality NETWORK voice
+    first (e.g. Chrome's "Google हिन्दी" / "Google US English") — these sound
+    far more natural than the free offline/local voice most browsers default
+    to, which is what "default awaaz bahut gatiya hai" was about. Needs an
+    internet connection to actually fetch the better voice; falls back to
+    whatever's available if none is found. rate/pitch (0.5–2.0 each, 1.0 =
+    normal) are separate, always-available levers even when only the basic
+    system voice exists."""
     safe_text = (text or "").replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+    lang_short = lang_code.split("-")[0]
     return f"""
     <script>
     (function() {{
         if (!window.speechSynthesis) return;
         const utter = new SpeechSynthesisUtterance("{safe_text}");
         utter.lang = "{lang_code}";
+        utter.rate = {rate};
+        utter.pitch = {pitch};
+        const preferQuality = {str(prefer_quality).lower()};
         const pick = () => {{
             const voices = window.speechSynthesis.getVoices();
-            const match = voices.find(v => v.lang === "{lang_code}") ||
-                          voices.find(v => v.lang.startsWith("{lang_code.split('-')[0]}"));
+            let match = null;
+            if (preferQuality) {{
+                match = voices.find(v => v.lang === "{lang_code}" && /google|natural|neural|premium|online/i.test(v.name)) ||
+                        voices.find(v => v.lang.startsWith("{lang_short}") && /google|natural|neural|premium|online/i.test(v.name));
+            }}
+            if (!match) {{
+                match = voices.find(v => v.lang === "{lang_code}") ||
+                        voices.find(v => v.lang.startsWith("{lang_short}"));
+            }}
             if (match) utter.voice = match;
             window.speechSynthesis.cancel();
             window.speechSynthesis.speak(utter);
