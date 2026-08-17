@@ -44,7 +44,6 @@ from modules import intel_engine as ie
 from modules import ppt_engine as ppt
 from modules import usage_limits as ul
 from modules import payments as pay
-from modules import pivot_engine as pv
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -143,8 +142,6 @@ def init_state():
     ss.setdefault("theme", copy.deepcopy(DEFAULT_THEME))
     ss.setdefault("dashboard_charts", [])   # list of dicts: {family, variant} chosen for Boss Dashboard
     ss.setdefault("pinned_kpis", [])        # list of kpi labels pinned to dashboard
-    ss.setdefault("pivot_reports", [])      # 📐 Pivot Table — list of pivot report dicts (see pivot_engine.py)
-    ss.setdefault("pinned_pivots", [])      # list of pivot report IDs pinned to the Boss Dashboard, plus their
                                              # chosen chart type there: [{"report_id":.., "chart_type":"Bar"}]
     ss.setdefault("p1_kpi_filters", {})     # {kpi_label: [filter,...]} — per-card filters, Raw Analysis KPI cards
     ss.setdefault("p1_kpi_format", {})      # {kpi_label: format_code} — per-card NUMBER FORMAT (e.g. one card
@@ -1569,7 +1566,7 @@ with st.sidebar:
     sync_workspace_from_disk()
 
     nav_options = ["📥 Connect Data", "📊 Raw Analysis", "🧩 Custom Builder", "⭐ Boss Dashboard",
-                    "📈 Full Analysis", "🗂 Data Table", "📐 Pivot Table", "🤖 AI Assistant", "⚙️ Settings", "💎 Plans"]
+                    "📈 Full Analysis", "🗂 Data Table", "🤖 AI Assistant", "⚙️ Settings", "💎 Plans"]
     # "💡 Business Insights" only makes sense for datasets that actually have a
     # Payment Page Title-shaped column (e.g. "Badminton AMD Mondays") - this app
     # is used by many different clients with unrelated datasets, so the tab
@@ -2080,7 +2077,7 @@ elif page == "⭐ Boss Dashboard":
     st.subheader("Selected Charts")
     chart_png_items = []
 
-    if not st.session_state.dashboard_charts and not pinned_custom_charts and not st.session_state.pinned_pivots:
+    if not st.session_state.dashboard_charts and not pinned_custom_charts:
         st.info("No charts selected yet. Go to Raw Analysis and click ⭐ Add to Boss Dashboard on any chart, "
                 "or build & pin your own on the Custom Builder page.")
     else:
@@ -2162,35 +2159,6 @@ elif page == "⭐ Boss Dashboard":
 
                 chart_png_items.append({"title": variant.get("title", fam), "insight": insight,
                                          "fig": fig, "type": fam})
-
-        if st.session_state.pinned_pivots:
-            for pin in list(st.session_state.pinned_pivots):
-                report = next((r for r in st.session_state.pivot_reports if r["id"] == pin["report_id"]), None)
-                if report is None:
-                    continue  # the report behind this pin was deleted — silently drop it, nothing to show
-                box = st.container(border=True)
-                with box:
-                    top1, top3 = st.columns([8, 1])
-                    with top1:
-                        st.markdown(f"**📐 {report.get('title', 'Pivot Report')}**")
-                    with top3:
-                        if can_edit_dashboard() and st.button("🗑️", key=f"rm_pivot_{report['id']}", help="Unpin from dashboard"):
-                            st.session_state.pinned_pivots = [p for p in st.session_state.pinned_pivots
-                                                              if p["report_id"] != report["id"]]
-                            ws.save_light(st.session_state, st.session_state.workspace_id)
-                            st.rerun()
-                    display_df_pin, raw_df_pin, err_pin = pv.build_pivot_table(df, report)
-                    if err_pin:
-                        st.warning(err_pin)
-                        continue
-                    pv.render_pivot_table(display_df_pin, report)
-                    fig_pin = pv.build_pivot_chart(raw_df_pin, report, report.get("chart_type", "Bar"))
-                    if fig_pin is not None:
-                        fig_pin = _render_chart_with_zoom(fig_pin, zoom_key=f"pivot_{report['id']}",
-                                                           widget_key=f"p2_pivot_{report['id']}",
-                                                           editable=can_edit_dashboard())
-                        chart_png_items.append({"title": report.get("title", "Pivot Report"),
-                                                "insight": "Pivot table summary.", "fig": fig_pin, "type": "Pivot"})
 
         st.divider()
         st.subheader("📄 Export")
@@ -3027,158 +2995,6 @@ elif page == "🗂 Data Table":
                         elif not q.get("error"):
                             st.caption("Not run yet — click ▶️ Run.")
 
-
-# ==================================================================================
-# PAGE 3.4: PIVOT TABLE — Excel-style pivot builder (Rows/Columns/Measures),
-# PivotChart, pin-to-Boss-Dashboard, PDF export.
-# ==================================================================================
-elif page == "📐 Pivot Table":
-    st.title("📐 Pivot Table")
-    st.caption("Excel-style pivot: pick Rows / Columns / Measures, add filters or computed columns, "
-              "then chart the result and optionally pin it to your Boss Dashboard. Plus fully independent "
-              "KPI cards — see 🎴 Build cards below.")
-
-    if st.session_state.df_raw is None:
-        st.info("Load data on the **📥 Connect Data** page first.")
-        st.stop()
-
-    df_raw = st.session_state.df_raw
-    meta = st.session_state.meta
-    df = render_filters(df_raw, meta, key_prefix="pvt_")
-
-    st.info(
-        "**📌 Base data:** same as **🗂 Data Table** — your full loaded dataset, narrowed by any filters "
-        "you set right above (⬆️). Nothing else to 'select' — that filtered set IS the range.\n\n"
-        "**How to build the table, step by step** (just like Excel's PivotTable Field List):\n"
-        "1. Click **🛠️ Build this pivot (table)** below to open the field list.\n"
-        "2. Under **Rows** or **Columns**, pick 1+ fields (e.g. Rows = `sport`, Columns = `payment_status`) "
-        "— this is exactly like dragging a field into Excel's Rows/Columns boxes.\n"
-        "3. Under **Measures**, click **➕ Add measure**, then pick a Column + Aggregation (e.g. "
-        "`total_payment_amount` → Sum) — this is Excel's Values box.\n"
-        "4. The table appears automatically the moment you've picked at least one Row/Column field "
-        "AND one measure. No separate 'run' button needed.\n"
-        "5. Once it appears, scroll down for a **matching chart**, and buttons to turn it into a "
-        "**card** or **pin it to the Boss Dashboard**.\n\n"
-        "**🎴 Cards are separate** — open **🎴 Build cards** to add standalone KPI cards, each with its "
-        "own Column + Aggregation (e.g. 'Distinct Count of department') that doesn't need to be part of "
-        "the table at all. **Filters work in two layers:** the filter inside 🛠️ Build this pivot (table) "
-        "is *shared* — it narrows the table, the chart, AND every card. Each card can ALSO have its own "
-        "extra filter on top, just for that one card."
-    )
-
-    reports = st.session_state.pivot_reports
-    editable = can_edit()
-
-    top_l, top_r = st.columns([4, 1])
-    with top_r:
-        if st.button("➕ New pivot report", use_container_width=True, disabled=not editable):
-            reports.append(pv.new_pivot_report(df))
-            ws.save_light(st.session_state, st.session_state.workspace_id)
-            st.rerun()
-
-    if not reports:
-        st.info("No pivot reports yet — click **➕ New pivot report** to build your first one.")
-        st.stop()
-
-    report_tabs = st.tabs([r["title"] or "Untitled" for r in reports])
-    for report, tab in zip(reports, report_tabs):
-        with tab:
-            with st.expander("🛠️ Build this pivot (table)", expanded=not report.get("measures")):
-                pv.render_pivot_builder(df, report, key_prefix="pvt_")
-                st.divider()
-                st.markdown("**Style**")
-                pv.render_pivot_style_editor(report, key_prefix="pvt_")
-
-            with st.expander("🎴 Build cards (independent of the table above)",
-                             expanded=bool(report.get("global_measures"))):
-                st.caption("Each card is its own Column + Aggregation — it doesn't need to match anything "
-                          "used in the table's Rows/Columns/Measures. Every card also gets its own optional "
-                          "filter on top of the shared filter below (applies to the table, chart, and every card).")
-                pv.render_global_measures_builder(df, report, key_prefix="pvt_")
-
-            _cards = pv.compute_global_measures(df, report)
-            if _cards:
-                st.markdown("**🎴 Cards**")
-                ccols = st.columns(min(len(_cards), 4))
-                for _i, _c in enumerate(_cards):
-                    with ccols[_i % len(ccols)]:
-                        if _c["error"]:
-                            st.metric(_c["label"], "—")
-                            st.caption(f"⚠️ {_c['error']}")
-                        else:
-                            st.metric(_c["label"], _c["value"])
-                st.divider()
-
-            display_df, raw_df, err = pv.build_pivot_table(df, report)
-            if err:
-                st.warning(err)
-                del_col, _ = st.columns([1, 5])
-                with del_col:
-                    if editable and st.button("🗑️ Delete this report", key=f"pvt_del_empty_{report['id']}"):
-                        reports.remove(report)
-                        st.session_state.pinned_pivots = [p for p in st.session_state.pinned_pivots
-                                                          if p["report_id"] != report["id"]]
-                        ws.save_light(st.session_state, st.session_state.workspace_id)
-                        st.rerun()
-                continue
-
-            pv.render_header_rename_ui(report, display_df, key_prefix="pvt_")
-            pv.render_pivot_table(display_df, report)
-
-            st.divider()
-            chart_col, action_col = st.columns([2, 3])
-            with chart_col:
-                report["chart_type"] = st.selectbox("PivotChart type", pv.CHART_TYPES,
-                                                     index=pv.CHART_TYPES.index(report.get("chart_type", "Bar"))
-                                                     if report.get("chart_type") in pv.CHART_TYPES else 0,
-                                                     key=f"pvt_charttype_{report['id']}")
-            fig = pv.build_pivot_chart(raw_df, report, report.get("chart_type", "Bar"))
-            if fig is not None:
-                st.plotly_chart(fig, use_container_width=True, key=f"pvt_chart_{report['id']}", config=ce.PLOTLY_CONFIG)
-            else:
-                st.caption("Add at least one Row field to see a PivotChart here.")
-
-            st.divider()
-            is_pinned = any(p["report_id"] == report["id"] for p in st.session_state.pinned_pivots)
-            b1, b2, b3 = st.columns(3)
-            with b1:
-                if not is_pinned:
-                    if st.button("📌 Pin to Boss Dashboard", key=f"pvt_pin_{report['id']}",
-                                use_container_width=True, disabled=not editable):
-                        st.session_state.pinned_pivots.append({"report_id": report["id"],
-                                                                "chart_type": report.get("chart_type", "Bar")})
-                        ws.save_light(st.session_state, st.session_state.workspace_id)
-                        st.rerun()
-                else:
-                    if st.button("📌 Unpin from Boss Dashboard", key=f"pvt_unpin_{report['id']}",
-                                use_container_width=True, disabled=not editable):
-                        st.session_state.pinned_pivots = [p for p in st.session_state.pinned_pivots
-                                                          if p["report_id"] != report["id"]]
-                        ws.save_light(st.session_state, st.session_state.workspace_id)
-                        st.rerun()
-            with b2:
-                if st.button("⬇️ Download PDF", key=f"pvt_pdf_{report['id']}", use_container_width=True):
-                    pdf_ok, pdf_limit_msg = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "pdf_exports")
-                    if not pdf_ok:
-                        st.error(f"🚫 {pdf_limit_msg}")
-                    else:
-                        chart_png = None
-                        if fig is not None:
-                            try:
-                                chart_png = fig.to_image(format="png", width=1200, height=560, scale=2)
-                            except Exception:
-                                chart_png = None  # PDF still generates fine without the chart image
-                        pdf_bytes = pv.export_pivot_pdf(report, display_df, chart_png)
-                        st.download_button("📥 Click to save PDF", data=pdf_bytes,
-                                          file_name=f"{(report['title'] or 'pivot_report').replace(' ', '_')}.pdf",
-                                          mime="application/pdf", key=f"pvt_pdf_dl_{report['id']}")
-            with b3:
-                if editable and st.button("🗑️ Delete report", key=f"pvt_del_{report['id']}", use_container_width=True):
-                    reports.remove(report)
-                    st.session_state.pinned_pivots = [p for p in st.session_state.pinned_pivots
-                                                      if p["report_id"] != report["id"]]
-                    ws.save_light(st.session_state, st.session_state.workspace_id)
-                    st.rerun()
 
 
 # ==================================================================================
