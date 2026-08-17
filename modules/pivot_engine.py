@@ -102,6 +102,11 @@ def new_pivot_report(df) -> dict:
         "computed_columns": [],
         "grand_total": True,
         "header_overrides": {},
+        # Independent KPI cards — each one its own Column + Aggregation, completely
+        # separate from the table's Rows/Columns/Measures above (e.g. a "Distinct
+        # Count of department" card even though department is only a Row in the
+        # table, never one of its Measures). See compute_global_measures().
+        "global_measures": [],
         "style": {"header_bg": "#2C6E49", "header_font_color": "#FFFFFF", "font_size": 13,
                    "border": True, "striped": True},
     }
@@ -267,6 +272,107 @@ def measure_grand_totals(raw_df: pd.DataFrame, report: dict) -> list:
         cards.append({"label": lbl, "value": ms.format_value(total, fmt_code, m.get("custom_format_code", "")),
                       "raw_value": total})
     return cards
+
+
+# ==================================================================================
+# GLOBAL MEASURES / CARDS — independent of the table's Rows/Columns/Measures.
+# Each card is its own Column + Aggregation, computed straight off the
+# (filtered) base data — it never has to match anything used in the pivot
+# table itself. Two filter layers apply, same "sabka ek filter + apna alag
+# filter" idea as the table: `report["filters"]` (shared — also narrows the
+# table/chart) is applied FIRST, then this card's own `gm["filters"]` (only
+# this card) on top of that.
+# ==================================================================================
+def compute_global_measures(df: pd.DataFrame, report: dict) -> list:
+    """Returns one dict per configured card:
+    {"id", "label", "value", "raw_value", "error"} — error is None on success,
+    a short human-readable string if that one card's own filter/column broke
+    (a bad card never takes the others down with it)."""
+    shared_filtered = ms.apply_filters(df, report.get("filters", []))
+    out = []
+    for gm in report.get("global_measures", []):
+        label = gm.get("label") or (
+            f"{gm['agg']} of rows" if gm.get("column") in (None, "(all rows)") else f"{gm['agg']} of {gm['column']}"
+        )
+        card = {"id": gm["id"], "label": label, "value": "—", "raw_value": None, "error": None}
+        try:
+            card_df = ms.apply_filters(shared_filtered, gm.get("filters", []))
+            if len(card_df) == 0:
+                card["error"] = "No rows left after this card's filter."
+                out.append(card)
+                continue
+            agg_tpl = AGG_SQL.get(gm["agg"], AGG_SQL["Sum"])
+            is_all_rows = gm.get("column") in (None, "(all rows)")
+            col_sql = "*" if (gm["agg"] == "Count" and is_all_rows) else _q(gm["column"])
+            if is_all_rows and gm["agg"] != "Count":
+                card["error"] = "Pick a column for this aggregation (only Count works on '(all rows)')."
+                out.append(card)
+                continue
+            agg_sql = agg_tpl.format(c=col_sql)
+            con = duckdb.connect(database=":memory:")
+            try:
+                con.execute("SET enable_external_access=false")
+                con.register("t", card_df)
+                raw_value = con.execute(f"SELECT {agg_sql} AS v FROM t").df()["v"].iloc[0]
+            finally:
+                con.close()
+            fmt_code = ms.NUMBER_FORMAT_PRESETS.get(gm.get("number_format", "Auto (Cr / L / K)"), "auto")
+            card["raw_value"] = raw_value
+            card["value"] = ms.format_value(raw_value, fmt_code, gm.get("custom_format_code", ""))
+        except Exception as e:
+            card["error"] = str(e)
+        out.append(card)
+    return out
+
+
+def render_global_measures_builder(df: pd.DataFrame, report: dict, key_prefix: str):
+    """The '+ Add global measure' UI — Excel-style: pick a Column + an
+    Aggregation, optionally rename it and give IT its own filter, and it
+    becomes a standalone KPI card. Completely independent of the table
+    above — add as many as you like."""
+    all_cols = ms.list_all_columns(df)
+    col_names = [c["name"] for c in all_cols]
+    computed_names = [cc["name"] for cc in report.get("computed_columns", [])]
+    pickable = ["(all rows)"] + col_names + computed_names
+
+    remove_gm = None
+    for gm in report.get("global_measures", []):
+        with st.container(border=True):
+            gc1, gc2, gc3, gc4 = st.columns([2, 2, 2, 1])
+            with gc1:
+                gm["column"] = st.selectbox("Column", pickable,
+                                            index=pickable.index(gm["column"]) if gm.get("column") in pickable else 0,
+                                            key=f"{key_prefix}gmcol_{gm['id']}")
+            with gc2:
+                gm["agg"] = st.selectbox("Aggregation", ms.ALL_MEASURES[:8],
+                                         index=ms.ALL_MEASURES[:8].index(gm["agg"]) if gm.get("agg") in ms.ALL_MEASURES[:8] else 0,
+                                         key=f"{key_prefix}gmagg_{gm['id']}")
+            with gc3:
+                gm["label"] = st.text_input("Card title (optional)", gm.get("label") or "",
+                                            key=f"{key_prefix}gmlab_{gm['id']}")
+            with gc4:
+                st.write("")
+                if st.button("🗑️", key=f"{key_prefix}gmdel_{gm['id']}"):
+                    remove_gm = gm["id"]
+            fmt_opts = list(ms.NUMBER_FORMAT_PRESETS.keys())
+            cur_fmt = gm.get("number_format", "Auto (Cr / L / K)")
+            gm["number_format"] = st.selectbox("Format", fmt_opts,
+                                               index=fmt_opts.index(cur_fmt) if cur_fmt in fmt_opts else 0,
+                                               key=f"{key_prefix}gmfmt_{gm['id']}")
+            if ms.NUMBER_FORMAT_PRESETS.get(gm["number_format"]) == "custom":
+                gm["custom_format_code"] = st.text_input("Excel format code", gm.get("custom_format_code", "#,##0.00"),
+                                                          key=f"{key_prefix}gmfmtcode_{gm['id']}")
+            with st.expander(f"🔍 This card's own filter (on top of the shared filter below)"):
+                gm["filters"] = be.render_filter_builder(df, gm.get("filters", []),
+                                                          key_prefix=f"{key_prefix}gmf_{gm['id']}_")
+    if remove_gm is not None:
+        report["global_measures"] = [g for g in report["global_measures"] if g["id"] != remove_gm]
+        st.rerun()
+    if st.button("➕ Add global measure", key=f"{key_prefix}gmadd"):
+        report.setdefault("global_measures", []).append(
+            {"id": uuid.uuid4().hex[:8], "column": pickable[0] if pickable else "(all rows)", "agg": "Count",
+             "label": "", "number_format": "Auto (Cr / L / K)", "custom_format_code": "#,##0.00", "filters": []})
+        st.rerun()
 
 
 # ==================================================================================
