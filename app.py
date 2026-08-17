@@ -2129,12 +2129,27 @@ elif page == "⭐ Boss Dashboard":
                     st.markdown(f"**{FAMILY_ICONS.get(fam,'')} {fam}**")
                 with top2:
                     if options and can_edit_dashboard():
-                        default_idx = options.index(variant["id"]) if variant["id"] in options else 0
-                        chosen_id = st.selectbox("Swap analysis", options, index=default_idx,
-                                                  format_func=lambda x: labels.get(x, x),
-                                                  key=f"swap_{widget_key}", label_visibility="collapsed")
-                        variant = id_to_variant[chosen_id]
-                        entry["variant"] = variant
+                        if variant["id"] in options:
+                            default_idx = options.index(variant["id"])
+                            chosen_id = st.selectbox("Swap analysis", options, index=default_idx,
+                                                      format_func=lambda x: labels.get(x, x),
+                                                      key=f"swap_{widget_key}", label_visibility="collapsed")
+                            # Only touch the pinned chart if the person actually picked something
+                            # different — previously this reassigned unconditionally on every
+                            # rerun, which silently corrupted the pinned chart into "whatever the
+                            # first dropdown option happens to be" the moment the exact pinned
+                            # variant wasn't found (see the else branch below for why that
+                            # happens), even with zero user interaction.
+                            if chosen_id != variant["id"]:
+                                variant = id_to_variant[chosen_id]
+                                entry["variant"] = variant
+                        else:
+                            # The exact pinned chart isn't among what's regenerated for THIS page's
+                            # current filters (Boss Dashboard has its own filters, separate from
+                            # wherever this was originally pinned from) — showing a swap list here
+                            # would only invite the same silent-corruption bug. Keep rendering
+                            # exactly what was pinned (below) instead of guessing a replacement.
+                            st.caption("🔀 Swap unavailable for current filters")
                 with top3:
                     if can_edit_dashboard() and st.button("🗑️", key=f"rm_{widget_key}", help="Remove from dashboard"):
                         remove_from_dashboard(fam, entry["variant"]["id"])
@@ -3030,6 +3045,21 @@ elif page == "📐 Pivot Table":
     meta = st.session_state.meta
     df = render_filters(df_raw, meta, key_prefix="pvt_")
 
+    st.info(
+        "**📌 Base data:** same as **🗂 Data Table** — your full loaded dataset, narrowed by any filters "
+        "you set right above (⬆️). Nothing else to 'select' — that filtered set IS the range.\n\n"
+        "**How to build one, step by step** (just like Excel's PivotTable Field List):\n"
+        "1. Click **🛠️ Build this pivot** below to open the field list.\n"
+        "2. Under **Rows** or **Columns**, pick 1+ fields (e.g. Rows = `sport`, Columns = `payment_status`) "
+        "— this is exactly like dragging a field into Excel's Rows/Columns boxes.\n"
+        "3. Under **Measures**, click **➕ Add measure**, then pick a Column + Aggregation (e.g. "
+        "`total_payment_amount` → Sum) — this is Excel's Values box.\n"
+        "4. The table appears automatically the moment you've picked at least one Row/Column field "
+        "AND one measure. No separate 'run' button needed.\n"
+        "5. Once it appears, scroll down for a **matching chart**, and buttons to turn it into a "
+        "**card** or **pin it to the Boss Dashboard**."
+    )
+
     reports = st.session_state.pivot_reports
     editable = can_edit()
 
@@ -3065,6 +3095,15 @@ elif page == "📐 Pivot Table":
                         ws.save_light(st.session_state, st.session_state.workspace_id)
                         st.rerun()
                 continue
+
+            _totals = pv.measure_grand_totals(raw_df, report)
+            if _totals:
+                st.markdown("**📇 At a glance**")
+                tcols = st.columns(min(len(_totals), 4))
+                for _i, _t in enumerate(_totals):
+                    with tcols[_i % len(tcols)]:
+                        st.metric(_t["label"], _t["value"])
+                st.divider()
 
             pv.render_header_rename_ui(report, display_df, key_prefix="pvt_")
             pv.render_pivot_table(display_df, report)
@@ -3191,6 +3230,7 @@ elif page == "🤖 AI Assistant":
     # strips the individual text-input/button borders so only the outer
     # container's border shows, making it read as a single clean box.
     st.session_state.setdefault("ai_page_draft", "")
+    st.session_state.setdefault("ai_page_mode", "💬 Poocho")
     st.markdown("""
         <style>
         div[data-testid="stVerticalBlockBorderWrapper"]:has(div.st-key-ai_unified_input) {
@@ -3208,18 +3248,35 @@ elif page == "🤖 AI Assistant":
         </style>
     """, unsafe_allow_html=True)
 
+    # ONE visual box, TWO modes via a small pill toggle above it — merging the
+    # actual behaviour into a single input would mean the AI has to GUESS
+    # whether you're asking a question or asking it to build something new;
+    # this keeps the box identical either way and just switches what it does
+    # with what you type, which is clearer than one input doing two things.
+    _ai_modes = ["💬 Poocho", "🪄 Card/Chart banao"] if can_edit() else ["💬 Poocho"]
+    if st.session_state.ai_page_mode not in _ai_modes:
+        st.session_state.ai_page_mode = _ai_modes[0]
+    st.session_state.ai_page_mode = st.radio("Mode", _ai_modes, key="ai_page_mode_radio",
+                                              index=_ai_modes.index(st.session_state.ai_page_mode),
+                                              horizontal=True, label_visibility="collapsed")
+    _ask_mode = st.session_state.ai_page_mode == "💬 Poocho"
+    _placeholder = "Ask anything about your data..." if _ask_mode else 'e.g. "monthly revenue trend" or "top clients by total paid"'
+
     with st.container(key="ai_unified_input", border=True):
         text_col, send_col = st.columns([9, 1], vertical_alignment="center")
         with text_col:
             st.session_state.ai_page_draft = st.text_input(
                 "Ask", value=st.session_state.ai_page_draft, key="ai_page_draft_box",
-                placeholder="Ask anything about your data...", label_visibility="collapsed")
+                placeholder=_placeholder, label_visibility="collapsed")
         with send_col:
-            _send_clicked = st.button("🚀", key="ai_page_send_btn", type="primary", use_container_width=True,
-                                      disabled=not st.session_state.ai_page_draft.strip(), help="Send")
+            _icon = "🚀" if _ask_mode else "✨"
+            _send_clicked = st.button(_icon, key="ai_page_send_btn", type="primary", use_container_width=True,
+                                      disabled=not st.session_state.ai_page_draft.strip(),
+                                      help="Send" if _ask_mode else "Generate")
 
-    question = st.session_state.ai_page_draft.strip() if _send_clicked else None
-    if question:
+    question = st.session_state.ai_page_draft.strip() if (_send_clicked and _ask_mode) else None
+    ai_req = st.session_state.ai_page_draft.strip() if (_send_clicked and not _ask_mode) else None
+    if _send_clicked:
         st.session_state.ai_page_draft = ""
     if question:
         st.session_state.ai_chat_history.append({"role": "user", "content": question, "ts": time.time()})
@@ -3254,18 +3311,13 @@ elif page == "🤖 AI Assistant":
 
     # ------------------------------------------------------------------------
     # AUTO-BUILD A KPI CARD OR CHART FROM A PLAIN-LANGUAGE REQUIREMENT
-    # (view-only accounts can chat above, but can't add/pin dashboard content)
+    # (view-only accounts never see "🪄 Card/Chart banao" mode above, so
+    # ai_req is always None for them — nothing below this point can trigger)
     # ------------------------------------------------------------------------
     if not can_edit():
         st.stop()
 
-    st.divider()
-    st.subheader("🪄 Ask AI to build a card or chart")
-    st.caption("Describe what you need — AI designs a matching KPI card or chart from your real "
-               "columns. Add it to **🧩 Custom Builder** with one click, or pin it straight to the "
-               "**⭐ Boss Dashboard**.")
-    ai_req = st.text_input("e.g. \"monthly revenue trend\" or \"top clients by total paid\"", key="ai_card_req")
-    if st.button("✨ Generate", key="ai_card_gen") and ai_req.strip():
+    if ai_req:
         with st.spinner("Designing a card/chart from your data..."):
             gen_result = ac.suggest_card_or_chart(ai_req.strip(), df_raw, api_key)
         if gen_result.get("error"):
