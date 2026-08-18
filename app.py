@@ -109,6 +109,11 @@ DEFAULT_BRAND = {
     "logo_light": None,
     "logo_light_mime": None,
     "logo_width": 220,     # px — explicit size control for the login-page logo
+    # Login-page background wallpaper (admin-set, optional). Same raw-bytes
+    # pattern as the logo above - None means "no wallpaper, plain default
+    # background", exactly like before this feature existed.
+    "bg_image": None,
+    "bg_image_mime": None,
     # ---- Neon / glow lighting (advanced) --------------------------------------
     "glow_enabled": False,
     "glow_targets": ["text", "logo"],  # subset of "text" (sidebar brand text) / "logo" (login logo)
@@ -609,32 +614,41 @@ def _logo_img_html(logo_bytes: bytes, mime: str, width: int, extra_style: str = 
 
 
 def login_screen():
-    # Full-page gradient wallpaper + a frosted-glass look for the login
-    # card, just for this screen (scoped here, not applied once logged in).
-    st.markdown("""
-    <style>
-    [data-testid="stAppViewContainer"] > .main {
-        background: linear-gradient(135deg, #0f2027 0%, #203a43 45%, #2c5364 100%);
-        background-attachment: fixed;
-    }
-    [data-testid="stHeader"] { background: transparent; }
-    [data-testid="stForm"] {
-        background: rgba(255, 255, 255, 0.92);
-        backdrop-filter: blur(10px);
-        border-radius: 16px;
-        padding: 1.75rem 1.5rem 1.25rem 1.5rem;
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
-        border: 1px solid rgba(255, 255, 255, 0.25);
-    }
-    div[data-testid="stExpander"] {
-        background: rgba(255, 255, 255, 0.92);
-        border-radius: 12px;
-        border: 1px solid rgba(255, 255, 255, 0.25);
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
     brand = st.session_state.get("app_brand") or DEFAULT_BRAND
+
+    # Optional admin-set wallpaper behind the login form (Settings → Branding
+    # → Login page background). Only injects CSS when one is actually set -
+    # no wallpaper = plain default background, exactly like before.
+    _bg = brand.get("bg_image")
+    if _bg:
+        import base64
+        _bg_mime = brand.get("bg_image_mime") or "image/png"
+        _bg_b64 = base64.b64encode(_bg).decode("utf-8")
+        st.markdown(f"""
+        <style>
+        [data-testid="stAppViewContainer"] > .main {{
+            background-image: url("data:{_bg_mime};base64,{_bg_b64}");
+            background-size: cover;
+            background-position: center;
+            background-attachment: fixed;
+            background-repeat: no-repeat;
+        }}
+        [data-testid="stHeader"] {{ background: transparent; }}
+        [data-testid="stForm"] {{
+            background: rgba(255, 255, 255, 0.92);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            padding: 1.75rem 1.5rem 1.25rem 1.5rem;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+            border: 1px solid rgba(255, 255, 255, 0.25);
+        }}
+        div[data-testid="stExpander"] {{
+            background: rgba(255, 255, 255, 0.92);
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.25);
+        }}
+        </style>
+        """, unsafe_allow_html=True)
     _mode = _detect_theme_mode()
     _logo = brand.get(f"logo_{_mode}") or brand.get("logo_dark") or brand.get("logo_light")
     _logo_mime = brand.get(f"logo_{_mode}_mime") or brand.get("logo_dark_mime") or brand.get("logo_light_mime") or "image/png"
@@ -643,8 +657,8 @@ def login_screen():
         with _lc2:
             _img_html = _logo_img_html(_logo, _logo_mime, brand.get("logo_width", 220))
             _render_glow_target("brand_glow_logo", "logo", brand, _img_html)
-    st.markdown("<h1 style='text-align:center;color:#ffffff;text-shadow:0 2px 8px rgba(0,0,0,0.4);'>Research | Analysis | Intellegance </h1>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align:center;color:#dbe6ec;'>Please sign in to continue</p>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align:center;'>Research | Analysis | Intellegance </h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
         with st.form("login_form"):
@@ -3554,6 +3568,33 @@ elif page == "⚙️ Settings":
 
             b["logo_width"] = st.slider("Logo size on the login page (px wide)", 80, 500,
                                          b.get("logo_width", 220), key="brand_logo_width")
+
+            st.divider()
+            st.markdown("**🖼️ Login page background wallpaper**")
+            st.caption("Optional full-page background image behind the sign-in form. Leave empty for the "
+                       "plain default background. Same login/logo text stays visible on top - a lighter, "
+                       "not-too-busy image usually looks best.")
+            if b.get("bg_image"):
+                st.image(b["bg_image"], width=320)
+                if st.button("🗑️ Remove wallpaper", key="brand_bg_rm"):
+                    b["bg_image"] = None
+                    b["bg_image_mime"] = None
+                    st.rerun()
+            bg_up = st.file_uploader("Upload PNG / JPG / JPEG", type=["png", "jpg", "jpeg"], key="brand_bg_up")
+            if bg_up is not None:
+                bg_data, bg_mime = _process_logo_file(bg_up)
+                if bg_data:
+                    b["bg_image"] = bg_data
+                    b["bg_image_mime"] = bg_mime
+                    st.success("Wallpaper ready below — click 'Save branding for everyone' to publish it.")
+            bg_url = st.text_input("...or paste a direct image link", key="brand_bg_url",
+                                    placeholder="https://...")
+            if st.button("Use this link", key="brand_bg_url_btn") and bg_url.strip():
+                bg_data, bg_mime = _fetch_logo_from_url(bg_url.strip())
+                if bg_data:
+                    b["bg_image"] = bg_data
+                    b["bg_image_mime"] = bg_mime
+                    st.success("Wallpaper ready below — click 'Save branding for everyone' to publish it.")
 
             st.divider()
             st.markdown("**✨ Neon / Glow Lighting**")
