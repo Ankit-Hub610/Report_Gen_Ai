@@ -493,10 +493,53 @@ def _detect_theme_mode():
     return "dark"
 
 
+def _resize_for_branding(raw: bytes, max_dimension: int = 1600) -> tuple:
+    """Shrinks a branding image (logo or login wallpaper) down to a sane size
+    before it's stored. This is the actual fix for 'wallpaper saved fine but
+    doesn't show up on the login page' - the whole branding blob (all logos +
+    wallpaper together) gets synced via GitHub's Contents API, and that API
+    can PUT (save) a file over ~1MB just fine but silently fails to return
+    its content on a later GET (read) - so the save always looked successful
+    with no error, but a fresh session (a different visitor, or the admin's
+    own login page in a new tab) would load branding, fail to fetch the
+    oversized blob, and silently fall back to 'no wallpaper'. A raw photo
+    upload (a few MB is normal for a phone photo or stock image) blew right
+    past that limit with zero warning. Capping every branding image to at
+    most `max_dimension` px on its longest side keeps the whole blob small
+    and reliable, no matter what someone uploads.
+    Returns (bytes, mime) - PNG only if the source actually has transparency
+    (most logos), JPEG otherwise (photos compress far better as JPEG).
+    """
+    try:
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        has_alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+        if img.width > max_dimension or img.height > max_dimension:
+            img.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
+        out = io.BytesIO()
+        if has_alpha:
+            img.save(out, format="PNG", optimize=True)
+            return out.getvalue(), "image/png"
+        else:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img.save(out, format="JPEG", quality=85, optimize=True)
+            return out.getvalue(), "image/jpeg"
+    except Exception:
+        # Pillow not available or the file wasn't a decodable image - fall back
+        # to storing it as-is rather than blocking the upload entirely. Large
+        # files can still hit the GitHub sync issue described above in this case.
+        return raw, None
+
+
 def _process_logo_file(uploaded_file):
     """Turns an uploaded PNG/JPG/JPEG/PDF into (bytes, mime) ready to store
     and hand straight to st.image. PDFs get their first page rendered down
     to a PNG (needs the optional PyMuPDF package - see requirements.txt).
+    Every image is resized/recompressed via _resize_for_branding() before
+    being returned - see its docstring for why that matters.
     Returns (None, None) and shows an st.error on failure."""
     raw = _read_upload(uploaded_file)
     name = uploaded_file.name.lower()
@@ -510,12 +553,38 @@ def _process_logo_file(uploaded_file):
         try:
             doc = fitz.open(stream=raw, filetype="pdf")
             pix = doc.load_page(0).get_pixmap(matrix=fitz.Matrix(3, 3))  # ~3x zoom, crisp small logo
-            return pix.tobytes("png"), "image/png"
+            raw, fallback_mime = pix.tobytes("png"), "image/png"
         except Exception as e:
             st.error(f"Couldn't read that PDF: {e}")
             return None, None
-    mime = "image/jpeg" if name.endswith((".jpg", ".jpeg")) else "image/png"
-    return raw, mime
+    else:
+        fallback_mime = "image/jpeg" if name.endswith((".jpg", ".jpeg")) else "image/png"
+    data, mime = _resize_for_branding(raw)
+    return data, (mime or fallback_mime)
+
+
+def _fetch_logo_from_url(url: str):
+    """Downloads an image from a direct link for the 'paste a link' branding
+    option, resizes/recompresses it the same way as an upload (see
+    _resize_for_branding), and returns (bytes, mime). Returns (None, None)
+    and shows an st.error on failure — bad URL, not an image, too slow, etc."""
+    try:
+        import requests
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            st.error(f"Couldn't fetch that link (HTTP {r.status_code}).")
+            return None, None
+        content_type = (r.headers.get("Content-Type") or "").lower()
+        if "image" not in content_type and not url.lower().endswith((".png", ".jpg", ".jpeg")):
+            st.error("That link doesn't look like a direct image file (needs to end in .png/.jpg, "
+                      "or serve an image content-type).")
+            return None, None
+        fallback_mime = "image/jpeg" if "jpeg" in content_type or url.lower().endswith((".jpg", ".jpeg")) else "image/png"
+        data, mime = _resize_for_branding(r.content)
+        return data, (mime or fallback_mime)
+    except Exception as e:
+        st.error(f"Couldn't fetch that link: {e}")
+        return None, None
 
 
 def _glow_css(css_class: str, kind: str, color: str, style: str, intensity: int, speed: float) -> str:
