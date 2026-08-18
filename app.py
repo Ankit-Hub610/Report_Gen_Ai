@@ -114,6 +114,14 @@ DEFAULT_BRAND = {
     # background", exactly like before this feature existed.
     "bg_image": None,
     "bg_image_mime": None,
+    # Login-page LIVE wallpaper (admin-set, optional short looping video —
+    # MP4/H.264 recommended). Same on/off pattern as bg_image: None means no
+    # video, plain static wallpaper (or default background) shows instead.
+    # When both bg_video and bg_image are set, bg_video takes priority on
+    # the login page (bg_image stays saved underneath, untouched, so
+    # removing the video brings the static wallpaper straight back).
+    "bg_video": None,
+    "bg_video_mime": None,
     # Interactive cursor-following creature background (admin toggle). When
     # True, REPLACES the static bg_image above on the login page with a live
     # canvas animation that reacts to mouse movement - bg_image itself is
@@ -508,7 +516,8 @@ def _detect_theme_mode():
     return "dark"
 
 
-def _resize_for_branding(raw: bytes, max_dimension: int = 1600, quality: int = 85) -> tuple:
+def _resize_for_branding(raw: bytes, max_dimension: int = 1600, quality: int = 85,
+                          skip_recompress_under_mb: float = 6.0) -> tuple:
     """Shrinks a branding image (logo or login wallpaper) down to at most
     `max_dimension` px on its longest side before it's stored — logos stay at
     the smaller default (1600px, plenty crisp for something shown at a few
@@ -520,6 +529,16 @@ def _resize_for_branding(raw: bytes, max_dimension: int = 1600, quality: int = 8
     download_url for anything over ~1MB) — this cap now exists only to stop a
     truly absurd upload (e.g. a 40-megapixel raw photo) from bloating storage
     for no visible benefit, not to protect a persistence quirk.
+
+    IMPORTANT (fixes visible blur/softness on 4K/8K wallpapers): if the image
+    is ALREADY within max_dimension on both sides AND its file size is under
+    `skip_recompress_under_mb`, it's stored completely as-is — no re-encode
+    at all. Previously every upload was unconditionally re-saved as JPEG
+    (even a PNG that already fit fine), which is an extra generation of lossy
+    compression on top of whatever the source already was; for a sharp
+    high-resolution photo that double compression is exactly what read as
+    "blurry" compared to the original file. Recompression now only kicks in
+    when it's actually needed (oversized dimensions, or a very large file).
     Returns (bytes, mime) - PNG only if the source actually has transparency
     (most logos), JPEG otherwise (photos compress far better as JPEG).
     """
@@ -529,7 +548,14 @@ def _resize_for_branding(raw: bytes, max_dimension: int = 1600, quality: int = 8
         img = Image.open(io.BytesIO(raw))
         img.load()
         has_alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
-        if img.width > max_dimension or img.height > max_dimension:
+        fits_already = img.width <= max_dimension and img.height <= max_dimension
+        size_mb = len(raw) / (1024 * 1024)
+        if fits_already and size_mb <= skip_recompress_under_mb:
+            # Already the right resolution and a reasonable file size —
+            # store the original bytes untouched, full original quality.
+            src_mime = Image.MIME.get(img.format) if img.format else None
+            return raw, src_mime
+        if not fits_already:
             img.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
         out = io.BytesIO()
         if has_alpha:
@@ -538,7 +564,7 @@ def _resize_for_branding(raw: bytes, max_dimension: int = 1600, quality: int = 8
         else:
             if img.mode != "RGB":
                 img = img.convert("RGB")
-            img.save(out, format="JPEG", quality=quality, optimize=True)
+            img.save(out, format="JPEG", quality=quality, optimize=True, subsampling=0)
             return out.getvalue(), "image/jpeg"
     except Exception:
         # Pillow not available or the file wasn't a decodable image - fall back
@@ -971,12 +997,57 @@ def _render_interactive_login_background():
     """, height=0)
 
 
+_LOGIN_FORM_CHROME_CSS = """
+[data-testid="stHeader"] { background: transparent !important; }
+[data-testid="stForm"] {
+    background: rgba(255, 255, 255, 0.92);
+    backdrop-filter: blur(10px);
+    border-radius: 16px;
+    padding: 1.75rem 1.5rem 1.25rem 1.5rem;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+}
+div[data-testid="stExpander"] {
+    background: rgba(255, 255, 255, 0.92);
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.25);
+}
+"""
+
+
 def _render_static_login_wallpaper(brand: dict):
     # Optional admin-set wallpaper behind the login form (Settings → Branding
-    # → Login page background). Only injects CSS when one is actually set -
-    # no wallpaper = plain default background, exactly like before.
+    # → Login page background: either a LIVE video wallpaper or a static
+    # image). Only injects anything when one is actually set - no wallpaper
+    # = plain default background, exactly like before. A video wallpaper (if
+    # set) takes priority over the static image - see the Branding settings
+    # caption for why.
+    _bg_video = brand.get("bg_video")
     _bg = brand.get("bg_image")
-    if _bg:
+
+    if _bg_video:
+        import base64
+        _vid_mime = brand.get("bg_video_mime") or "video/mp4"
+        _vid_b64 = base64.b64encode(_bg_video).decode("utf-8")
+        st.markdown(f"""
+        <style>
+        #ra-login-bg-video {{
+            position: fixed;
+            top: 0; left: 0;
+            min-width: 100vw;
+            min-height: 100vh;
+            width: 100vw; height: 100vh;
+            object-fit: cover;
+            z-index: -1;
+        }}
+        [data-testid="stAppViewContainer"], .stApp {{ background: transparent !important; }}
+        {_LOGIN_FORM_CHROME_CSS}
+        </style>
+        <video id="ra-login-bg-video" autoplay loop muted playsinline>
+            <source src="data:{_vid_mime};base64,{_vid_b64}" type="{_vid_mime}">
+        </video>
+        """, unsafe_allow_html=True)
+    elif _bg:
         import base64
         _bg_mime = brand.get("bg_image_mime") or "image/png"
         _bg_b64 = base64.b64encode(_bg).decode("utf-8")
@@ -1003,20 +1074,7 @@ def _render_static_login_wallpaper(brand: dict):
             background-attachment: fixed !important;
             background-repeat: no-repeat !important;
         }}
-        [data-testid="stHeader"] {{ background: transparent !important; }}
-        [data-testid="stForm"] {{
-            background: rgba(255, 255, 255, 0.92);
-            backdrop-filter: blur(10px);
-            border-radius: 16px;
-            padding: 1.75rem 1.5rem 1.25rem 1.5rem;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
-            border: 1px solid rgba(255, 255, 255, 0.25);
-        }}
-        div[data-testid="stExpander"] {{
-            background: rgba(255, 255, 255, 0.92);
-            border-radius: 12px;
-            border: 1px solid rgba(255, 255, 255, 0.25);
-        }}
+        {_LOGIN_FORM_CHROME_CSS}
         </style>
         """, unsafe_allow_html=True)
 
@@ -3928,10 +3986,11 @@ elif page == "⚙️ Settings":
             st.markdown("**🖼️ Login page background wallpaper**")
             st.caption("Optional full-page background image behind the sign-in form. Leave empty for the "
                        "plain default background. Same login/logo text stays visible on top - a lighter, "
-                       "not-too-busy image usually looks best. **Full HD / 4K / 8K supported** — uploads are "
-                       "kept at their original resolution up to 8K (7680px), only compressed a little "
-                       "(quality 92 JPEG) to keep load times reasonable; nothing gets downscaled to a blurry "
-                       "small size like before.")
+                       "not-too-busy image usually looks best. **Full HD / 4K / 8K supported** — an upload "
+                       "that's already 8K (7680px) or smaller is stored at its **original quality, no "
+                       "recompression at all**; anything bigger is resized down to 8K max and saved at "
+                       "high-quality JPEG (95, no chroma subsampling) — noticeably sharper than before, "
+                       "nothing gets downscaled to a blurry small size.")
             if b.get("bg_image"):
                 st.image(b["bg_image"], width=320)
                 _bg_kb = len(b["bg_image"]) / 1024
@@ -3943,7 +4002,7 @@ elif page == "⚙️ Settings":
             bg_up = st.file_uploader("Upload PNG / JPG / JPEG (Full HD / 4K / 8K all fine)",
                                       type=["png", "jpg", "jpeg"], key="brand_bg_up")
             if bg_up is not None:
-                bg_data, bg_mime = _process_logo_file(bg_up, max_dimension=7680, quality=92)
+                bg_data, bg_mime = _process_logo_file(bg_up, max_dimension=7680, quality=95)
                 if bg_data:
                     b["bg_image"] = bg_data
                     b["bg_image_mime"] = bg_mime
@@ -3952,7 +4011,7 @@ elif page == "⚙️ Settings":
             bg_url = st.text_input("...or paste a direct image link", key="brand_bg_url",
                                     placeholder="https://...")
             if st.button("Use this link", key="brand_bg_url_btn") and bg_url.strip():
-                bg_data, bg_mime = _fetch_logo_from_url(bg_url.strip(), max_dimension=7680, quality=92)
+                bg_data, bg_mime = _fetch_logo_from_url(bg_url.strip(), max_dimension=7680, quality=95)
                 if bg_data:
                     b["bg_image"] = bg_data
                     b["bg_image_mime"] = bg_mime
@@ -3960,13 +4019,53 @@ elif page == "⚙️ Settings":
                                f"'Save branding for everyone' to publish it.")
 
             st.divider()
+            st.markdown("**🎬 Login page LIVE wallpaper (video)**")
+            st.caption("Optional short looping video behind the sign-in form, instead of a static image — "
+                       "a real 'live wallpaper'. **MP4 (H.264) recommended** — that's what plays natively in "
+                       "every browser without any conversion. It autoplays muted and on loop, exactly like a "
+                       "phone's live wallpaper. When a video is set here, it **replaces the static image "
+                       "wallpaper above** on the login page (the image itself stays saved — remove the video "
+                       "to bring it straight back). Keep it short (a few seconds, looping) and reasonably "
+                       "compressed on your end before uploading — a multi-minute 8K video will be slow to "
+                       "load and may fail to sync; a well-compressed 1080p/4K clip a few seconds long, a few "
+                       "MB in size, looks just as 'live' and loads instantly.")
+            _MAX_BG_VIDEO_MB = 20
+            if b.get("bg_video"):
+                st.video(b["bg_video"])
+                _vid_mb = len(b["bg_video"]) / (1024 * 1024)
+                st.caption(f"Current live wallpaper: {_vid_mb:,.1f} MB")
+                if st.button("🗑️ Remove live wallpaper", key="brand_bgvid_rm"):
+                    b["bg_video"] = None
+                    b["bg_video_mime"] = None
+                    st.rerun()
+            bgvid_up = st.file_uploader(f"Upload MP4 (max {_MAX_BG_VIDEO_MB} MB — keep it short & compressed)",
+                                         type=["mp4", "m4v", "mov", "webm"], key="brand_bgvid_up")
+            if bgvid_up is not None:
+                _vid_raw = _read_upload(bgvid_up)
+                _vid_mb_up = len(_vid_raw) / (1024 * 1024)
+                if _vid_mb_up > _MAX_BG_VIDEO_MB:
+                    st.error(f"That video is {_vid_mb_up:,.1f} MB — please trim/compress it under "
+                             f"{_MAX_BG_VIDEO_MB} MB first (large videos are slow to load for visitors and "
+                             f"can fail to save). Free tools: HandBrake, or ffmpeg "
+                             f"(`ffmpeg -i in.mp4 -vf scale=1920:-2 -crf 28 -an out.mp4`).")
+                else:
+                    _vid_name = bgvid_up.name.lower()
+                    _vid_mime = ("video/webm" if _vid_name.endswith(".webm")
+                                 else "video/quicktime" if _vid_name.endswith(".mov")
+                                 else "video/mp4")
+                    b["bg_video"] = _vid_raw
+                    b["bg_video_mime"] = _vid_mime
+                    st.success(f"Live wallpaper ready below ({_vid_mb_up:,.1f} MB) — click "
+                               f"'Save branding for everyone' to publish it.")
+
+            st.divider()
             st.markdown("**🕷️ Interactive cursor-following creature**")
             st.caption("A small live creature that follows the visitor's mouse cursor around the login "
                        "page — works purely in the browser (no server calls), so it's smooth and free. "
-                       "When ON, this **replaces** the static wallpaper above on the login page (the "
-                       "wallpaper image itself isn't deleted — turn this back OFF and it reappears "
-                       "exactly as it was). When OFF, the static wallpaper (or plain background, if none "
-                       "is set) shows as usual.")
+                       "When ON, this **replaces** the static wallpaper / live video wallpaper above on the "
+                       "login page (neither is deleted — turn this back OFF and whichever one was set "
+                       "reappears exactly as it was). When OFF, the live video wallpaper (if set), else the "
+                       "static image wallpaper (if set), else the plain background shows, in that order.")
             b["interactive_bg_enabled"] = st.toggle(
                 "Enable interactive cursor creature on the login page",
                 b.get("interactive_bg_enabled", False), key="brand_interactive_bg_enabled")
