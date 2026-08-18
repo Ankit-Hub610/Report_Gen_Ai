@@ -784,59 +784,38 @@ def login_screen():
 
 
 def _render_interactive_login_background():
-    """🕷️ Admin-toggleable: small creatures made of a body + wiggling legs,
-    drawn on a full-page canvas, that ease toward wherever the visitor's
-    mouse is. Pure browser JS/canvas - no server round-trip once loaded, so
-    it stays smooth. Two things make this actually work inside a Streamlit
-    components.html iframe:
+    """🕷️ Admin-toggleable: a spider made of a body + 8 legs, drawn on a
+    full-page canvas, that walks toward wherever the visitor's mouse is —
+    legs move in a real alternating tripod gait (4 legs step while the
+    other 4 plant), not just a uniform pulsing starburst. Pure browser
+    JS/canvas, no server round-trip once loaded. The page's normal
+    background (white/default, or whatever static wallpaper would show)
+    is left completely untouched — only the canvas layer is added on top,
+    drawn in a dark colour so it's actually visible against a light page.
+
+    Two things make this work inside a Streamlit components.html iframe:
       1. The canvas listens for mousemove on window.parent.document (the
-         REAL page), not just its own iframe - otherwise it would only ever
+         REAL page), not just its own iframe - otherwise it would only
          react to the cursor while directly over the iframe's own box.
       2. The iframe re-styles ITSELF (via window.frameElement, reachable
          since components.html iframes share the parent page's origin) to
-         cover the full viewport, sit behind everything (z-index -1), and
-         ignore clicks (pointer-events: none) - so the actual login form on
-         top of it stays perfectly usable. Both only need same-origin JS,
-         no custom Streamlit component build required.
-    A dark solid page background is set alongside it (plain CSS, not part
-    of the iframe) so the creatures are actually visible regardless of the
-    visitor's system theme.
+         cover the full viewport, sit on top (so the spider is visible)
+         but ignore clicks (pointer-events: none) - so the actual login
+         form stays perfectly usable underneath it.
     """
-    st.markdown("""
-        <style>
-        [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer"] > .main,
-        [data-testid="stMain"], section.main, .stApp {
-            background: #0a0a12 !important;
-        }
-        [data-testid="stHeader"] { background: transparent !important; }
-        [data-testid="stForm"] {
-            background: rgba(255, 255, 255, 0.92);
-            backdrop-filter: blur(10px);
-            border-radius: 16px;
-            padding: 1.75rem 1.5rem 1.25rem 1.5rem;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-        }
-        div[data-testid="stExpander"] {
-            background: rgba(255, 255, 255, 0.92);
-            border-radius: 12px;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-        }
-        </style>
-    """, unsafe_allow_html=True)
     st.components.v1.html("""
-        <canvas id="_ra_creature_canvas" style="display:block;"></canvas>
+        <canvas id="_ra_spider_canvas" style="display:block;"></canvas>
         <script>
         (function() {
             try {
                 var fe = window.frameElement;
                 if (fe) {
                     fe.style.cssText = "position:fixed; inset:0; width:100vw; height:100vh; " +
-                                        "z-index:0; pointer-events:none; border:none;";
+                                        "z-index:-1; pointer-events:none; border:none;";
                 }
             } catch (e) {}
 
-            var canvas = document.getElementById('_ra_creature_canvas');
+            var canvas = document.getElementById('_ra_spider_canvas');
             var ctx = canvas.getContext('2d');
             var pdoc = (window.parent && window.parent.document) ? window.parent.document : document;
             var pwin = window.parent || window;
@@ -858,46 +837,97 @@ def _render_interactive_login_background():
                 }
             });
 
-            var N = 3;
-            var creatures = [];
-            for (var i = 0; i < N; i++) {
-                creatures.push({
-                    x: Math.random() * canvas.width, y: Math.random() * canvas.height,
-                    legPhase: Math.random() * Math.PI * 2, offsetAngle: i * 2.4
-                });
+            var LEG_COUNT = 8, REST_R = 38, BODY_R = 9;
+            var SPIDER_COLOR = "rgba(30,30,35,0.75)";
+
+            function makeSpider(x, y, followOffset) {
+                var legs = [];
+                for (var i = 0; i < LEG_COUNT; i++) {
+                    var a = (i / LEG_COUNT) * Math.PI * 2;
+                    legs.push({
+                        angle: a, group: i % 2,   // alternating tripod-style groups
+                        foot: { x: x + Math.cos(a) * REST_R, y: y + Math.sin(a) * REST_R }
+                    });
+                }
+                return { x: x, y: y, legs: legs, followOffset: followOffset, walkT: Math.random() * 10 };
             }
 
-            function drawCreature(s, t) {
-                var legs = 8, legLen = 24;
-                ctx.strokeStyle = "rgba(255,255,255,0.35)";
-                ctx.lineWidth = 1.4;
-                for (var i = 0; i < legs; i++) {
-                    var angle = (i / legs) * Math.PI * 2 + s.legPhase;
-                    var wig = Math.sin(t / 220 + i * 1.3) * 7;
-                    var lx = s.x + Math.cos(angle) * (legLen + wig);
-                    var ly = s.y + Math.sin(angle) * (legLen + wig);
-                    var kx = s.x + Math.cos(angle) * (legLen * 0.5);
-                    var ky = s.y + Math.sin(angle) * (legLen * 0.5) + Math.sin(t / 180 + i) * 3;
+            function idealFoot(spider, leg) {
+                return { x: spider.x + Math.cos(leg.angle) * REST_R,
+                         y: spider.y + Math.sin(leg.angle) * REST_R };
+            }
+
+            function drawSpider(s) {
+                ctx.strokeStyle = SPIDER_COLOR;
+                ctx.fillStyle = SPIDER_COLOR;
+                ctx.lineWidth = 2;
+                ctx.lineCap = "round";
+                for (var i = 0; i < s.legs.length; i++) {
+                    var leg = s.legs[i];
+                    // Knee bends outward (away from body centre) partway along the leg -
+                    // this is what reads as an actual jointed leg instead of a straight spike.
+                    var mx = (s.x + leg.foot.x) / 2, my = (s.y + leg.foot.y) / 2;
+                    var perpA = leg.angle + Math.PI / 2;
+                    var bend = 10 * (leg.group === 0 ? 1 : -1);
+                    var kx = mx + Math.cos(perpA) * bend, ky = my + Math.sin(perpA) * bend;
                     ctx.beginPath();
                     ctx.moveTo(s.x, s.y);
-                    ctx.quadraticCurveTo(kx, ky, lx, ly);
+                    ctx.quadraticCurveTo(kx, ky, leg.foot.x, leg.foot.y);
                     ctx.stroke();
                 }
-                ctx.fillStyle = "rgba(255,255,255,0.65)";
+                // Body: two overlapping ellipses (abdomen + head) reads as "spider", not a dot.
                 ctx.beginPath();
-                ctx.arc(s.x, s.y, 5, 0, Math.PI * 2);
+                ctx.ellipse(s.x, s.y, BODY_R * 1.15, BODY_R, 0, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.beginPath();
+                ctx.ellipse(s.x - Math.cos(s.facing || 0) * BODY_R, s.y - Math.sin(s.facing || 0) * BODY_R,
+                            BODY_R * 0.55, BODY_R * 0.5, 0, 0, Math.PI * 2);
                 ctx.fill();
             }
 
+            function stepSpider(s, dt) {
+                var tx = mouseX + Math.cos(s.followOffset) * 22;
+                var ty = mouseY + Math.sin(s.followOffset) * 22;
+                var dx = tx - s.x, dy = ty - s.y;
+                var dist = Math.sqrt(dx * dx + dy * dy);
+                var moving = dist > 2;
+                if (moving) {
+                    s.facing = Math.atan2(dy, dx);
+                    s.x += dx * Math.min(0.08, 4 / Math.max(dist, 1));
+                    s.y += dy * Math.min(0.08, 4 / Math.max(dist, 1));
+                    s.walkT += dt * 10;
+                }
+                // Alternating tripod gait: group 0 legs lift+step while group 1 plant, then swap.
+                var cycle = Math.sin(s.walkT);
+                for (var i = 0; i < s.legs.length; i++) {
+                    var leg = s.legs[i];
+                    var groupPhase = leg.group === 0 ? cycle : -cycle;
+                    var ideal = idealFoot(s, leg);
+                    if (moving && groupPhase > 0.6) {
+                        // this leg is "in the air" this instant - snap its resting point forward
+                        leg.foot.x += (ideal.x - leg.foot.x) * 0.5;
+                        leg.foot.y += (ideal.y - leg.foot.y) * 0.5;
+                    } else {
+                        // planted - drift gently toward ideal so it doesn't stay stuck forever
+                        leg.foot.x += (ideal.x - leg.foot.x) * 0.03;
+                        leg.foot.y += (ideal.y - leg.foot.y) * 0.03;
+                    }
+                }
+            }
+
+            var spiders = [
+                makeSpider(pwin.innerWidth * 0.3, pwin.innerHeight * 0.6, 0),
+                makeSpider(pwin.innerWidth * 0.7, pwin.innerHeight * 0.5, 3.2),
+            ];
+
+            var lastT = 0;
             function tick(t) {
+                var dt = Math.min(0.05, (t - lastT) / 1000 || 0.016);
+                lastT = t;
                 ctx.clearRect(0, 0, canvas.width, canvas.height);
-                creatures.forEach(function(s) {
-                    var tx = mouseX + Math.cos(s.offsetAngle) * 26;
-                    var ty = mouseY + Math.sin(s.offsetAngle) * 26;
-                    s.x += (tx - s.x) * 0.07;
-                    s.y += (ty - s.y) * 0.07;
-                    s.legPhase += 0.025;
-                    drawCreature(s, t || 0);
+                spiders.forEach(function(s) {
+                    stepSpider(s, dt);
+                    drawSpider(s);
                 });
                 requestAnimationFrame(tick);
             }
