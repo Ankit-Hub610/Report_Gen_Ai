@@ -46,17 +46,16 @@ files are auto-migrated the first time this module loads, so nobody gets
 locked out by this upgrade.
 """
 
+import base64
 import hashlib
+import hmac
 import json
-import math
 import os
 import secrets
 import time
 
 CRED_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "credentials.json")
-SESSIONS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sessions.json")
 SESSION_LIFETIME_SECONDS = 7 * 24 * 60 * 60   # 7 days of inactivity before a "stay logged in" link expires
-TRIAL_DAYS = 14   # how long a brand-new "free" account gets full-but-capped access before it locks
 
 ROLE_ADMIN = "admin"
 ROLE_CLIENT = "client"
@@ -126,12 +125,6 @@ def _migrate_if_old_format(raw: dict) -> dict:
     for uname, info in raw["users"].items():
         info.setdefault("workspace_id", uname)
         info.setdefault("plan", "standard")   # existing accounts stay unlimited — nobody gets newly capped by surprise
-        # Standard = "standard" with no expiry (permanent) unless a duration was
-        # set (e.g. via a UPI approval). Existing pre-this-feature accounts get
-        # no expiry at all, same "unlimited" behaviour they already had.
-        info.setdefault("standard_expires_at", None)
-        info.setdefault("billing_cycle", None)
-        info.setdefault("trial_started_at", None)
         if info.get("role") not in ALL_ROLES:
             info["role"] = ROLE_VIEWER
     return raw
@@ -180,102 +173,10 @@ def verify_login(username: str, password_plain: str):
 
 
 def get_plan(username: str) -> str:
-    """Returns the RAW stored base plan: 'standard' or 'free'. This does NOT
-    account for expiry (a 'standard' account whose subscription lapsed still
-    shows 'standard' here) - use get_effective_plan() for the real, current
-    access level. This one stays around for places that just need the base
-    plan (e.g. the admin panel's own free/standard branch)."""
+    """Returns 'standard' (unlimited) or 'free' (capped — see usage_limits.py)."""
     store = _load_store()
     user = store["users"].get((username or "").strip())
     return (user or {}).get("plan", "standard")
-
-
-def get_trial_status(username: str) -> dict:
-    """For a 'free' account: how much of its TRIAL_DAYS trial is left.
-    Recomputed fresh from trial_started_at every call - never cached - so it
-    is always correct the moment it's asked, not just at login."""
-    store = _load_store()
-    info = store["users"].get((username or "").strip()) or {}
-    started = info.get("trial_started_at")
-    if not started:
-        return {"expired": False, "days_left": TRIAL_DAYS}
-    elapsed_days = (time.time() - started) / 86400.0
-    days_left = max(0, math.ceil(TRIAL_DAYS - elapsed_days))
-    return {"expired": elapsed_days >= TRIAL_DAYS, "days_left": days_left}
-
-
-def get_subscription_status(username: str) -> dict:
-    """For a 'standard' account: when (if ever) it expires. expires_at is
-    None for a permanent/manual grant (no auto-expiry). Recomputed fresh
-    every call, same reasoning as get_trial_status()."""
-    store = _load_store()
-    info = store["users"].get((username or "").strip()) or {}
-    expires_at = info.get("standard_expires_at")
-    billing_cycle = info.get("billing_cycle")
-    if not expires_at:
-        return {"expires_at": None, "billing_cycle": billing_cycle, "days_left": None, "expired": False}
-    days_left = max(0, math.ceil((expires_at - time.time()) / 86400.0))
-    return {"expires_at": expires_at, "billing_cycle": billing_cycle,
-            "days_left": days_left, "expired": time.time() >= expires_at}
-
-
-def get_effective_plan(username: str) -> str:
-    """The REAL, current access level: 'free', 'standard', or
-    'expired_standard' (was Standard, subscription lapsed, needs to renew).
-    Always recomputed fresh from disk - this is deliberately NOT cached
-    anywhere beyond a single call, specifically so that an admin's approval
-    (or a subscription's natural expiry) shows up the moment app.py next
-    calls this - on literally the next rerun (any click/page-change) for
-    everyone, plus near-instantly on the Plans page itself via its own
-    short auto-refresh timer - instead of only after logging out and back
-    in, which was the actual bug being fixed here."""
-    store = _load_store()
-    info = store["users"].get((username or "").strip()) or {}
-    base = info.get("plan", "standard")
-    if base == "standard":
-        sub = get_subscription_status(username)
-        if sub["expires_at"] and sub["expired"]:
-            return "expired_standard"
-        return "standard"
-    return "free"
-
-
-def set_plan(username: str, plan: str, duration_days: int = None, billing_cycle: str = None):
-    """Admin action - approving a UPI request, a manual grant, a downgrade,
-    or a reversal all go through here.
-      plan: "standard" or "free".
-      duration_days: for "standard", how many days from NOW it's valid
-        (e.g. 30 for a monthly approval, 365 for yearly). Omit/None for a
-        permanent manual grant with no auto-expiry (e.g. admin comps someone
-        via the 'Upgrade to Standard (unlimited)' button).
-      billing_cycle: "monthly" / "yearly" / None - display-only, doesn't
-        affect anything else."""
-    store = _load_store()
-    username = (username or "").strip()
-    if username not in store["users"]:
-        raise ValueError(f"Unknown user: {username}")
-    info = store["users"][username]
-    info["plan"] = "standard" if plan == "standard" else "free"
-    if info["plan"] == "standard":
-        info["standard_expires_at"] = (time.time() + duration_days * 86400) if duration_days else None
-        info["billing_cycle"] = billing_cycle
-    else:
-        info["standard_expires_at"] = None
-        info["billing_cycle"] = None
-        if not info.get("trial_started_at"):
-            info["trial_started_at"] = time.time()   # fresh trial clock, per the "moved to Free" message in the Admin Panel
-    _save_store(store)
-
-
-def reset_trial(username: str):
-    """Gives a 'free' account a fresh TRIAL_DAYS-day clock, without touching
-    its role, password, or workspace."""
-    store = _load_store()
-    username = (username or "").strip()
-    if username not in store["users"]:
-        raise ValueError(f"Unknown user: {username}")
-    store["users"][username]["trial_started_at"] = time.time()
-    _save_store(store)
 
 
 def verify_admin_login(username: str, password_plain: str) -> bool:
@@ -351,18 +252,6 @@ def create_or_update_user(username: str, password_plain: str, role: str, workspa
         entry["plan"] = store["users"][username]["plan"]   # keep existing plan on an update that didn't touch it
     else:
         entry["plan"] = "standard"
-
-    existing = store["users"].get(username, {})
-    entry["standard_expires_at"] = existing.get("standard_expires_at")
-    entry["billing_cycle"] = existing.get("billing_cycle")
-    entry["trial_started_at"] = existing.get("trial_started_at")
-    if entry["plan"] == "free" and not entry["trial_started_at"]:
-        entry["trial_started_at"] = time.time()   # first time this account is Free — trial clock starts now
-    if entry["plan"] == "standard":
-        # switching TO standard clears any leftover trial clock so a later
-        # downgrade back to free starts a fresh trial, not a stale one
-        entry["trial_started_at"] = None
-
     store["users"][username] = entry
     _save_store(store)
 
@@ -429,63 +318,99 @@ def user_exists(username: str) -> bool:
 # Streamlit wipes st.session_state on a genuine browser refresh/reload (a new
 # in-memory session starts from scratch), which is why a plain "if not
 # session_state.authenticated: show login" was kicking people back to the
-# login screen just from hitting refresh. To fix that WITHOUT weakening
-# security (i.e. without keeping people logged in forever), we hand out a
-# random, unguessable token on successful login, put it in the page's URL
-# (?s=<token>) so the browser keeps re-sending it on every reload, and look
-# it up here — a token only proves who you are for SESSION_LIFETIME_SECONDS
-# and gets deleted immediately on logout or password change.
+# login screen just from hitting refresh. The token itself lives in a real
+# browser COOKIE (see app.py: _set_session_cookie), never in the URL — so
+# copy-pasting the page's link into a different browser/device never carries
+# a login with it, only the SAME browser that received the cookie stays in.
+#
+# STATELESS BY DESIGN (this was the actual bug — read on):
+# An earlier version of this kept a server-side sessions.json mapping
+# token -> username, similar to credentials.json. That looked fine locally,
+# but on a host like Streamlit Community Cloud the app's local disk is NOT
+# permanent (see DEPLOY_README.md) — every time the container sleeps from
+# inactivity and wakes back up, or a new version is deployed, it's rebuilt
+# fresh from GitHub. sessions.json isn't committed to GitHub (it's in
+# .gitignore, same as credentials.json's old draft was), so it silently got
+# wiped on every one of those restarts. The BROWSER still had a perfectly
+# valid cookie, but the server had nothing left to look it up against — so
+# a real refresh could still bounce someone back to the login screen,
+# exactly like it did before this feature existed.
+#
+# Fix: the token is now SELF-VERIFYING (username + expiry + an HMAC
+# signature), so resolving it needs no server-side lookup at all — it
+# survives a container rebuild perfectly, the same way a password does
+# (passwords work fine across restarts because credentials.json IS
+# committed to GitHub). The one signing secret it needs is generated once
+# and stored inside credentials.json itself, so it persists the same way.
+#
+# Trade-off, stated plainly: destroy_session() (explicit Logout) can no
+# longer force-invalidate a specific token server-side, because there's no
+# longer a server-side list to remove it from — clearing the browser
+# cookie is what actually logs that browser out. A copied/stolen token
+# would keep working until it naturally expires (SESSION_LIFETIME_SECONDS,
+# 7 days), same as it always could between a login and the next password
+# change. That's a reasonable trade for "refresh no longer randomly logs
+# people out", but it's worth knowing about.
 # ==================================================================================
 
-def _load_sessions() -> dict:
-    if not os.path.exists(SESSIONS_FILE):
-        return {}
-    try:
-        with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return {}
-    now = time.time()
-    return {tok: v for tok, v in data.items() if v.get("expires", 0) > now}   # drop expired on every read
-
-
-def _save_sessions(sessions: dict):
-    with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
-        json.dump(sessions, f, indent=2)
+def _get_session_secret() -> bytes:
+    """The HMAC signing key for session tokens — generated once and stored
+    inside credentials.json (which already persists across restarts/
+    redeploys) so signatures keep validating even after the container is
+    rebuilt from scratch."""
+    store = _load_store()
+    secret_hex = store.get("_session_secret")
+    if not secret_hex:
+        secret_hex = secrets.token_hex(32)
+        store["_session_secret"] = secret_hex
+        _save_store(store)
+    return bytes.fromhex(secret_hex)
 
 
 def create_session(username: str) -> str:
-    """Called right after a successful login. Returns a token to put in the URL."""
-    sessions = _load_sessions()
-    token = secrets.token_urlsafe(24)
-    sessions[token] = {"username": username, "expires": time.time() + SESSION_LIFETIME_SECONDS}
-    _save_sessions(sessions)
-    return token
+    """Called right after a successful login (and again to silently extend
+    an already-valid one — see app.py's cookie-restore block). Returns a
+    signed, stateless token to store in the browser cookie."""
+    secret = _get_session_secret()
+    expires = int(time.time()) + SESSION_LIFETIME_SECONDS
+    payload = f"{username}|{expires}"
+    payload_b64 = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("utf-8").rstrip("=")
+    sig = hmac.new(secret, payload_b64.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{payload_b64}.{sig}"
 
 
 def resolve_session(token: str):
-    """Given a token from the URL, returns the username it belongs to (and
-    silently refreshes its expiry, so an active user's link keeps working),
-    or None if the token is missing/expired/was logged out."""
-    if not token:
+    """Given a token from the cookie, returns the username it belongs to, or
+    None if it's missing/malformed/tampered-with/expired. Verifies entirely
+    from the token itself (signature + embedded expiry) — no server-side
+    file lookup, so this keeps working right after a container rebuild."""
+    if not token or "." not in token:
         return None
-    sessions = _load_sessions()
-    entry = sessions.get(token)
-    if not entry:
+    payload_b64, _, sig = token.rpartition(".")
+    secret = _get_session_secret()
+    expected_sig = hmac.new(secret, payload_b64.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected_sig):
+        return None   # bad signature - either tampered with, or signed under an old/different secret
+    try:
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        payload = base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8")
+        username, _, expires_str = payload.rpartition("|")
+        expires = int(expires_str)
+    except Exception:
         return None
-    entry["expires"] = time.time() + SESSION_LIFETIME_SECONDS   # sliding expiry: still-active users don't get logged out
-    _save_sessions(sessions)
-    return entry["username"]
+    if time.time() > expires:
+        return None
+    return username
 
 
 def destroy_session(token: str):
-    """Called on explicit Logout — invalidates the link immediately."""
-    if not token:
-        return
-    sessions = _load_sessions()
-    if token in sessions:
-        del sessions[token]
-        _save_sessions(sessions)
+    """Called on explicit Logout. Tokens are stateless/self-verifying (see
+    the block comment above) precisely so login survives a container
+    restart — which means there's no server-side record left to delete.
+    The actual logout happens by clearing the browser cookie (see app.py:
+    _clear_session_cookie right after this is called); kept as a function
+    so every existing call site keeps working unchanged."""
+    return
 
 
 # ==================================================================================
