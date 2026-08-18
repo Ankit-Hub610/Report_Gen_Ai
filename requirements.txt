@@ -1,6 +1,11 @@
 streamlit>=1.38  # PINNED (min version) — a reasonably recent Streamlit is needed
                  # for extra_streamlit_components (the "stay logged in on
                  # refresh" cookie, see app.py: CookieManager) to work reliably.
+Pillow  # explicit — used to resize/recompress branding images (logo, login wallpaper)
+        # before storage, so the whole branding blob stays small enough to sync
+        # reliably via GitHub (see app.py: _resize_for_branding). Streamlit already
+        # depends on Pillow transitively, but pinning it here is more robust than
+        # relying on that indirect dependency staying true forever.
 extra-streamlit-components  # CookieManager — real browser cookie for "stay logged in
                              # on refresh" (see app.py: _set_session_cookie /
                              # _get_session_cookie). Replaced an earlier hand-rolled
