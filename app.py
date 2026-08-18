@@ -502,20 +502,18 @@ def _detect_theme_mode():
     return "dark"
 
 
-def _resize_for_branding(raw: bytes, max_dimension: int = 1600) -> tuple:
-    """Shrinks a branding image (logo or login wallpaper) down to a sane size
-    before it's stored. This is the actual fix for 'wallpaper saved fine but
-    doesn't show up on the login page' - the whole branding blob (all logos +
-    wallpaper together) gets synced via GitHub's Contents API, and that API
-    can PUT (save) a file over ~1MB just fine but silently fails to return
-    its content on a later GET (read) - so the save always looked successful
-    with no error, but a fresh session (a different visitor, or the admin's
-    own login page in a new tab) would load branding, fail to fetch the
-    oversized blob, and silently fall back to 'no wallpaper'. A raw photo
-    upload (a few MB is normal for a phone photo or stock image) blew right
-    past that limit with zero warning. Capping every branding image to at
-    most `max_dimension` px on its longest side keeps the whole blob small
-    and reliable, no matter what someone uploads.
+def _resize_for_branding(raw: bytes, max_dimension: int = 1600, quality: int = 85) -> tuple:
+    """Shrinks a branding image (logo or login wallpaper) down to at most
+    `max_dimension` px on its longest side before it's stored — logos stay at
+    the smaller default (1600px, plenty crisp for something shown at a few
+    hundred px wide); the login wallpaper is called with a much higher cap
+    (see _process_logo_file/_fetch_logo_from_url below) since it's meant to
+    fill the whole screen and genuinely benefits from being Full HD/4K/8K.
+    This is no longer about working around GitHub's Contents API size limit —
+    that's now handled properly in _github_get_file (falls back to the raw
+    download_url for anything over ~1MB) — this cap now exists only to stop a
+    truly absurd upload (e.g. a 40-megapixel raw photo) from bloating storage
+    for no visible benefit, not to protect a persistence quirk.
     Returns (bytes, mime) - PNG only if the source actually has transparency
     (most logos), JPEG otherwise (photos compress far better as JPEG).
     """
@@ -534,16 +532,15 @@ def _resize_for_branding(raw: bytes, max_dimension: int = 1600) -> tuple:
         else:
             if img.mode != "RGB":
                 img = img.convert("RGB")
-            img.save(out, format="JPEG", quality=85, optimize=True)
+            img.save(out, format="JPEG", quality=quality, optimize=True)
             return out.getvalue(), "image/jpeg"
     except Exception:
         # Pillow not available or the file wasn't a decodable image - fall back
-        # to storing it as-is rather than blocking the upload entirely. Large
-        # files can still hit the GitHub sync issue described above in this case.
+        # to storing it as-is rather than blocking the upload entirely.
         return raw, None
 
 
-def _process_logo_file(uploaded_file):
+def _process_logo_file(uploaded_file, max_dimension: int = 1600, quality: int = 85):
     """Turns an uploaded PNG/JPG/JPEG/PDF into (bytes, mime) ready to store
     and hand straight to st.image. PDFs get their first page rendered down
     to a PNG (needs the optional PyMuPDF package - see requirements.txt).
@@ -568,18 +565,18 @@ def _process_logo_file(uploaded_file):
             return None, None
     else:
         fallback_mime = "image/jpeg" if name.endswith((".jpg", ".jpeg")) else "image/png"
-    data, mime = _resize_for_branding(raw)
+    data, mime = _resize_for_branding(raw, max_dimension=max_dimension, quality=quality)
     return data, (mime or fallback_mime)
 
 
-def _fetch_logo_from_url(url: str):
+def _fetch_logo_from_url(url: str, max_dimension: int = 1600, quality: int = 85):
     """Downloads an image from a direct link for the 'paste a link' branding
     option, resizes/recompresses it the same way as an upload (see
     _resize_for_branding), and returns (bytes, mime). Returns (None, None)
     and shows an st.error on failure — bad URL, not an image, too slow, etc."""
     try:
         import requests
-        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200:
             st.error(f"Couldn't fetch that link (HTTP {r.status_code}).")
             return None, None
@@ -589,7 +586,7 @@ def _fetch_logo_from_url(url: str):
                       "or serve an image content-type).")
             return None, None
         fallback_mime = "image/jpeg" if "jpeg" in content_type or url.lower().endswith((".jpg", ".jpeg")) else "image/png"
-        data, mime = _resize_for_branding(r.content)
+        data, mime = _resize_for_branding(r.content, max_dimension=max_dimension, quality=quality)
         return data, (mime or fallback_mime)
     except Exception as e:
         st.error(f"Couldn't fetch that link: {e}")
@@ -3703,28 +3700,36 @@ elif page == "⚙️ Settings":
             st.markdown("**🖼️ Login page background wallpaper**")
             st.caption("Optional full-page background image behind the sign-in form. Leave empty for the "
                        "plain default background. Same login/logo text stays visible on top - a lighter, "
-                       "not-too-busy image usually looks best.")
+                       "not-too-busy image usually looks best. **Full HD / 4K / 8K supported** — uploads are "
+                       "kept at their original resolution up to 8K (7680px), only compressed a little "
+                       "(quality 92 JPEG) to keep load times reasonable; nothing gets downscaled to a blurry "
+                       "small size like before.")
             if b.get("bg_image"):
                 st.image(b["bg_image"], width=320)
+                _bg_kb = len(b["bg_image"]) / 1024
+                st.caption(f"Current wallpaper: {_bg_kb:,.0f} KB")
                 if st.button("🗑️ Remove wallpaper", key="brand_bg_rm"):
                     b["bg_image"] = None
                     b["bg_image_mime"] = None
                     st.rerun()
-            bg_up = st.file_uploader("Upload PNG / JPG / JPEG", type=["png", "jpg", "jpeg"], key="brand_bg_up")
+            bg_up = st.file_uploader("Upload PNG / JPG / JPEG (Full HD / 4K / 8K all fine)",
+                                      type=["png", "jpg", "jpeg"], key="brand_bg_up")
             if bg_up is not None:
-                bg_data, bg_mime = _process_logo_file(bg_up)
+                bg_data, bg_mime = _process_logo_file(bg_up, max_dimension=7680, quality=92)
                 if bg_data:
                     b["bg_image"] = bg_data
                     b["bg_image_mime"] = bg_mime
-                    st.success("Wallpaper ready below — click 'Save branding for everyone' to publish it.")
+                    st.success(f"Wallpaper ready below ({len(bg_data)/1024:,.0f} KB) — click "
+                               f"'Save branding for everyone' to publish it.")
             bg_url = st.text_input("...or paste a direct image link", key="brand_bg_url",
                                     placeholder="https://...")
             if st.button("Use this link", key="brand_bg_url_btn") and bg_url.strip():
-                bg_data, bg_mime = _fetch_logo_from_url(bg_url.strip())
+                bg_data, bg_mime = _fetch_logo_from_url(bg_url.strip(), max_dimension=7680, quality=92)
                 if bg_data:
                     b["bg_image"] = bg_data
                     b["bg_image_mime"] = bg_mime
-                    st.success("Wallpaper ready below — click 'Save branding for everyone' to publish it.")
+                    st.success(f"Wallpaper ready below ({len(bg_data)/1024:,.0f} KB) — click "
+                               f"'Save branding for everyone' to publish it.")
 
             st.divider()
             st.markdown("**✨ Neon / Glow Lighting**")
