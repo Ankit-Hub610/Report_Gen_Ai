@@ -33,6 +33,21 @@ FREE_PLAN_LIMITS = {
     "max_rows": 5000,      # rows accepted from an uploaded file / DB query
 }
 
+# Max number of Slides (independent datasets/dashboards) a workspace may
+# have at once - not a daily count, just a hard cap enforced whenever
+# "+ New Slide" is clicked. "standard" is the default plan for every
+# existing account (see module docstring above), so this is generous.
+SLIDE_LIMITS = {
+    "free": 3,
+    "standard": 10,
+}
+
+
+def slide_limit_for_plan(plan: str) -> int:
+    """Max slides allowed for this plan. Unknown plan names fall back to the
+    (more generous) 'standard' cap rather than blocking unexpectedly."""
+    return SLIDE_LIMITS.get(plan, SLIDE_LIMITS["standard"])
+
 
 def _today_str():
     import datetime
