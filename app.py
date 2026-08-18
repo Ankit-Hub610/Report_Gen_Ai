@@ -695,14 +695,28 @@ def login_screen():
         _bg_b64 = base64.b64encode(_bg).decode("utf-8")
         st.markdown(f"""
         <style>
-        [data-testid="stAppViewContainer"] > .main {{
-            background-image: url("data:{_bg_mime};base64,{_bg_b64}");
-            background-size: cover;
-            background-position: center;
-            background-attachment: fixed;
-            background-repeat: no-repeat;
+        /* Several selectors targeted at once, not just one - Streamlit's internal
+           class names (like .main) aren't a stable public API and have changed
+           between versions (this app pins streamlit>=1.38 with no upper bound,
+           so Streamlit Cloud always installs whatever the latest release is,
+           which may not match the exact DOM shape this was originally written
+           against). data-testid attributes are the more stable hook, but even
+           those have been renamed before (e.g. an older "stMain" vs a newer
+           one) - so this covers every variant seen in the wild rather than
+           betting on just one, which is what silently showed no background at
+           all despite the image being set and saved correctly. */
+        [data-testid="stAppViewContainer"],
+        [data-testid="stAppViewContainer"] > .main,
+        [data-testid="stMain"],
+        section.main,
+        .stApp {{
+            background-image: url("data:{_bg_mime};base64,{_bg_b64}") !important;
+            background-size: cover !important;
+            background-position: center !important;
+            background-attachment: fixed !important;
+            background-repeat: no-repeat !important;
         }}
-        [data-testid="stHeader"] {{ background: transparent; }}
+        [data-testid="stHeader"] {{ background: transparent !important; }}
         [data-testid="stForm"] {{
             background: rgba(255, 255, 255, 0.92);
             backdrop-filter: blur(10px);
