@@ -609,6 +609,31 @@ def _logo_img_html(logo_bytes: bytes, mime: str, width: int, extra_style: str = 
 
 
 def login_screen():
+    # Full-page gradient wallpaper + a frosted-glass look for the login
+    # card, just for this screen (scoped here, not applied once logged in).
+    st.markdown("""
+    <style>
+    [data-testid="stAppViewContainer"] > .main {
+        background: linear-gradient(135deg, #0f2027 0%, #203a43 45%, #2c5364 100%);
+        background-attachment: fixed;
+    }
+    [data-testid="stHeader"] { background: transparent; }
+    [data-testid="stForm"] {
+        background: rgba(255, 255, 255, 0.92);
+        backdrop-filter: blur(10px);
+        border-radius: 16px;
+        padding: 1.75rem 1.5rem 1.25rem 1.5rem;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(255, 255, 255, 0.25);
+    }
+    div[data-testid="stExpander"] {
+        background: rgba(255, 255, 255, 0.92);
+        border-radius: 12px;
+        border: 1px solid rgba(255, 255, 255, 0.25);
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
     brand = st.session_state.get("app_brand") or DEFAULT_BRAND
     _mode = _detect_theme_mode()
     _logo = brand.get(f"logo_{_mode}") or brand.get("logo_dark") or brand.get("logo_light")
@@ -618,8 +643,8 @@ def login_screen():
         with _lc2:
             _img_html = _logo_img_html(_logo, _logo_mime, brand.get("logo_width", 220))
             _render_glow_target("brand_glow_logo", "logo", brand, _img_html)
-    st.markdown("<h1 style='text-align:center;'>Research | Analysis | Intellegance </h1>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align:center;color:#ffffff;text-shadow:0 2px 8px rgba(0,0,0,0.4);'>Research | Analysis | Intellegance </h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center;color:#dbe6ec;'>Please sign in to continue</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
         with st.form("login_form"):
