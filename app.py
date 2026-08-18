@@ -141,7 +141,7 @@ DEFAULT_BRAND = {
     "tagline_color": "#FFFFFF",
     "tagline_size": 32,     # px
     "tagline_bold": True,
-    "subtitle_text": "Please sign in to continue",
+    "subtitle_text": "You logged out and I upgrade.",
     "subtitle_color": "#E0E0E0",
     "subtitle_size": 15,    # px
 }
@@ -742,7 +742,7 @@ def login_screen():
                f"{brand.get('tagline_text', 'Research | Analysis | Intelligence')}</h1>", unsafe_allow_html=True)
     st.markdown(f"<p style='text-align:center;color:{brand.get('subtitle_color', '#E0E0E0')};"
                f"font-size:{brand.get('subtitle_size', 15)}px;'>"
-               f"{brand.get('subtitle_text', 'Please sign in to continue')}</p>", unsafe_allow_html=True)
+               f"{brand.get('subtitle_text', 'You logged out and I upgrade.')}</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
         with st.form("login_form"):
