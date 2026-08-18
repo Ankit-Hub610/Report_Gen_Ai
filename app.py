@@ -135,7 +135,7 @@ def init_state():
     ss.setdefault("plan", "standard")   # "standard" (unlimited) or "free" (capped, see usage_limits.py)
     ss.setdefault("workspace_id", None)      # which data workspace this account owns (Phase 4: multi-tenant)
     ss.setdefault("view_as_workspace", None)  # admin-only: workspace_id currently being viewed/managed instead of their own
-    ss.setdefault("_loaded_workspace_id", None)  # which workspace's data is currently sitting in session_state
+
     ss.setdefault("df_raw", None)
     ss.setdefault("meta", None)
     ss.setdefault("filters", {})
@@ -147,6 +147,7 @@ def init_state():
     ss.setdefault("p1_kpi_format", {})      # {kpi_label: format_code} — per-card NUMBER FORMAT (e.g. one card
                                              # shows "58.18 L", another shows "5,818,432.00", another "12.3%") —
                                              # each card remembers its own choice independently of every other card.
+
     ss.setdefault("p1_kpi_custom_code", {})  # {kpi_label: "custom Excel-style code"} — only used when that
                                               # card's format is set to "Custom (type Excel format code)"
     ss.setdefault("page", "Connect Data")
@@ -188,6 +189,10 @@ def init_state():
     ss.setdefault("_intel_narrative", None)     # session-only — cached AI narrative text, keyed by (cache_key, language)
     ss.setdefault("intel_qa_history", [])       # session-only — follow-up Q&A chat log on this page
 
+    ss.setdefault("_loaded_workspace_id", None)  # which (workspace, slide) data is currently sitting in session_state
+    ss.setdefault("active_slide_id", None)        # 🗂 Slides — which slide of the workspace is active this run
+    ss.setdefault("_active_slide_for_ws", None)   # which workspace active_slide_id above was resolved for
+
 
 init_state()
 
@@ -201,6 +206,41 @@ def effective_workspace_id():
     if ss.role == auth.ROLE_ADMIN and ss.get("view_as_workspace"):
         return ss["view_as_workspace"]
     return ss.get("workspace_id") or ss.get("username")
+
+
+def active_slide_id():
+    """Which Slide (independent dataset/dashboard) of the effective
+    workspace is active for THIS run. Falls back to whatever was last saved
+    for this workspace (so a fresh login reopens on the same slide), and
+    self-heals to 'default' if session_state doesn't have one yet."""
+    ss = st.session_state
+    wsid = effective_workspace_id()
+    if ss.get("active_slide_id") is None or ss.get("_active_slide_for_ws") != wsid:
+        ss["active_slide_id"] = ws.get_active_slide(wsid)
+        ss["_active_slide_for_ws"] = wsid
+    return ss["active_slide_id"]
+
+
+def effective_storage_id():
+    """The exact string every save/load call in this file should use - the
+    effective workspace PLUS which of its Slides is currently active. Use
+    this (never effective_workspace_id() directly) for anything that's
+    dataset-specific: df_raw/dashboard config, chat history, intel
+    snapshots. Keep using effective_workspace_id() for things that stay the
+    SAME across every slide of a workspace (plan, branding, admin actions)."""
+    return ws.slide_storage_id(effective_workspace_id(), active_slide_id())
+
+
+def switch_active_slide(slide_id: str):
+    """Switches the session onto a different Slide of the current workspace
+    and persists that choice, so it sticks across a page reload / other
+    sessions sharing the account. The actual data swap happens automatically
+    on the next sync_workspace_from_disk() call, exactly like an admin
+    'View as' switch — see that function's docstring."""
+    wsid = effective_workspace_id()
+    st.session_state["active_slide_id"] = slide_id
+    st.session_state["_active_slide_for_ws"] = wsid
+    ws.set_active_slide(wsid, slide_id)
 
 
 def can_edit() -> bool:
@@ -241,7 +281,7 @@ def _render_chart_with_zoom(fig, zoom_key: str, widget_key: str, editable: bool 
             new_zoom = list(new_zoom)
             if new_zoom != zoom:
                 st.session_state.dashboard_zoom[zoom_key] = new_zoom
-                ws.save_light(st.session_state, st.session_state.workspace_id)
+                ws.save_light(st.session_state, effective_storage_id())
                 zoom = new_zoom
     if zoom != [0, 100]:
         fig = ce.apply_zoom_window(fig, zoom[0], zoom[1])
@@ -267,7 +307,7 @@ def sync_workspace_from_disk(force: bool = False):
     this workspace, so what's on disk is always at most a few hundred ms
     behind the most recent change from anyone."""
     ss = st.session_state
-    wsid = effective_workspace_id()
+    wsid = effective_storage_id()
     workspace_changed = ss.get("_loaded_workspace_id") != wsid
     if not workspace_changed and not force:
         return
@@ -1563,6 +1603,71 @@ with st.sidebar:
             st.info(f"👁️ Viewing as: **{st.session_state.view_as_workspace}**")
         st.divider()
 
+    # ---- Slides: multiple independent datasets/dashboards per workspace ---------
+    # Like browser tabs - each slide has its own Connect Data, Raw Analysis,
+    # Custom Builder, Boss Dashboard, Full Analysis and Data Table, all built
+    # off whatever dataset was uploaded into THAT slide. Switching slides never
+    # touches any other slide's saved data (see effective_storage_id()).
+    if st.session_state.role in (auth.ROLE_ADMIN, auth.ROLE_CLIENT, auth.ROLE_VIEWER):
+        _slide_wsid = effective_workspace_id()
+        _slides = ws.list_slides(_slide_wsid)
+        _active_slide = active_slide_id()
+        _slide_ids = [s["id"] for s in _slides]
+        _slide_labels = {s["id"]: s["name"] for s in _slides}
+        _chosen_slide = st.selectbox(
+            "🗂 Slide", _slide_ids,
+            index=_slide_ids.index(_active_slide) if _active_slide in _slide_ids else 0,
+            format_func=lambda sid: _slide_labels.get(sid, sid),
+            help="Each slide is a separate dataset + dashboard, like browser tabs. "
+                 "Switching never loses or overwrites another slide's data.",
+            key="_slide_switcher_select",
+        )
+        if _chosen_slide != _active_slide:
+            switch_active_slide(_chosen_slide)
+            st.rerun()
+
+        if can_edit():
+            _slide_cap = ul.slide_limit_for_plan(st.session_state.plan)
+            with st.popover("⚙️ Manage slides", use_container_width=True):
+                st.caption(f"{len(_slides)} of {_slide_cap} slide(s) used on your plan.")
+
+                st.markdown("**Rename current slide**")
+                _rename_val = st.text_input("New name", value=_slide_labels.get(_active_slide, ""),
+                                             key="_slide_rename_input", label_visibility="collapsed")
+                if st.button("Save name", key="_slide_rename_btn", use_container_width=True):
+                    if _rename_val.strip() and _rename_val.strip() != _slide_labels.get(_active_slide):
+                        ws.rename_slide(_slide_wsid, _active_slide, _rename_val.strip())
+                        st.rerun()
+
+                st.divider()
+                st.markdown("**Add a new slide**")
+                if len(_slides) >= _slide_cap:
+                    st.caption(f"🔒 Slide limit reached for your plan ({_slide_cap}). "
+                               f"Ask your admin to upgrade for more slides.")
+                else:
+                    _new_slide_name = st.text_input("Name", value=f"Slide {len(_slides) + 1}",
+                                                      key="_new_slide_name_input", label_visibility="collapsed")
+                    if st.button("➕ Create new slide", key="_new_slide_btn", use_container_width=True):
+                        _new_id = ws.create_slide(_slide_wsid, _new_slide_name)
+                        switch_active_slide(_new_id)
+                        st.success(f"Created '{_new_slide_name}' — go to 📥 Connect Data to load its dataset.")
+                        st.rerun()
+
+                if len(_slides) > 1:
+                    st.divider()
+                    st.markdown("**Delete current slide**")
+                    st.caption("⚠️ Permanently removes this slide's dataset, dashboard, and chat history. "
+                               "Other slides are never affected.")
+                    _confirm_del = st.checkbox(f"Yes, delete '{_slide_labels.get(_active_slide)}'",
+                                                key="_slide_delete_confirm")
+                    if st.button("🗑️ Delete this slide", key="_slide_delete_btn",
+                                 use_container_width=True, disabled=not _confirm_del, type="primary"):
+                        _next_active = ws.delete_slide(_slide_wsid, _active_slide)
+                        switch_active_slide(_next_active)
+                        st.success("Slide deleted.")
+                        st.rerun()
+        st.divider()
+
     sync_workspace_from_disk()
 
     nav_options = ["📥 Connect Data", "📊 Raw Analysis", "🧩 Custom Builder", "⭐ Boss Dashboard",
@@ -1601,6 +1706,8 @@ with st.sidebar:
         st.session_state.workspace_id = None
         st.session_state.view_as_workspace = None
         st.session_state._loaded_workspace_id = None
+        st.session_state.active_slide_id = None
+        st.session_state._active_slide_for_ws = None
         st.session_state._session_token = None
         _clear_session_cookie()
         st.rerun()
@@ -1621,6 +1728,11 @@ if page == "📥 Connect Data":
                      use_container_width=True):
             st.session_state._last_upload_sig = None
             st.rerun()
+
+    if st.session_state.role in (auth.ROLE_ADMIN, auth.ROLE_CLIENT, auth.ROLE_VIEWER):
+        _cd_slide_name = ws.list_slides(effective_workspace_id())
+        _cd_slide_name = next((s["name"] for s in _cd_slide_name if s["id"] == active_slide_id()), "Slide 1")
+        st.caption(f"🗂 Loading data into: **{_cd_slide_name}** — switch or add slides from the sidebar.")
 
     if st.session_state.df_raw is not None:
         st.success(f"🟢 Currently loaded: **{st.session_state.data_source_name}** "
@@ -2394,7 +2506,7 @@ elif page == "📈 Full Analysis":
         if st.button("💾 Save mapping & Recalculate", key="intel_save_roles", disabled=not can_edit()):
             st.session_state.intel_role_overrides = new_roles
             st.session_state._intel_cache_key = None
-            ws.save_light(st.session_state, st.session_state.workspace_id)
+            ws.save_light(st.session_state, effective_storage_id())
             st.rerun()
     roles = dict(auto_roles)
     roles.update({k: v for k, v in saved_overrides.items()})
@@ -2410,7 +2522,7 @@ elif page == "📈 Full Analysis":
     if language != st.session_state.intel_language:
         st.session_state.intel_language = language
         st.session_state._intel_narrative = None  # force re-generation in the new language
-        ws.save_light(st.session_state, st.session_state.workspace_id)
+        ws.save_light(st.session_state, effective_storage_id())
 
     # ------------------------------------------------------------------------
     # COMPUTE FACTS (cached — recomputed only when data/mapping/language changes)
@@ -2432,7 +2544,7 @@ elif page == "📈 Full Analysis":
     health = facts["health"]
     badge = {"Healthy": "🟢", "Stable": "🟡", "At Risk": "🟠", "Critical": "🔴"}.get(health["label"], "⚪")
 
-    snapshots = ws.load_intel_snapshots(st.session_state.workspace_id)
+    snapshots = ws.load_intel_snapshots(effective_storage_id())
     snap_caption = None
     if snapshots:
         last = snapshots[-1]
@@ -2656,7 +2768,7 @@ elif page == "📈 Full Analysis":
                     "total_profit": facts["financials"].get("total_profit"),
                     "profit_margin_pct": facts["financials"].get("profit_margin_pct"),
                     "row_count": facts["row_count"],
-                }, st.session_state.workspace_id)
+                }, effective_storage_id())
                 st.success("Snapshot saved.")
         with exp_col3:
             with st.popover("📧 Email this summary", use_container_width=True):
@@ -2673,7 +2785,7 @@ elif page == "📈 Full Analysis":
         new_action = st.text_input("+ Add an action item", key="intel_new_action")
         if st.button("Add", key="intel_add_action") and new_action.strip() and can_edit():
             st.session_state.intel_action_checks.append({"text": new_action.strip(), "done": False})
-            ws.save_light(st.session_state, st.session_state.workspace_id)
+            ws.save_light(st.session_state, effective_storage_id())
             st.rerun()
         for i, item in enumerate(list(st.session_state.intel_action_checks)):
             ac1, ac2 = st.columns([9, 1])
@@ -2681,11 +2793,11 @@ elif page == "📈 Full Analysis":
                 checked = st.checkbox(item["text"], value=item["done"], key=f"intel_action_{i}", disabled=not can_edit())
                 if checked != item["done"]:
                     st.session_state.intel_action_checks[i]["done"] = checked
-                    ws.save_light(st.session_state, st.session_state.workspace_id)
+                    ws.save_light(st.session_state, effective_storage_id())
             with ac2:
                 if can_edit() and st.button("🗑️", key=f"intel_action_del_{i}"):
                     st.session_state.intel_action_checks.pop(i)
-                    ws.save_light(st.session_state, st.session_state.workspace_id)
+                    ws.save_light(st.session_state, effective_storage_id())
                     st.rerun()
 
         # ---- Optional AI write-up — deeper narrative, NOT the primary content anymore ----
@@ -3014,11 +3126,11 @@ elif page == "🤖 AI Assistant":
     meta = st.session_state.meta
     api_key = ac.get_api_key() or st.session_state.ai_groq_key
 
-    # Pull this workspace's saved chat history (5-day auto-expiring) exactly once
-    # per workspace per session — after that, session_state is the live copy.
-    if st.session_state._chat_history_loaded_ws != st.session_state.workspace_id:
-        st.session_state.ai_chat_history = ws.load_chat_history(st.session_state.workspace_id)
-        st.session_state._chat_history_loaded_ws = st.session_state.workspace_id
+    # Pull this slide's saved chat history (5-day auto-expiring) exactly once
+    # per slide per session — after that, session_state is the live copy.
+    if st.session_state._chat_history_loaded_ws != effective_storage_id():
+        st.session_state.ai_chat_history = ws.load_chat_history(effective_storage_id())
+        st.session_state._chat_history_loaded_ws = effective_storage_id()
 
     if not api_key:
         if st.session_state.role == auth.ROLE_ADMIN:
@@ -3135,11 +3247,11 @@ elif page == "🤖 AI Assistant":
                     "role": "assistant", "content": result["answer"],
                     "sql_used": result["sql_used"], "proof_df": result["proof_df"], "ts": time.time(),
                 })
-        ws.save_chat_history(st.session_state.ai_chat_history, st.session_state.workspace_id)
+        ws.save_chat_history(st.session_state.ai_chat_history, effective_storage_id())
 
     if st.session_state.ai_chat_history and st.button("🗑️ Clear chat"):
         st.session_state.ai_chat_history = []
-        ws.save_chat_history([], st.session_state.workspace_id)
+        ws.save_chat_history([], effective_storage_id())
         st.rerun()
 
     # ------------------------------------------------------------------------
@@ -3178,7 +3290,7 @@ elif page == "🤖 AI Assistant":
                         new_card = be.new_kpi_card(df_raw)
                         new_card.update({k: v for k, v in preview_card.items() if k != "filters"})
                         st.session_state.custom_kpis.append(new_card)
-                        ws.save_light(st.session_state, st.session_state.workspace_id)
+                        ws.save_light(st.session_state, effective_storage_id())
                         st.session_state["_ai_card_spec"] = None
                         st.success("Added! See it on 🧩 Custom Builder → Custom KPI Cards.")
                         st.rerun()
@@ -3188,7 +3300,7 @@ elif page == "🤖 AI Assistant":
                         new_card.update({k: v for k, v in preview_card.items() if k != "filters"})
                         new_card["pinned"] = True
                         st.session_state.custom_kpis.append(new_card)
-                        ws.save_light(st.session_state, st.session_state.workspace_id)
+                        ws.save_light(st.session_state, effective_storage_id())
                         st.session_state["_ai_card_spec"] = None
                         st.success("Added and pinned to ⭐ Boss Dashboard!")
                         st.rerun()
@@ -3219,7 +3331,7 @@ elif page == "🤖 AI Assistant":
                         new_chart = be.new_chart(df_raw)
                         new_chart.update({k: v for k, v in preview_chart.items() if k not in ("id", "filters")})
                         st.session_state.custom_charts.append(new_chart)
-                        ws.save_light(st.session_state, st.session_state.workspace_id)
+                        ws.save_light(st.session_state, effective_storage_id())
                         st.session_state["_ai_card_spec"] = None
                         st.success("Added! See it on 🧩 Custom Builder → Custom Charts.")
                         st.rerun()
@@ -3229,7 +3341,7 @@ elif page == "🤖 AI Assistant":
                         new_chart.update({k: v for k, v in preview_chart.items() if k not in ("id", "filters")})
                         new_chart["pinned"] = True
                         st.session_state.custom_charts.append(new_chart)
-                        ws.save_light(st.session_state, st.session_state.workspace_id)
+                        ws.save_light(st.session_state, effective_storage_id())
                         st.session_state["_ai_card_spec"] = None
                         st.success("Added and pinned to ⭐ Boss Dashboard!")
                         st.rerun()
@@ -3858,22 +3970,29 @@ elif page == "🔐 Admin Panel":
                 index=default_idx,
                 format_func=lambda w: f"{w}  —  used by: {', '.join(ws_to_accounts[w])}",
             )
-            if ws.has_saved_data(target_ws):
-                st.info(f"'{target_ws}' currently has data saved.")
+            _target_slides = ws.list_slides(target_ws)
+            if ws.has_saved_data(target_ws) or len(_target_slides) > 1:
+                st.info(f"'{target_ws}' currently has data saved across **{len(_target_slides)} slide(s)**: "
+                        f"{', '.join(s['name'] for s in _target_slides)}.")
             else:
                 st.info(f"'{target_ws}' has nothing loaded right now.")
             st.warning(f"Resetting removes the data for **every account sharing workspace '{target_ws}'** "
-                       f"({', '.join(ws_to_accounts[target_ws])}) - do this only when intentionally "
-                       f"starting that client over with a new dataset.")
-            confirm_reset = st.checkbox("Yes, I understand - clear this workspace's dataset and dashboard.", key="confirm_ws_reset")
+                       f"({', '.join(ws_to_accounts[target_ws])}) — including EVERY slide, not just the "
+                       f"one currently shown — do this only when intentionally starting that client over "
+                       f"from scratch.")
+            confirm_reset = st.checkbox("Yes, I understand - clear this workspace's dataset and dashboard (all slides).", key="confirm_ws_reset")
             if st.button("🗑️ Reset this workspace now", disabled=not confirm_reset, type="primary"):
-                ws.clear(target_ws)
+                for _s in _target_slides:
+                    ws.clear(ws.slide_storage_id(target_ws, _s["id"]))
+                ws.reset_slides_registry(target_ws)
                 if effective_workspace_id() == target_ws:
                     for k in ws.PERSISTED_KEYS:
                         st.session_state[k] = [] if isinstance(st.session_state.get(k), list) else None
                     st.session_state.filters = {}
                     st.session_state.dashboard_name = "⭐ Boss Dashboard"
-                st.success(f"Workspace '{target_ws}' cleared.")
+                    st.session_state.active_slide_id = "default"
+                    st.session_state._active_slide_for_ws = target_ws
+                st.success(f"Workspace '{target_ws}' cleared — back to a single empty slide.")
                 st.rerun()
 
     with tab_payments:
@@ -4023,7 +4142,7 @@ have no access to any credential screen, and never see this tab.
 # other interaction uses save_light(), which is cheap because it never
 # touches the dataset.
 if st.session_state.authenticated and st.session_state.df_raw is not None:
-    _wsid_now = effective_workspace_id()
+    _wsid_now = effective_storage_id()
     if st.session_state.get("_last_saved_df_id") != id(st.session_state.df_raw):
         ws.save(st.session_state, _wsid_now)
         st.session_state._last_saved_df_id = id(st.session_state.df_raw)
