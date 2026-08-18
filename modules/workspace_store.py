@@ -44,8 +44,6 @@ PERSISTED_KEYS = [
     "dashboard_zoom",     # {chart_key: [start_pct, end_pct]} — per-chart zoom window, so it survives restarts
                           # and the PDF export (rendered from the same figure) matches what's on screen
     "dashboard_name",
-    "pivot_reports",
-    "pinned_pivots",   # 📐 Pivot Table reports pinned onto the Boss Dashboard
     "intel_action_checks",   # 🧠 Intelligence Report — ticked/unticked state of the Top Actions checklist
     "intel_language",        # 🧠 Intelligence Report — last-picked narrative language (English/Hindi)
     "intel_role_overrides",  # 🧠 Intelligence Report — user-confirmed column-role mapping
