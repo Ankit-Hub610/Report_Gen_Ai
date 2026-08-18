@@ -121,6 +121,15 @@ DEFAULT_BRAND = {
     "glow_style": "pulse",             # "steady" | "pulse" | "flicker" | "rainbow"
     "glow_intensity": 16,              # px — base glow size (bigger = thicker halo)
     "glow_speed": 2.2,                 # seconds per animation cycle (ignored by "steady")
+    # ---- Login-page tagline + subtitle text (admin-editable — was hardcoded
+    # and barely readable against a busy wallpaper before this) -----------------
+    "tagline_text": "Research | Analysis | Intelligence",
+    "tagline_color": "#FFFFFF",
+    "tagline_size": 32,     # px
+    "tagline_bold": True,
+    "subtitle_text": "Please sign in to continue",
+    "subtitle_color": "#E0E0E0",
+    "subtitle_size": 15,    # px
 }
 
 FAMILY_ICONS = {
@@ -740,8 +749,13 @@ def login_screen():
         with _lc2:
             _img_html = _logo_img_html(_logo, _logo_mime, brand.get("logo_width", 220))
             _render_glow_target("brand_glow_logo", "logo", brand, _img_html)
-    st.markdown("<h1 style='text-align:center;'>Research | Analysis | Intellegance </h1>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align:center;color:gray;'>Please sign in to continue</p>", unsafe_allow_html=True)
+    st.markdown(f"<h1 style='text-align:center;color:{brand.get('tagline_color', '#FFFFFF')};"
+               f"font-size:{brand.get('tagline_size', 32)}px;"
+               f"font-weight:{'700' if brand.get('tagline_bold', True) else '400'};'>"
+               f"{brand.get('tagline_text', 'Research | Analysis | Intelligence')}</h1>", unsafe_allow_html=True)
+    st.markdown(f"<p style='text-align:center;color:{brand.get('subtitle_color', '#E0E0E0')};"
+               f"font-size:{brand.get('subtitle_size', 15)}px;'>"
+               f"{brand.get('subtitle_text', 'Please sign in to continue')}</p>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
         with st.form("login_form"):
@@ -3651,6 +3665,39 @@ elif page == "⚙️ Settings":
 
             b["logo_width"] = st.slider("Logo size on the login page (px wide)", 80, 500,
                                          b.get("logo_width", 220), key="brand_logo_width")
+
+            st.divider()
+            st.markdown("**📝 Login page tagline & subtitle text**")
+            st.caption("The big heading and the small line under it on the login page. Pick colors that "
+                       "stay readable against your background wallpaper below (if you set one) — the "
+                       "default gray was too close to some wallpapers to read.")
+            tg1, tg2, tg3 = st.columns([3, 1, 1])
+            with tg1:
+                b["tagline_text"] = st.text_input("Tagline (big heading)", b.get("tagline_text", "Research | Analysis | Intelligence"),
+                                                   key="brand_tagline_text")
+            with tg2:
+                b["tagline_color"] = st.color_picker("Tagline color", b.get("tagline_color", "#FFFFFF"), key="brand_tagline_color")
+            with tg3:
+                b["tagline_size"] = st.slider("Size (px)", 16, 60, b.get("tagline_size", 32), key="brand_tagline_size")
+            b["tagline_bold"] = st.checkbox("Bold tagline", b.get("tagline_bold", True), key="brand_tagline_bold")
+
+            sb1, sb2, sb3 = st.columns([3, 1, 1])
+            with sb1:
+                b["subtitle_text"] = st.text_input("Subtitle (small line)", b.get("subtitle_text", "Please sign in to continue"),
+                                                    key="brand_subtitle_text")
+            with sb2:
+                b["subtitle_color"] = st.color_picker("Subtitle color", b.get("subtitle_color", "#E0E0E0"), key="brand_subtitle_color")
+            with sb3:
+                b["subtitle_size"] = st.slider("Size (px)", 10, 30, b.get("subtitle_size", 15), key="brand_subtitle_size")
+
+            st.markdown(
+                f"<div style='text-align:center; padding:10px; border-radius:8px; background:#1a1a2e;'>"
+                f"<div style='color:{b['tagline_color']}; font-size:{b['tagline_size']}px; "
+                f"font-weight:{'700' if b['tagline_bold'] else '400'};'>{b['tagline_text']}</div>"
+                f"<div style='color:{b['subtitle_color']}; font-size:{b['subtitle_size']}px;'>{b['subtitle_text']}</div>"
+                f"</div>", unsafe_allow_html=True,
+            )
+            st.caption("👆 Preview (shown here on a dark swatch since the real login page background varies)")
 
             st.divider()
             st.markdown("**🖼️ Login page background wallpaper**")
