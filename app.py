@@ -3966,7 +3966,7 @@ elif page == "⚙️ Settings":
 
             sb1, sb2, sb3 = st.columns([3, 1, 1])
             with sb1:
-                b["subtitle_text"] = st.text_input("Subtitle (small line)", b.get("subtitle_text", "Please sign in to continue"),
+                b["subtitle_text"] = st.text_input("Subtitle (small line)", b.get("subtitle_text", "You logged out and I upgrade."),
                                                     key="brand_subtitle_text")
             with sb2:
                 b["subtitle_color"] = st.color_picker("Subtitle color", b.get("subtitle_color", "#E0E0E0"), key="brand_subtitle_color")
