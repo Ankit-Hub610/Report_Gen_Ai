@@ -807,35 +807,69 @@ def _render_interactive_login_background():
         <canvas id="_ra_spider_canvas" style="display:block;"></canvas>
         <script>
         (function() {
+            // Everything that touches window.parent can throw a SecurityError if the
+            // browser treats this iframe as cross-origin (varies by Streamlit version/
+            // deployment - this exact class of failure bit the login-cookie code
+            // earlier in this app too). Each attempt below is individually try/caught
+            // with a same-iframe fallback, so ONE blocked access can't silently kill
+            // the whole script the way a single uncaught throw did before.
+            var pwin = window, pdoc = document, fullPage = false;
             try {
-                var fe = window.frameElement;
-                if (fe) {
-                    fe.style.cssText = "position:fixed; inset:0; width:100vw; height:100vh; " +
-                                        "z-index:-1; pointer-events:none; border:none;";
+                if (window.parent && window.parent.document && window.parent.innerWidth) {
+                    pwin = window.parent;
+                    pdoc = window.parent.document;
+                    fullPage = true;
                 }
-            } catch (e) {}
+            } catch (e) { pwin = window; pdoc = document; fullPage = false; }
+
+            if (fullPage) {
+                try {
+                    var fe = window.frameElement;
+                    if (fe) {
+                        fe.style.cssText = "position:fixed; inset:0; width:100vw; height:100vh; " +
+                                            "z-index:1; pointer-events:none; border:none;";
+                    } else {
+                        fullPage = false;
+                    }
+                } catch (e) { fullPage = false; }
+            }
 
             var canvas = document.getElementById('_ra_spider_canvas');
             var ctx = canvas.getContext('2d');
-            var pdoc = (window.parent && window.parent.document) ? window.parent.document : document;
-            var pwin = window.parent || window;
+
+            function currentSize() {
+                if (fullPage) {
+                    try { return [pwin.innerWidth, pwin.innerHeight]; } catch (e) { fullPage = false; }
+                }
+                // Fallback: not full-page - just fill this component's own box
+                // (still reacts to the cursor, just only while over this box).
+                return [window.innerWidth, 420];
+            }
 
             function resize() {
-                canvas.width = pwin.innerWidth;
-                canvas.height = pwin.innerHeight;
+                var sz = currentSize();
+                canvas.width = sz[0]; canvas.height = sz[1];
+                canvas.style.width = sz[0] + "px"; canvas.style.height = sz[1] + "px";
             }
             resize();
-            pwin.addEventListener('resize', resize);
+            try { pwin.addEventListener('resize', resize); } catch (e) { window.addEventListener('resize', resize); }
 
-            var mouseX = pwin.innerWidth / 2, mouseY = pwin.innerHeight / 2;
-            pdoc.addEventListener('mousemove', function(e) {
-                mouseX = e.clientX; mouseY = e.clientY;
-            });
-            pdoc.addEventListener('touchmove', function(e) {
-                if (e.touches && e.touches.length) {
-                    mouseX = e.touches[0].clientX; mouseY = e.touches[0].clientY;
-                }
-            });
+            var mouseX = canvas.width / 2, mouseY = canvas.height / 2;
+            function onMove(e) { mouseX = e.clientX; mouseY = e.clientY; }
+            function onTouch(e) {
+                if (e.touches && e.touches.length) { mouseX = e.touches[0].clientX; mouseY = e.touches[0].clientY; }
+            }
+            try {
+                pdoc.addEventListener('mousemove', onMove);
+                pdoc.addEventListener('touchmove', onTouch);
+            } catch (e) {
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('touchmove', onTouch);
+            }
+            // Always ALSO listen on this iframe's own document - harmless if duplicate
+            // (fullPage case), and the only way it reacts at all in the fallback case.
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('touchmove', onTouch);
 
             var LEG_COUNT = 8, REST_R = 38, BODY_R = 9;
             var SPIDER_COLOR = "rgba(30,30,35,0.75)";
