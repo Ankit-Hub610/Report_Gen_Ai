@@ -1086,6 +1086,12 @@ if not st.session_state.authenticated:
         st.session_state.role = auth.get_role(_resolved_user)
         st.session_state.workspace_id = auth.get_workspace_id(_resolved_user)
         st.session_state.plan = auth.get_effective_plan(_resolved_user)
+        # Sliding expiry: issue a fresh token (full SESSION_LIFETIME_SECONDS
+        # from now) on every active visit, instead of counting down from the
+        # original login. Someone who opens the app every day never hits the
+        # 7-day expiry; someone who genuinely walks away for a week does.
+        _session_token = auth.create_session(_resolved_user)
+        _set_session_cookie(_session_token)
         st.session_state._session_token = _session_token
 
 if not st.session_state.authenticated:
@@ -1182,6 +1188,11 @@ def render_upi_upgrade_flow(plan_type: str, key_prefix: str = ""):
         if pay_cfg.get("payee_name"):
             st.caption(f"Payee name: {pay_cfg['payee_name']}")
         st.link_button("📲 Open in UPI app (on phone)", upi_link, use_container_width=True)
+        st.caption("Only works if you're viewing this ON your phone — tapping it hands the payment "
+                  "(UPI ID, amount, note) straight to whichever UPI app you have installed (GPay, "
+                  "PhonePe, Paytm...), so you just pick the app and confirm with your PIN. On a "
+                  "laptop/desktop this button won't do anything since there's no UPI app to open — "
+                  "use the QR code instead: open any UPI app on your phone and scan it from there.")
     with upi_col2:
         qr_bytes = pay.qr_png_bytes(upi_link)
         if qr_bytes:
@@ -1214,11 +1225,26 @@ def upgrade_dialog():
     """The popup — this is what makes upgrading feel like a real product's
     pricing modal (Notion/Slack-style) instead of a plain page section.
     Triggered by an 'Upgrade' button; everything happens inside this modal
-    without leaving whatever page the person was on."""
+    without leaving whatever page the person was on.
+
+    IMPORTANT: this function is called on EVERY rerun for as long as
+    st.session_state.upgrade_dialog_open stays True (see the "🚀 Upgrade to
+    Standard" / "🔁 Renew" buttons below, and the 20s auto-refresh guard on
+    the Plans page) — not just once on the click that opened it. Only
+    calling it on the click itself is what let it disappear on its own:
+    any later rerun the person didn't cause (the Plans page's 20-second
+    "Live" auto-refresh, most commonly) would re-run the whole script
+    without that click being true again, so the dialog simply never got
+    reopened on that rerun and looked like it had auto-closed. Driving it
+    from a flag that persists across reruns — and only turning that flag
+    off on an explicit Close/Cancel click — means it now stays open no
+    matter what triggers a rerun in the background, and only goes away
+    when the person actually closes it themselves."""
     chosen = render_pricing_cards(key_prefix="dlg_")
     st.divider()
     render_upi_upgrade_flow(chosen, key_prefix="dlg_")
     if st.button("Close", key="dlg_close_upgrade"):
+        st.session_state.upgrade_dialog_open = False
         st.rerun()
 
 
@@ -4189,7 +4215,11 @@ elif page == "💎 Plans":
         # refresh: someone sitting on THIS page waiting for their upgrade
         # to be approved shouldn't have to click anything (or log back in)
         # to see it land - just re-check every 20s while they're here.
-        if AUTOREFRESH_AVAILABLE:
+        # BUT: skip this entirely while the Upgrade/Renew dialog is open -
+        # a background rerun the person didn't trigger is exactly what was
+        # making that dialog vanish on its own after a few seconds (see the
+        # comment inside upgrade_dialog() above for the full explanation).
+        if AUTOREFRESH_AVAILABLE and not st.session_state.get("upgrade_dialog_open"):
             st_autorefresh(interval=20 * 1000, key="plans_page_autorefresh")
     if st.session_state.plan == "free" and st.session_state.role != auth.ROLE_ADMIN:
         _trial_pp = auth.get_trial_status(st.session_state.username)
@@ -4210,11 +4240,17 @@ elif page == "💎 Plans":
     if st.session_state.role != auth.ROLE_ADMIN:
         if st.session_state.plan == "free":
             if st.button("🚀 Upgrade to Standard", type="primary"):
-                upgrade_dialog()
+                st.session_state.upgrade_dialog_open = True
         else:
             if st.button("🔁 Renew / change plan"):
-                upgrade_dialog()
+                st.session_state.upgrade_dialog_open = True
             st.caption("You're already on Standard — this is only needed if you want to renew early or switch between Monthly/Yearly.")
+        # Keep calling the dialog function on every rerun for as long as the
+        # flag is set - see the big comment inside upgrade_dialog() for why
+        # this (rather than only calling it inside the "if button clicked"
+        # branch above) is what actually keeps it open.
+        if st.session_state.get("upgrade_dialog_open"):
+            upgrade_dialog()
 
 
 elif page == "🔐 Admin Panel":
