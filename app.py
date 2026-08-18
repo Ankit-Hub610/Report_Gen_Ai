@@ -122,11 +122,11 @@ DEFAULT_BRAND = {
     # removing the video brings the static wallpaper straight back).
     "bg_video": None,
     "bg_video_mime": None,
-    # Interactive cursor-reactive background (admin toggle). When True,
-    # REPLACES the static bg_image above on the login page with a live
-    # canvas mandala animation that reacts to mouse movement - bg_image
-    # itself is left untouched so turning this back off restores whatever
-    # wallpaper was already set.
+    # Interactive cursor-following creature background (admin toggle). When
+    # True, REPLACES the static bg_image above on the login page with a live
+    # canvas animation that reacts to mouse movement - bg_image itself is
+    # left untouched so turning this back off restores whatever wallpaper
+    # was already set.
     "interactive_bg_enabled": False,
     # ---- Neon / glow lighting (advanced) --------------------------------------
     "glow_enabled": False,
@@ -810,34 +810,35 @@ def login_screen():
 
 
 def _render_interactive_login_background():
-    """🌸 Admin-toggleable: a procedurally-drawn mandala (pure canvas shapes —
-    no image file), centered on the login page, on top of the normal
-    background — the page's own background (white/default, or whatever
-    static wallpaper would otherwise show) is left completely untouched,
-    only this canvas layer sits on top of it.
+    """🕷️ Admin-toggleable: a spider made of a body + 8 legs, drawn on a
+    full-page canvas, that walks toward wherever the visitor's mouse is —
+    legs move in a real alternating tripod gait (4 legs step while the
+    other 4 plant), not just a uniform pulsing starburst. Pure browser
+    JS/canvas, no server round-trip once loaded. The page's normal
+    background (white/default, or whatever static wallpaper would show)
+    is left completely untouched — only the canvas layer is added on top,
+    drawn in a dark colour so it's actually visible against a light page.
 
-    Idle: rotates slowly and continuously on its own, no cursor needed.
-    Cursor nearby / moving: the closer the cursor gets to the mandala (and
-    how much it's actively moving), the more it glows AND the faster it
-    spins — both eased smoothly frame-to-frame (never an instant jump),
-    and it settles back down to the slow idle spin on its own once the
-    cursor moves away again.
-
-    Same two same-origin-safety mechanics as the rest of this app's
-    canvas/cookie code (each wrapped in its own try/catch with a
-    same-iframe fallback, so one blocked access can't kill the whole
-    script):
-      1. Listens for mousemove on window.parent.document (the REAL page),
-         not just its own iframe — otherwise it would only react while the
-         cursor is directly over the iframe's own little box.
-      2. Re-styles its OWN iframe (via window.frameElement) to cover the
-         full viewport, sit on top, but ignore clicks (pointer-events:
-         none) — so the actual login form underneath stays fully usable.
+    Two things make this work inside a Streamlit components.html iframe:
+      1. The canvas listens for mousemove on window.parent.document (the
+         REAL page), not just its own iframe - otherwise it would only
+         react to the cursor while directly over the iframe's own box.
+      2. The iframe re-styles ITSELF (via window.frameElement, reachable
+         since components.html iframes share the parent page's origin) to
+         cover the full viewport, sit on top (so the spider is visible)
+         but ignore clicks (pointer-events: none) - so the actual login
+         form stays perfectly usable underneath it.
     """
     st.components.v1.html("""
-        <canvas id="_ra_mandala_canvas" style="display:block;"></canvas>
+        <canvas id="_ra_spider_canvas" style="display:block;"></canvas>
         <script>
         (function() {
+            // Everything that touches window.parent can throw a SecurityError if the
+            // browser treats this iframe as cross-origin (varies by Streamlit version/
+            // deployment - this exact class of failure bit the login-cookie code
+            // earlier in this app too). Each attempt below is individually try/caught
+            // with a same-iframe fallback, so ONE blocked access can't silently kill
+            // the whole script the way a single uncaught throw did before.
             var pwin = window, pdoc = document, fullPage = false;
             try {
                 if (window.parent && window.parent.document && window.parent.innerWidth) {
@@ -859,13 +860,15 @@ def _render_interactive_login_background():
                 } catch (e) { fullPage = false; }
             }
 
-            var canvas = document.getElementById('_ra_mandala_canvas');
+            var canvas = document.getElementById('_ra_spider_canvas');
             var ctx = canvas.getContext('2d');
 
             function currentSize() {
                 if (fullPage) {
                     try { return [pwin.innerWidth, pwin.innerHeight]; } catch (e) { fullPage = false; }
                 }
+                // Fallback: not full-page - just fill this component's own box
+                // (still reacts to the cursor, just only while over this box).
                 return [window.innerWidth, 420];
             }
 
@@ -878,12 +881,9 @@ def _render_interactive_login_background():
             try { pwin.addEventListener('resize', resize); } catch (e) { window.addEventListener('resize', resize); }
 
             var mouseX = canvas.width / 2, mouseY = canvas.height / 2;
-            var lastMoveT = 0;
-            function onMove(e) { mouseX = e.clientX; mouseY = e.clientY; lastMoveT = performance.now(); }
+            function onMove(e) { mouseX = e.clientX; mouseY = e.clientY; }
             function onTouch(e) {
-                if (e.touches && e.touches.length) {
-                    mouseX = e.touches[0].clientX; mouseY = e.touches[0].clientY; lastMoveT = performance.now();
-                }
+                if (e.touches && e.touches.length) { mouseX = e.touches[0].clientX; mouseY = e.touches[0].clientY; }
             }
             try {
                 pdoc.addEventListener('mousemove', onMove);
@@ -892,102 +892,103 @@ def _render_interactive_login_background():
                 document.addEventListener('mousemove', onMove);
                 document.addEventListener('touchmove', onTouch);
             }
+            // Always ALSO listen on this iframe's own document - harmless if duplicate
+            // (fullPage case), and the only way it reacts at all in the fallback case.
             document.addEventListener('mousemove', onMove);
             document.addEventListener('touchmove', onTouch);
 
-            // ---- mandala look & feel -------------------------------------------------
-            var PETALS = 12;                 // rotational symmetry (petals/spokes)
-            var BASE_COLOR = "210, 165, 20";  // warm yellow/gold, as an "r, g, b" triplet
-            var GLOW_COLOR = "#FFD700";       // bright yellow glow when active — matches the logo's own glow
-            var IDLE_SPEED = 0.12;            // rad/s, always spinning, cursor or not
-            var MAX_SPEED  = 1.4;             // rad/s, at full cursor-triggered intensity
-            var PROXIMITY_RANGE = 420;        // px — cursor this close (or closer) to full intensity
+            var LEG_COUNT = 8, REST_R = 38, BODY_R = 9;
+            var SPIDER_COLOR = "rgba(30,30,35,0.75)";
 
-            var angle = 0, curSpeed = IDLE_SPEED, curGlow = 0;
-
-            function drawMandalaOnce(cx, cy, R, glow) {
-                ctx.save();
-                ctx.translate(cx, cy);
-
-                var alpha = 0.55 + 0.35 * glow;
-                ctx.strokeStyle = "rgba(" + BASE_COLOR + ", " + alpha + ")";
-                ctx.fillStyle = "rgba(" + BASE_COLOR + ", " + (0.35 + 0.35 * glow) + ")";
-                ctx.lineWidth = 1.5 + 1.5 * glow;
-                ctx.shadowBlur = 6 + 34 * glow;
-                ctx.shadowColor = GLOW_COLOR;
-
-                // Outer ring of teardrop petals.
-                for (var i = 0; i < PETALS; i++) {
-                    ctx.save();
-                    ctx.rotate((i / PETALS) * Math.PI * 2);
-                    ctx.beginPath();
-                    ctx.moveTo(0, -R * 0.32);
-                    ctx.quadraticCurveTo(R * 0.22, -R * 0.62, 0, -R);
-                    ctx.quadraticCurveTo(-R * 0.22, -R * 0.62, 0, -R * 0.32);
-                    ctx.stroke();
-                    ctx.restore();
+            function makeSpider(x, y, followOffset) {
+                var legs = [];
+                for (var i = 0; i < LEG_COUNT; i++) {
+                    var a = (i / LEG_COUNT) * Math.PI * 2;
+                    legs.push({
+                        angle: a, group: i % 2,   // alternating tripod-style groups
+                        foot: { x: x + Math.cos(a) * REST_R, y: y + Math.sin(a) * REST_R }
+                    });
                 }
-                // Middle ring of small dots.
-                for (var j = 0; j < PETALS; j++) {
-                    var a2 = (j / PETALS) * Math.PI * 2 + (Math.PI / PETALS);
-                    var dx = Math.cos(a2) * R * 0.58, dy = Math.sin(a2) * R * 0.58;
-                    ctx.beginPath();
-                    ctx.arc(dx, dy, R * 0.045, 0, Math.PI * 2);
-                    ctx.fill();
-                }
-                // Inner ring of diamonds.
-                for (var k = 0; k < PETALS; k++) {
-                    ctx.save();
-                    ctx.rotate((k / PETALS) * Math.PI * 2 + (Math.PI / PETALS));
-                    ctx.beginPath();
-                    ctx.moveTo(0, -R * 0.20);
-                    ctx.lineTo(R * 0.07, -R * 0.32);
-                    ctx.lineTo(0, -R * 0.44);
-                    ctx.lineTo(-R * 0.07, -R * 0.32);
-                    ctx.closePath();
-                    ctx.stroke();
-                    ctx.restore();
-                }
-                // Concentric guide rings + center.
-                ctx.beginPath(); ctx.arc(0, 0, R * 0.62, 0, Math.PI * 2); ctx.stroke();
-                ctx.beginPath(); ctx.arc(0, 0, R * 0.20, 0, Math.PI * 2); ctx.stroke();
-                ctx.beginPath(); ctx.arc(0, 0, R * 0.07, 0, Math.PI * 2); ctx.fill();
-
-                ctx.restore();
+                return { x: x, y: y, legs: legs, followOffset: followOffset, walkT: Math.random() * 10 };
             }
+
+            function idealFoot(spider, leg) {
+                return { x: spider.x + Math.cos(leg.angle) * REST_R,
+                         y: spider.y + Math.sin(leg.angle) * REST_R };
+            }
+
+            function drawSpider(s) {
+                ctx.strokeStyle = SPIDER_COLOR;
+                ctx.fillStyle = SPIDER_COLOR;
+                ctx.lineWidth = 2;
+                ctx.lineCap = "round";
+                for (var i = 0; i < s.legs.length; i++) {
+                    var leg = s.legs[i];
+                    // Knee bends outward (away from body centre) partway along the leg -
+                    // this is what reads as an actual jointed leg instead of a straight spike.
+                    var mx = (s.x + leg.foot.x) / 2, my = (s.y + leg.foot.y) / 2;
+                    var perpA = leg.angle + Math.PI / 2;
+                    var bend = 10 * (leg.group === 0 ? 1 : -1);
+                    var kx = mx + Math.cos(perpA) * bend, ky = my + Math.sin(perpA) * bend;
+                    ctx.beginPath();
+                    ctx.moveTo(s.x, s.y);
+                    ctx.quadraticCurveTo(kx, ky, leg.foot.x, leg.foot.y);
+                    ctx.stroke();
+                }
+                // Body: two overlapping ellipses (abdomen + head) reads as "spider", not a dot.
+                ctx.beginPath();
+                ctx.ellipse(s.x, s.y, BODY_R * 1.15, BODY_R, 0, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.beginPath();
+                ctx.ellipse(s.x - Math.cos(s.facing || 0) * BODY_R, s.y - Math.sin(s.facing || 0) * BODY_R,
+                            BODY_R * 0.55, BODY_R * 0.5, 0, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            function stepSpider(s, dt) {
+                var tx = mouseX + Math.cos(s.followOffset) * 22;
+                var ty = mouseY + Math.sin(s.followOffset) * 22;
+                var dx = tx - s.x, dy = ty - s.y;
+                var dist = Math.sqrt(dx * dx + dy * dy);
+                var moving = dist > 2;
+                if (moving) {
+                    s.facing = Math.atan2(dy, dx);
+                    s.x += dx * Math.min(0.08, 4 / Math.max(dist, 1));
+                    s.y += dy * Math.min(0.08, 4 / Math.max(dist, 1));
+                    s.walkT += dt * 10;
+                }
+                // Alternating tripod gait: group 0 legs lift+step while group 1 plant, then swap.
+                var cycle = Math.sin(s.walkT);
+                for (var i = 0; i < s.legs.length; i++) {
+                    var leg = s.legs[i];
+                    var groupPhase = leg.group === 0 ? cycle : -cycle;
+                    var ideal = idealFoot(s, leg);
+                    if (moving && groupPhase > 0.6) {
+                        // this leg is "in the air" this instant - snap its resting point forward
+                        leg.foot.x += (ideal.x - leg.foot.x) * 0.5;
+                        leg.foot.y += (ideal.y - leg.foot.y) * 0.5;
+                    } else {
+                        // planted - drift gently toward ideal so it doesn't stay stuck forever
+                        leg.foot.x += (ideal.x - leg.foot.x) * 0.03;
+                        leg.foot.y += (ideal.y - leg.foot.y) * 0.03;
+                    }
+                }
+            }
+
+            var spiders = [
+                makeSpider(pwin.innerWidth * 0.3, pwin.innerHeight * 0.6, 0),
+                makeSpider(pwin.innerWidth * 0.7, pwin.innerHeight * 0.5, 3.2),
+            ];
 
             var lastT = 0;
             function tick(t) {
                 var dt = Math.min(0.05, (t - lastT) / 1000 || 0.016);
                 lastT = t;
-
-                var cx = canvas.width / 2, cy = canvas.height / 2;
-                var R = Math.max(120, Math.min(260, Math.min(canvas.width, canvas.height) * 0.28));
-
-                // How "active" is the cursor right now? Combines how CLOSE it is to the
-                // mandala (0..1, nearer = higher) with how RECENTLY it moved (a brief
-                // kick that fades over ~0.9s) - either one alone is enough to react.
-                var dist = Math.sqrt((mouseX - cx) * (mouseX - cx) + (mouseY - cy) * (mouseY - cy));
-                var proximity = Math.max(0, Math.min(1, 1 - dist / PROXIMITY_RANGE));
-                var msSinceMove = t - lastMoveT;
-                var movement = Math.max(0, 1 - msSinceMove / 900);
-                var targetIntensity = Math.max(proximity, movement);
-
-                // Ease current speed/glow toward the target - smooth, never an instant snap.
-                var targetSpeed = IDLE_SPEED + (MAX_SPEED - IDLE_SPEED) * targetIntensity;
-                curSpeed += (targetSpeed - curSpeed) * Math.min(1, dt * 3);
-                curGlow += (targetIntensity - curGlow) * Math.min(1, dt * 4);
-
-                angle += curSpeed * dt;
-
                 ctx.clearRect(0, 0, canvas.width, canvas.height);
-                ctx.save();
-                ctx.translate(cx, cy);
-                ctx.rotate(angle);
-                ctx.translate(-cx, -cy);
-                drawMandalaOnce(cx, cy, R, curGlow);
-                ctx.restore();
-
+                spiders.forEach(function(s) {
+                    stepSpider(s, dt);
+                    drawSpider(s);
+                });
                 requestAnimationFrame(tick);
             }
             requestAnimationFrame(tick);
@@ -4058,19 +4059,18 @@ elif page == "⚙️ Settings":
                                f"'Save branding for everyone' to publish it.")
 
             st.divider()
-            st.markdown("**🌸 Interactive cursor-reactive mandala**")
-            st.caption("A mandala that spins slowly on its own, then glows and spins faster the closer "
-                       "the visitor's cursor gets to it — works purely in the browser (no server calls), "
-                       "so it's smooth and free. When ON, this **replaces** the static wallpaper / live "
-                       "video wallpaper above on the login page (neither is deleted — turn this back OFF "
-                       "and whichever one was set reappears exactly as it was). When OFF, the live video "
-                       "wallpaper (if set), else the static image wallpaper (if set), else the plain "
-                       "background shows, in that order.")
+            st.markdown("**🕷️ Interactive cursor-following creature**")
+            st.caption("A small live creature that follows the visitor's mouse cursor around the login "
+                       "page — works purely in the browser (no server calls), so it's smooth and free. "
+                       "When ON, this **replaces** the static wallpaper / live video wallpaper above on the "
+                       "login page (neither is deleted — turn this back OFF and whichever one was set "
+                       "reappears exactly as it was). When OFF, the live video wallpaper (if set), else the "
+                       "static image wallpaper (if set), else the plain background shows, in that order.")
             b["interactive_bg_enabled"] = st.toggle(
-                "Enable interactive cursor mandala on the login page",
+                "Enable interactive cursor creature on the login page",
                 b.get("interactive_bg_enabled", False), key="brand_interactive_bg_enabled")
             if b["interactive_bg_enabled"]:
-                st.caption("🌸 Preview isn't shown here (it needs real mouse movement to animate) — "
+                st.caption("🕸️ Preview isn't shown here (it needs real mouse movement to animate) — "
                            "log out and check the actual login page after saving.")
 
             st.divider()
