@@ -897,8 +897,8 @@ def _render_interactive_login_background():
 
             // ---- mandala look & feel -------------------------------------------------
             var PETALS = 12;                 // rotational symmetry (petals/spokes)
-            var BASE_COLOR = "150, 90, 210";  // soft violet, as an "r, g, b" triplet
-            var GLOW_COLOR = "#FFC857";       // warm gold glow when active
+            var BASE_COLOR = "210, 165, 20";  // warm yellow/gold, as an "r, g, b" triplet
+            var GLOW_COLOR = "#FFD700";       // bright yellow glow when active — matches the logo's own glow
             var IDLE_SPEED = 0.12;            // rad/s, always spinning, cursor or not
             var MAX_SPEED  = 1.4;             // rad/s, at full cursor-triggered intensity
             var PROXIMITY_RANGE = 420;        // px — cursor this close (or closer) to full intensity
