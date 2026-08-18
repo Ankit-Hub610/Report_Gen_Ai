@@ -477,14 +477,31 @@ def _github_headers(cfg):
 
 
 def _github_get_file(cfg, path):
-    """Returns (raw_bytes, sha) or (None, None) if missing/unreachable."""
+    """Returns (raw_bytes, sha) or (None, None) if missing/unreachable.
+    GitHub's Contents API only inlines base64 `content` for files up to ~1MB —
+    for anything bigger it returns metadata (including `sha` and a working
+    `download_url`) but NO inline content. That silent gap was the actual bug
+    behind 'wallpaper saves fine but never shows up for anyone else' - a save
+    always looked successful (PUT has no such size cap, up to 100MB), but the
+    very next GET (by any visitor, on any fresh session) got back no content
+    and silently fell back to 'no wallpaper', with zero error anywhere. Fixed
+    by following `download_url` (a plain raw-blob fetch, no size cap that
+    matters here) whenever inline `content` is missing."""
     try:
         import requests
         url = f"https://api.github.com/repos/{cfg['repo']}/contents/{path}"
         r = requests.get(url, headers=_github_headers(cfg), params={"ref": cfg["branch"]}, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            return base64.b64decode(data["content"]), data.get("sha")
+        if r.status_code != 200:
+            return None, None
+        data = r.json()
+        sha = data.get("sha")
+        if "content" in data and data["content"]:
+            return base64.b64decode(data["content"]), sha
+        download_url = data.get("download_url")
+        if download_url:
+            r2 = requests.get(download_url, headers=_github_headers(cfg), timeout=30)
+            if r2.status_code == 200:
+                return r2.content, sha
     except Exception:
         pass
     return None, None
