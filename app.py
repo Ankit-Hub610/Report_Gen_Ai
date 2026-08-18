@@ -114,6 +114,12 @@ DEFAULT_BRAND = {
     # background", exactly like before this feature existed.
     "bg_image": None,
     "bg_image_mime": None,
+    # Interactive cursor-following creature background (admin toggle). When
+    # True, REPLACES the static bg_image above on the login page with a live
+    # canvas animation that reacts to mouse movement - bg_image itself is
+    # left untouched so turning this back off restores whatever wallpaper
+    # was already set.
+    "interactive_bg_enabled": False,
     # ---- Neon / glow lighting (advanced) --------------------------------------
     "glow_enabled": False,
     "glow_targets": ["text", "logo"],  # subset of "text" (sidebar brand text) / "logo" (login logo)
@@ -691,53 +697,11 @@ def _logo_img_html(logo_bytes: bytes, mime: str, width: int, extra_style: str = 
 def login_screen():
     brand = st.session_state.get("app_brand") or DEFAULT_BRAND
 
-    # Optional admin-set wallpaper behind the login form (Settings → Branding
-    # → Login page background). Only injects CSS when one is actually set -
-    # no wallpaper = plain default background, exactly like before.
-    _bg = brand.get("bg_image")
-    if _bg:
-        import base64
-        _bg_mime = brand.get("bg_image_mime") or "image/png"
-        _bg_b64 = base64.b64encode(_bg).decode("utf-8")
-        st.markdown(f"""
-        <style>
-        /* Several selectors targeted at once, not just one - Streamlit's internal
-           class names (like .main) aren't a stable public API and have changed
-           between versions (this app pins streamlit>=1.38 with no upper bound,
-           so Streamlit Cloud always installs whatever the latest release is,
-           which may not match the exact DOM shape this was originally written
-           against). data-testid attributes are the more stable hook, but even
-           those have been renamed before (e.g. an older "stMain" vs a newer
-           one) - so this covers every variant seen in the wild rather than
-           betting on just one, which is what silently showed no background at
-           all despite the image being set and saved correctly. */
-        [data-testid="stAppViewContainer"],
-        [data-testid="stAppViewContainer"] > .main,
-        [data-testid="stMain"],
-        section.main,
-        .stApp {{
-            background-image: url("data:{_bg_mime};base64,{_bg_b64}") !important;
-            background-size: cover !important;
-            background-position: center !important;
-            background-attachment: fixed !important;
-            background-repeat: no-repeat !important;
-        }}
-        [data-testid="stHeader"] {{ background: transparent !important; }}
-        [data-testid="stForm"] {{
-            background: rgba(255, 255, 255, 0.92);
-            backdrop-filter: blur(10px);
-            border-radius: 16px;
-            padding: 1.75rem 1.5rem 1.25rem 1.5rem;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
-            border: 1px solid rgba(255, 255, 255, 0.25);
-        }}
-        div[data-testid="stExpander"] {{
-            background: rgba(255, 255, 255, 0.92);
-            border-radius: 12px;
-            border: 1px solid rgba(255, 255, 255, 0.25);
-        }}
-        </style>
-        """, unsafe_allow_html=True)
+    if brand.get("interactive_bg_enabled"):
+        _render_interactive_login_background()
+    else:
+        _render_static_login_wallpaper(brand)
+
     _mode = _detect_theme_mode()
     _logo = brand.get(f"logo_{_mode}") or brand.get("logo_dark") or brand.get("logo_light")
     _logo_mime = brand.get(f"logo_{_mode}_mime") or brand.get("logo_dark_mime") or brand.get("logo_light_mime") or "image/png"
@@ -817,6 +781,180 @@ def login_screen():
                         st.rerun()
                     else:
                         st.error("Invalid admin username or password.")
+
+
+def _render_interactive_login_background():
+    """🕷️ Admin-toggleable: small creatures made of a body + wiggling legs,
+    drawn on a full-page canvas, that ease toward wherever the visitor's
+    mouse is. Pure browser JS/canvas - no server round-trip once loaded, so
+    it stays smooth. Two things make this actually work inside a Streamlit
+    components.html iframe:
+      1. The canvas listens for mousemove on window.parent.document (the
+         REAL page), not just its own iframe - otherwise it would only ever
+         react to the cursor while directly over the iframe's own box.
+      2. The iframe re-styles ITSELF (via window.frameElement, reachable
+         since components.html iframes share the parent page's origin) to
+         cover the full viewport, sit behind everything (z-index -1), and
+         ignore clicks (pointer-events: none) - so the actual login form on
+         top of it stays perfectly usable. Both only need same-origin JS,
+         no custom Streamlit component build required.
+    A dark solid page background is set alongside it (plain CSS, not part
+    of the iframe) so the creatures are actually visible regardless of the
+    visitor's system theme.
+    """
+    st.markdown("""
+        <style>
+        [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer"] > .main,
+        [data-testid="stMain"], section.main, .stApp {
+            background: #0a0a12 !important;
+        }
+        [data-testid="stHeader"] { background: transparent !important; }
+        [data-testid="stForm"] {
+            background: rgba(255, 255, 255, 0.92);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            padding: 1.75rem 1.5rem 1.25rem 1.5rem;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        div[data-testid="stExpander"] {
+            background: rgba(255, 255, 255, 0.92);
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    st.components.v1.html("""
+        <canvas id="_ra_creature_canvas" style="display:block;"></canvas>
+        <script>
+        (function() {
+            try {
+                var fe = window.frameElement;
+                if (fe) {
+                    fe.style.cssText = "position:fixed; inset:0; width:100vw; height:100vh; " +
+                                        "z-index:0; pointer-events:none; border:none;";
+                }
+            } catch (e) {}
+
+            var canvas = document.getElementById('_ra_creature_canvas');
+            var ctx = canvas.getContext('2d');
+            var pdoc = (window.parent && window.parent.document) ? window.parent.document : document;
+            var pwin = window.parent || window;
+
+            function resize() {
+                canvas.width = pwin.innerWidth;
+                canvas.height = pwin.innerHeight;
+            }
+            resize();
+            pwin.addEventListener('resize', resize);
+
+            var mouseX = pwin.innerWidth / 2, mouseY = pwin.innerHeight / 2;
+            pdoc.addEventListener('mousemove', function(e) {
+                mouseX = e.clientX; mouseY = e.clientY;
+            });
+            pdoc.addEventListener('touchmove', function(e) {
+                if (e.touches && e.touches.length) {
+                    mouseX = e.touches[0].clientX; mouseY = e.touches[0].clientY;
+                }
+            });
+
+            var N = 3;
+            var creatures = [];
+            for (var i = 0; i < N; i++) {
+                creatures.push({
+                    x: Math.random() * canvas.width, y: Math.random() * canvas.height,
+                    legPhase: Math.random() * Math.PI * 2, offsetAngle: i * 2.4
+                });
+            }
+
+            function drawCreature(s, t) {
+                var legs = 8, legLen = 24;
+                ctx.strokeStyle = "rgba(255,255,255,0.35)";
+                ctx.lineWidth = 1.4;
+                for (var i = 0; i < legs; i++) {
+                    var angle = (i / legs) * Math.PI * 2 + s.legPhase;
+                    var wig = Math.sin(t / 220 + i * 1.3) * 7;
+                    var lx = s.x + Math.cos(angle) * (legLen + wig);
+                    var ly = s.y + Math.sin(angle) * (legLen + wig);
+                    var kx = s.x + Math.cos(angle) * (legLen * 0.5);
+                    var ky = s.y + Math.sin(angle) * (legLen * 0.5) + Math.sin(t / 180 + i) * 3;
+                    ctx.beginPath();
+                    ctx.moveTo(s.x, s.y);
+                    ctx.quadraticCurveTo(kx, ky, lx, ly);
+                    ctx.stroke();
+                }
+                ctx.fillStyle = "rgba(255,255,255,0.65)";
+                ctx.beginPath();
+                ctx.arc(s.x, s.y, 5, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            function tick(t) {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                creatures.forEach(function(s) {
+                    var tx = mouseX + Math.cos(s.offsetAngle) * 26;
+                    var ty = mouseY + Math.sin(s.offsetAngle) * 26;
+                    s.x += (tx - s.x) * 0.07;
+                    s.y += (ty - s.y) * 0.07;
+                    s.legPhase += 0.025;
+                    drawCreature(s, t || 0);
+                });
+                requestAnimationFrame(tick);
+            }
+            requestAnimationFrame(tick);
+        })();
+        </script>
+    """, height=0)
+
+
+def _render_static_login_wallpaper(brand: dict):
+    # Optional admin-set wallpaper behind the login form (Settings → Branding
+    # → Login page background). Only injects CSS when one is actually set -
+    # no wallpaper = plain default background, exactly like before.
+    _bg = brand.get("bg_image")
+    if _bg:
+        import base64
+        _bg_mime = brand.get("bg_image_mime") or "image/png"
+        _bg_b64 = base64.b64encode(_bg).decode("utf-8")
+        st.markdown(f"""
+        <style>
+        /* Several selectors targeted at once, not just one - Streamlit's internal
+           class names (like .main) aren't a stable public API and have changed
+           between versions (this app pins streamlit>=1.38 with no upper bound,
+           so Streamlit Cloud always installs whatever the latest release is,
+           which may not match the exact DOM shape this was originally written
+           against). data-testid attributes are the more stable hook, but even
+           those have been renamed before (e.g. an older "stMain" vs a newer
+           one) - so this covers every variant seen in the wild rather than
+           betting on just one, which is what silently showed no background at
+           all despite the image being set and saved correctly. */
+        [data-testid="stAppViewContainer"],
+        [data-testid="stAppViewContainer"] > .main,
+        [data-testid="stMain"],
+        section.main,
+        .stApp {{
+            background-image: url("data:{_bg_mime};base64,{_bg_b64}") !important;
+            background-size: cover !important;
+            background-position: center !important;
+            background-attachment: fixed !important;
+            background-repeat: no-repeat !important;
+        }}
+        [data-testid="stHeader"] {{ background: transparent !important; }}
+        [data-testid="stForm"] {{
+            background: rgba(255, 255, 255, 0.92);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            padding: 1.75rem 1.5rem 1.25rem 1.5rem;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+            border: 1px solid rgba(255, 255, 255, 0.25);
+        }}
+        div[data-testid="stExpander"] {{
+            background: rgba(255, 255, 255, 0.92);
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.25);
+        }}
+        </style>
+        """, unsafe_allow_html=True)
 
 
 def reset_password_screen(token: str):
@@ -3730,6 +3868,21 @@ elif page == "⚙️ Settings":
                     b["bg_image_mime"] = bg_mime
                     st.success(f"Wallpaper ready below ({len(bg_data)/1024:,.0f} KB) — click "
                                f"'Save branding for everyone' to publish it.")
+
+            st.divider()
+            st.markdown("**🕷️ Interactive cursor-following creature**")
+            st.caption("A small live creature that follows the visitor's mouse cursor around the login "
+                       "page — works purely in the browser (no server calls), so it's smooth and free. "
+                       "When ON, this **replaces** the static wallpaper above on the login page (the "
+                       "wallpaper image itself isn't deleted — turn this back OFF and it reappears "
+                       "exactly as it was). When OFF, the static wallpaper (or plain background, if none "
+                       "is set) shows as usual.")
+            b["interactive_bg_enabled"] = st.toggle(
+                "Enable interactive cursor creature on the login page",
+                b.get("interactive_bg_enabled", False), key="brand_interactive_bg_enabled")
+            if b["interactive_bg_enabled"]:
+                st.caption("🕸️ Preview isn't shown here (it needs real mouse movement to animate) — "
+                           "log out and check the actual login page after saving.")
 
             st.divider()
             st.markdown("**✨ Neon / Glow Lighting**")
