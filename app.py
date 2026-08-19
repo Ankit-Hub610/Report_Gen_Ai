@@ -424,6 +424,15 @@ def _render_chart_with_zoom(fig, zoom_key: str, widget_key: str, editable: bool 
     and the caller then reuses that same fig for the PDF export, so whatever zoom
     is showing on screen is exactly what appears in the exported PDF too. Returns
     the (possibly zoom-applied) fig so the caller can hand it to chart_png_items."""
+    # Defensive fallback: self-heals any workspace whose on-disk dashboard_zoom
+    # was already saved as None by the sync_workspace_from_disk bug (see the
+    # fix in sync_workspace_from_disk() above) BEFORE this fix was deployed -
+    # without this, those existing workspaces would keep crashing here even
+    # after the root-cause fix above, since save_light()/load_light() only
+    # overwrite a key on load if the saved value is not None (so an
+    # already-None value already sitting on disk never self-corrects).
+    if st.session_state.dashboard_zoom is None:
+        st.session_state.dashboard_zoom = {}
     zoom = st.session_state.dashboard_zoom.get(zoom_key, [0, 100])
     if editable:
         zc1, zc2 = st.columns([1, 20])
@@ -470,7 +479,20 @@ def sync_workspace_from_disk(force: bool = False):
     if workspace_changed:
         for k in ws.PERSISTED_KEYS:
             ss[k] = [] if isinstance(ss.get(k), list) else None
+        # BUG FIX (reported): "Selected Charts" pe AttributeError crash ho raha tha
+        # ("'NoneType' object has no attribute 'get'" from _render_chart_with_zoom).
+        # Root cause: the loop above only knows two shapes - "was a list" -> [],
+        # everything else -> None. dashboard_zoom (and filters) are DICTS, not
+        # lists, so they were wiped to None here instead of {} - and stayed None
+        # if the on-disk saved copy for this workspace didn't have a valid
+        # dashboard_zoom yet (older save predating this feature, or a workspace
+        # that already got corrupted to None by this same bug on a previous
+        # run - once None, save_light()/load_light()'s "only overwrite if v is
+        # not None" logic can never self-heal it). Every dict-shaped persisted
+        # key needs its own explicit {} reset here, same as filters already had.
         ss["filters"] = {}
+        ss["dashboard_zoom"] = {}
+        ss["intel_role_overrides"] = {}
         ss["p3_sql_result"] = None  # SQL Query tab result belongs to the previous workspace — drop it on switch
         ss["p3_sql_error"] = None
     else:
