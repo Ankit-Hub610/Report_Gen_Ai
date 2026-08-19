@@ -75,6 +75,7 @@ TRANSLATIONS = {
     "title_admin_panel":      {"en": "🔐 Admin Panel",   "hi": "🔐 एडमिन पैनल",  "gu": "🔐 એડમિન પેનલ", "mr": "🔐 अ‍ॅडमिन पॅनल", "ta": "🔐 நிர்வாக பலகம்", "te": "🔐 అడ్మిన్ ప్యానెల్", "bn": "🔐 অ্যাডমিন প্যানেল", "pa": "🔐 ਐਡਮਿਨ ਪੈਨਲ", "kn": "🔐 ಅಡ್ಮಿನ್ ಪ್ಯಾನಲ್"},
 
     "language_picker_label": {"en": "🌐 Language", "hi": "🌐 भाषा", "gu": "🌐 ભાષા", "mr": "🌐 भाषा", "ta": "🌐 மொழி", "te": "🌐 భాష", "bn": "🌐 ভাষা", "pa": "🌐 ਭਾਸ਼ਾ", "kn": "🌐 ಭಾಷೆ"},
+    "language_dropdown_label": {"en": "Language", "hi": "Language", "gu": "Language", "mr": "Language", "ta": "Language", "te": "Language", "bn": "Language", "pa": "Language", "kn": "Language"},
 }
 
 
@@ -119,9 +120,10 @@ def nav_label(nav_option_en: str) -> str:
 
 def language_toggle(key_suffix=""):
     """Small 🌐 icon that opens a compact popover with the language list —
-    NOT a big box. Call once per page render (sidebar and/or login screen).
-    Changing the selection reruns the app immediately so every t() call
-    picks up the new language on the very next render."""
+    NOT a big box. Changing the selection reruns the app immediately so
+    every t() call picks up the new language on the very next render.
+    Kept for callers that still want the icon-only version; the main app
+    chrome now uses language_dropdown() instead (see below)."""
     current = st.session_state.get("app_language", "en")
     with st.popover("🌐", help=t("language_picker_label"), use_container_width=False):
         st.caption(t("language_picker_label"))
@@ -133,3 +135,40 @@ def language_toggle(key_suffix=""):
                          disabled=is_current):
                 st.session_state.app_language = code
                 st.rerun()
+
+
+def language_dropdown(key_suffix=""):
+    """Text-labelled 'Language' dropdown (no icon), pinned to the top-right
+    of the main content area — next to the app's own Share/toolbar icons.
+    Picking a language reruns the app immediately so every t() call picks
+    up the new language on the very next render."""
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stVerticalBlockBorderWrapper"]:has(div.ra-lang-dropdown-anchor) {
+            position: fixed;
+            top: 0.6rem;
+            right: 6rem;
+            z-index: 999999;
+            width: 190px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.container(border=False):
+        st.markdown('<div class="ra-lang-dropdown-anchor"></div>', unsafe_allow_html=True)
+        codes = list(LANGUAGES.keys())
+        current = st.session_state.get("app_language", "en")
+        idx = codes.index(current) if current in codes else 0
+        chosen = st.selectbox(
+            t("language_dropdown_label"),
+            codes,
+            index=idx,
+            format_func=lambda c: LANGUAGES.get(c, c),
+            key=f"lang_dropdown{key_suffix}",
+            label_visibility="visible",
+        )
+        if chosen != current:
+            st.session_state.app_language = chosen
+            st.rerun()
