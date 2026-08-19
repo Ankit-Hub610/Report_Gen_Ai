@@ -37,6 +37,8 @@ sqlalchemy             # 🔌 Database Connector tab — connect to an external 
 psycopg2-binary        # PostgreSQL driver for the Database Connector
 pymysql                # MySQL / MariaDB driver for the Database Connector
 streamlit-autorefresh  # powers the auto-refresh toggle on Database Connector query tabs
+gspread                # 🔗 Google Sheet tab (Private/Service Account mode) — reads a private sheet's rows
+google-auth             # authorizes the service-account JSON key used by gspread above
 PyMuPDF                # renders a PDF's first page to PNG for the Settings -> App Branding
                         # "Login page logo" upload (only needed if someone uploads a PDF logo;
                         # PNG/JPG logos work without it)
