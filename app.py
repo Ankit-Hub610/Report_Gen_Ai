@@ -45,6 +45,7 @@ from modules import ppt_engine as ppt
 from modules import usage_limits as ul
 from modules import payments as pay
 from modules import report_export as rex
+from modules import i18n
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -221,6 +222,7 @@ def init_state():
     ss.setdefault("_loaded_workspace_id", None)  # which (workspace, slide) data is currently sitting in session_state
     ss.setdefault("active_slide_id", None)        # 🗂 Slides — which slide of the workspace is active this run
     ss.setdefault("_active_slide_for_ws", None)   # which workspace active_slide_id above was resolved for
+    ss.setdefault("app_language", "en")           # 🌐 whole-app language toggle (session-only for now — see modules/i18n.py)
 
 
 init_state()
@@ -724,6 +726,10 @@ def _logo_img_html(logo_bytes: bytes, mime: str, width: int, extra_style: str = 
 def login_screen():
     brand = st.session_state.get("app_brand") or DEFAULT_BRAND
 
+    _lang_col1, _lang_col2 = st.columns([9, 1])
+    with _lang_col2:
+        i18n.language_toggle(key_suffix="_login")
+
     if brand.get("interactive_bg_enabled"):
         _render_interactive_login_background()
     else:
@@ -747,9 +753,9 @@ def login_screen():
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
         with st.form("login_form"):
-            u = st.text_input("Username")
-            p = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Login", use_container_width=True)
+            u = st.text_input(i18n.t("username"))
+            p = st.text_input(i18n.t("password"), type="password")
+            submitted = st.form_submit_button(i18n.t("login"), use_container_width=True)
             if submitted:
                 role = auth.verify_login(u, p)
                 if role:
@@ -763,7 +769,7 @@ def login_screen():
                     _set_session_cookie(_token)  # survives a browser refresh, but not copy-paste into another browser
                     st.rerun()
                 else:
-                    st.error("Invalid username or password.")
+                    st.error(i18n.t("invalid_login"))
 
         with st.expander("Forgot password?"):
             with st.form("forgot_pw_form"):
@@ -1988,14 +1994,18 @@ def customize_variant(fam, variant, meta, key_prefix):
 # ==================================================================================
 with st.sidebar:
     _b = st.session_state.app_brand
-    _text_html = (
-        f"<div style='font-size:{_b['font_size']}px; color:{_b['color']}; "
-        f"font-weight:{'700' if _b['bold'] else '400'}; "
-        f"font-style:{'italic' if _b['italic'] else 'normal'}; "
-        f"font-family:{_b['font_family']}; margin-bottom:0.2rem;'>{_b['text']}</div>"
-    )
-    _render_glow_target("brand_glow_text", "text", _b, _text_html)
-    st.caption(f"Logged in as **{st.session_state.username}** ({st.session_state.role})")
+    _lang_sb1, _lang_sb2 = st.columns([9, 1])
+    with _lang_sb2:
+        i18n.language_toggle(key_suffix="_sidebar")
+    with _lang_sb1:
+        _text_html = (
+            f"<div style='font-size:{_b['font_size']}px; color:{_b['color']}; "
+            f"font-weight:{'700' if _b['bold'] else '400'}; "
+            f"font-style:{'italic' if _b['italic'] else 'normal'}; "
+            f"font-family:{_b['font_family']}; margin-bottom:0.2rem;'>{_b['text']}</div>"
+        )
+        _render_glow_target("brand_glow_text", "text", _b, _text_html)
+    st.caption(f"{i18n.t('logged_in_as')} **{st.session_state.username}** ({st.session_state.role})")
     st.caption(f"💡Tool Guidance - ⚙️Settings > ❓how this tool work")
 
     # ---- Admin-only: "View as" a client/viewer workspace ------------------------
@@ -2102,7 +2112,7 @@ with st.sidebar:
         nav_options = ["⭐ Boss Dashboard"]   # nothing else exists for this account, not even Settings
     if st.session_state.role == auth.ROLE_ADMIN:
         nav_options.append("🔐 Admin Panel")
-    page = st.radio("Navigate", nav_options, label_visibility="collapsed")
+    page = st.radio("Navigate", nav_options, label_visibility="collapsed", format_func=i18n.nav_label)
     st.session_state.page = page
     st.divider()
     if st.session_state.plan == "free" and st.session_state.role != auth.ROLE_ADMIN:
@@ -2114,11 +2124,11 @@ with st.sidebar:
         if st.session_state.df_raw is not None:
             st.caption(f"{len(st.session_state.df_raw):,} rows × {len(st.session_state.df_raw.columns)} cols")
     else:
-        st.info("No data loaded yet.")
+        st.info(i18n.t("no_data_loaded"))
     if not can_edit():
         st.caption("👁️ View-only account — you can look at reports here but not upload data or change dashboards.")
     st.divider()
-    if st.button("🚪 Logout", use_container_width=True):
+    if st.button(i18n.t("logout"), use_container_width=True):
         auth.destroy_session(st.session_state.get("_session_token") or _get_session_cookie())  # invalidate server-side
         st.session_state.authenticated = False
         st.session_state.username = None
@@ -2139,7 +2149,7 @@ with st.sidebar:
 if page == "📥 Connect Data":
     top_l, top_r = st.columns([5, 1])
     with top_l:
-        st.title("📥 Connect Data")
+        st.title(i18n.nav_label("📥 Connect Data"))
         st.caption("Every other page (Raw Analysis, Boss Dashboard, Data Table) works off whatever dataset is "
                    "loaded here. Pick a source, load it once, then go build your analysis.")
     with top_r:
@@ -2350,7 +2360,7 @@ if page == "📥 Connect Data":
 # PAGE 1: RAW ANALYSIS
 # ==================================================================================
 if page == "📊 Raw Analysis":
-    st.title("📊 Raw Analysis")
+    st.title(i18n.nav_label("📊 Raw Analysis"))
     st.caption("Every KPI, chart and filter below is generated automatically from your loaded dataset's columns — nothing is hard-coded.")
 
     if st.session_state.df_raw is None:
@@ -2405,7 +2415,7 @@ if page == "📊 Raw Analysis":
 # PAGE 1.5: CUSTOM BUILDER (Power-BI style: pick your own column + measure + filters)
 # ==================================================================================
 elif page == "🧩 Custom Builder":
-    st.title("🧩 Custom Builder")
+    st.title(i18n.nav_label("🧩 Custom Builder"))
     st.caption("Build your own KPI cards and charts — pick the column, the measure "
                "(Sum / Average / Count / Distinct Count / Min / Max ...), and filters "
                "that apply to that card or chart only. Just like Power BI field wells.")
@@ -2514,9 +2524,9 @@ elif page == "⭐ Boss Dashboard":
                                       label_visibility="collapsed", key="dashboard_name_input")
             if new_name and new_name.strip() and new_name != st.session_state.dashboard_name:
                 st.session_state.dashboard_name = new_name
-        st.title(st.session_state.dashboard_name or "⭐ Boss Dashboard")
+        st.title(st.session_state.dashboard_name or i18n.nav_label("⭐ Boss Dashboard"))
     else:
-        st.title(st.session_state.dashboard_name or "⭐ Boss Dashboard")
+        st.title(st.session_state.dashboard_name or i18n.nav_label("⭐ Boss Dashboard"))
     st.caption("Only what you picked shows up here. Style it, swap any chart, then export a clean PDF.")
 
     # Manual sync, on purpose: a client and their linked report-viewer(s) are
@@ -2764,7 +2774,7 @@ elif page == "⭐ Boss Dashboard":
 # PAGE 2.5: INTELLIGENCE REPORT — full auto business-analytics report on ANY dataset
 # ==================================================================================
 elif page == "💡 Business Insights":
-    st.title("💡 Business Insights")
+    st.title(i18n.nav_label("💡 Business Insights"))
     st.caption("Payment Page Title ko **Sport → Code/Location → Day** hierarchy me todkar dikhata hai — "
                "kaunsa sport/location/day sabse zyada revenue de raha hai, kaunsi payment pages abhi "
                "active hain, aur kahan focus/reduce karna chahiye. Sirf tab dikhta hai jab dataset me "
@@ -2883,7 +2893,7 @@ elif page == "💡 Business Insights":
         st.dataframe(pd.DataFrame(decisions).head(25), use_container_width=True, hide_index=True)
 
 elif page == "📈 Full Analysis":
-    st.title("📈 Full Analysis")
+    st.title(i18n.nav_label("📈 Full Analysis"))
     st.caption("Har number Python khud calculate karta hai (koi invented figure nahi). "
                "**Page 1** neeche poora detailed analysis dikhata hai (data samajhna, saaf karna, "
                "aur calculated columns), **Page 2** usका simple summary — past kya tha, future me kya hoga, "
@@ -3359,7 +3369,7 @@ elif page == "📈 Full Analysis":
 # PAGE 3: DATA TABLE
 # ==================================================================================
 elif page == "🗂 Data Table":
-    st.title("🗂 Data Table")
+    st.title(i18n.nav_label("🗂 Data Table"))
 
     if st.session_state.df_raw is None:
         st.info("Load data on the **📥 Connect Data** page first.")
@@ -3602,7 +3612,7 @@ elif page == "🗂 Data Table":
 # PAGE 3.5: AI ASSISTANT — free chat with your data (OpenRouter free tier)
 # ==================================================================================
 elif page == "🤖 AI Assistant":
-    st.title("🤖 AI Assistant")
+    st.title(i18n.nav_label("🤖 AI Assistant"))
     st.caption("Ask questions in plain language about your data, KPIs, and dashboard charts. Answers are "
                "grounded in real SQL run against your dataset — not guesses — and shown with proof below each reply. "
                "Chat history is kept for **5 days** and then auto-deleted.")
@@ -3843,7 +3853,7 @@ elif page == "🤖 AI Assistant":
 # PAGE 4: SETTINGS
 # ==================================================================================
 elif page == "⚙️ Settings":
-    st.title("⚙️ Settings")
+    st.title(i18n.nav_label("⚙️ Settings"))
 
     tab_names = ["🎨 Defaults", "🔑 My Account"]
     if st.session_state.role == auth.ROLE_CLIENT:
@@ -4378,7 +4388,7 @@ every page to narrow down what's rendered on screen.
 
 
 elif page == "💎 Plans":
-    st.title("💎 Plans")
+    st.title(i18n.nav_label("💎 Plans"))
     if st.session_state.role != auth.ROLE_ADMIN:
         # Same reasoning as the admin's own 15s "Live" pending-requests
         # refresh: someone sitting on THIS page waiting for their upgrade
@@ -4427,7 +4437,7 @@ elif page == "🔐 Admin Panel":
         st.error("You don't have access to this page.")
         st.stop()
 
-    st.title("🔐 Admin Panel")
+    st.title(i18n.nav_label("🔐 Admin Panel"))
     st.caption("Visible to admin accounts only — report-users never see this page.")
 
     tab_users, tab_mypw, tab_reset, tab_payments, tab_admin_about = st.tabs(
