@@ -25,6 +25,7 @@ plotly==6.8.0  # PINNED — was unpinned before, so Streamlit Cloud silently ins
 reportlab
 qrcode        # generates the scannable UPI QR code on the 💎 Plans page's "Pay via UPI" flow
 openpyxl      # needed to read/write .xlsx files (pd.ExcelFile)
+python-docx   # Word (.docx) export of the Full Analysis report (see modules/report_export.py)
 kaleido==0.2.1  # PINNED — newer kaleido (1.x) needs a headless Chrome browser that
                    # isn't available on Streamlit Cloud by default, so fig.to_image()
                    # was silently failing and every chart was disappearing from the
