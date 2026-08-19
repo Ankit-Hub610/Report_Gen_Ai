@@ -44,6 +44,7 @@ from modules import intel_engine as ie
 from modules import ppt_engine as ppt
 from modules import usage_limits as ul
 from modules import payments as pay
+from modules import report_export as rex
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -3109,6 +3110,31 @@ elif page == "📈 Full Analysis":
                         st.dataframe(pd.DataFrame(b["bottom"]), use_container_width=True, hide_index=True)
 
         st.divider()
+        st.markdown("**⬇️ Download Page 1 (Full Analysis)**")
+        _th = st.session_state.theme
+        _dl1, _dl2, _dl3 = st.columns(3)
+        with _dl1:
+            st.download_button(
+                "📄 PDF", data=rex.build_full_analysis_pdf(
+                    facts, ir, health, roles, cleaning_log, derived_log, _th, which="page1"),
+                file_name="full_analysis_page1.pdf", mime="application/pdf",
+                use_container_width=True, key="intel_p1_dl_pdf")
+        with _dl2:
+            st.download_button(
+                "📝 Word", data=rex.build_full_analysis_docx(
+                    facts, ir, health, roles, cleaning_log, derived_log, which="page1"),
+                file_name="full_analysis_page1.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True, key="intel_p1_dl_docx")
+        with _dl3:
+            st.download_button(
+                "📊 Excel", data=rex.build_full_analysis_xlsx(
+                    facts, ir, health, roles, cleaning_log, derived_log, which="page1"),
+                file_name="full_analysis_page1.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True, key="intel_p1_dl_xlsx")
+
+        st.divider()
         if st.button("➡️ Continue to Page 2 — Summary & Recommendations", type="primary", key="intel_go_part2"):
             st.session_state.intel_part = 2
             st.rerun()
@@ -3197,6 +3223,50 @@ elif page == "📈 Full Analysis":
                         to_email.strip(), "Analysis Summary — RA-Intelligence Platform",
                         deterministic_report_md)
                     (st.success if ok else st.error)(msg)
+
+        st.markdown("**⬇️ Download Page 2 (Summary & Recommendations)**")
+        _th2 = st.session_state.theme
+        _e1, _e2, _e3, _e4 = st.columns(4)
+        with _e1:
+            st.download_button(
+                "📄 PDF", data=rex.build_full_analysis_pdf(
+                    facts, ir, health, roles, cleaning_log, derived_log, _th2, which="page2"),
+                file_name="full_analysis_page2.pdf", mime="application/pdf",
+                use_container_width=True, key="intel_p2_dl_pdf")
+        with _e2:
+            st.download_button(
+                "📝 Word", data=rex.build_full_analysis_docx(
+                    facts, ir, health, roles, cleaning_log, derived_log, which="page2"),
+                file_name="full_analysis_page2.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True, key="intel_p2_dl_docx")
+        with _e3:
+            st.download_button(
+                "📊 Excel", data=rex.build_full_analysis_xlsx(
+                    facts, ir, health, roles, cleaning_log, derived_log, which="page2"),
+                file_name="full_analysis_page2.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True, key="intel_p2_dl_xlsx")
+        with _e4:
+            with st.popover("📚 Both pages", use_container_width=True):
+                st.caption("Full report — Page 1 + Page 2 combined, one file.")
+                st.download_button(
+                    "📄 PDF (both)", data=rex.build_full_analysis_pdf(
+                        facts, ir, health, roles, cleaning_log, derived_log, _th2, which="both"),
+                    file_name="full_analysis_report.pdf", mime="application/pdf",
+                    use_container_width=True, key="intel_both_dl_pdf")
+                st.download_button(
+                    "📝 Word (both)", data=rex.build_full_analysis_docx(
+                        facts, ir, health, roles, cleaning_log, derived_log, which="both"),
+                    file_name="full_analysis_report.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True, key="intel_both_dl_docx")
+                st.download_button(
+                    "📊 Excel (both)", data=rex.build_full_analysis_xlsx(
+                        facts, ir, health, roles, cleaning_log, derived_log, which="both"),
+                    file_name="full_analysis_report.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True, key="intel_both_dl_xlsx")
 
         st.divider()
         st.subheader("✅ Action Tracker")
