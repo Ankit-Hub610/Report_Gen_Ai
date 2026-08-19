@@ -301,12 +301,29 @@ def verify_admin_login(username: str, password_plain: str) -> bool:
 def get_workspace_id(username: str) -> str:
     """The data workspace this account reads/writes. Falls back to the
     username itself if the account is missing/unknown, so callers always
-    get *something* usable rather than None."""
+    get *something* usable rather than None.
+
+    NOTE: for a shared-demo account (is_shared_demo == True), this is NOT
+    what's actually used at login — app.py generates a fresh temporary
+    workspace_id per login instead, specifically so multiple people sharing
+    the same demo username/password never see each other's data. This
+    function still returns a stable fallback for any other caller that
+    doesn't care about that (e.g. admin listings)."""
     store = _load_store()
     user = store["users"].get((username or "").strip())
     if user:
         return user.get("workspace_id") or username
     return (username or "").strip()
+
+
+def is_shared_demo(username: str) -> bool:
+    """True for an account marked as a shared demo login (see
+    create_or_update_user's is_shared_demo param) — every separate login to
+    such an account gets its own fresh, isolated temporary workspace
+    instead of everyone sharing one workspace_id."""
+    store = _load_store()
+    user = store["users"].get((username or "").strip())
+    return bool(user and user.get("is_shared_demo"))
 
 
 # --------------------------------------------------------------------------------
@@ -316,7 +333,8 @@ def list_users():
     store = _load_store()
     return [
         {"username": u, "role": info["role"], "workspace_id": info.get("workspace_id", u),
-         "email": info.get("email", ""), "plan": info.get("plan", "standard")}
+         "email": info.get("email", ""), "plan": info.get("plan", "standard"),
+         "is_shared_demo": bool(info.get("is_shared_demo"))}
         for u, info in store["users"].items()
     ]
 
@@ -334,7 +352,7 @@ def list_client_usernames():
 
 
 def create_or_update_user(username: str, password_plain: str, role: str, workspace_id: str = None,
-                          email: str = None, plan: str = None):
+                          email: str = None, plan: str = None, is_shared_demo: bool = False):
     """Creates a new account or updates an existing one's password/role/link.
     workspace_id: which data workspace this account should read/write.
       - If omitted/blank, defaults to the account's own username (a fresh,
@@ -346,13 +364,25 @@ def create_or_update_user(username: str, password_plain: str, role: str, workspa
       "Forgot password" (the reset link goes to this address).
     plan: "standard" (default, unlimited) or "free" (capped — see
       usage_limits.py for the actual limits). Lets you give trial/beta
-      accounts real usage caps without touching their role or workspace."""
+      accounts real usage caps without touching their role or workspace.
+    is_shared_demo: mark this account as a SHARED DEMO login — meant to be
+      handed out to multiple different people at once (same username +
+      password for everyone). Every separate login to a shared-demo account
+      gets its own fresh, isolated, temporary workspace (see app.py's login
+      flow + auth.create_session/resolve_session), so no two people sharing
+      these credentials ever see each other's uploaded data — unlike a
+      normal account, where workspace_id is fixed and shared across every
+      login. NOTE: this flag is applied exactly as passed on every call, so
+      when just resetting a demo account's password, pass is_shared_demo=True
+      again too, or it will silently turn back off (same as re-entering an
+      existing account's other fields on this form)."""
     username = (username or "").strip()
     if not username or not password_plain or role not in ALL_ROLES:
         raise ValueError("Username, password and a valid role are required.")
     store = _load_store()
     ws_id = (workspace_id or "").strip() or username
-    entry = {"password_hash": _hash(password_plain), "role": role, "workspace_id": ws_id}
+    entry = {"password_hash": _hash(password_plain), "role": role, "workspace_id": ws_id,
+             "is_shared_demo": bool(is_shared_demo)}
     if email:
         entry["email"] = email.strip().lower()
     elif username in store["users"] and store["users"][username].get("email"):
@@ -497,40 +527,58 @@ def _get_session_secret() -> bytes:
     return bytes.fromhex(secret_hex)
 
 
-def create_session(username: str) -> str:
+def create_session(username: str, workspace_id: str = None) -> str:
     """Called right after a successful login (and again to silently extend
     an already-valid one — see app.py's cookie-restore block). Returns a
-    signed, stateless token to store in the browser cookie."""
+    signed, stateless token to store in the browser cookie.
+
+    workspace_id: only passed for a SHARED DEMO account — embeds that
+    login's own freshly-generated temporary workspace_id directly in the
+    token, so it's self-verifying just like everything else here and
+    survives a browser refresh (same token → same temp workspace) without
+    needing any server-side record. Omit for a normal account; the caller
+    resolves workspace_id from auth.get_workspace_id(username) instead."""
     secret = _get_session_secret()
     expires = int(time.time()) + SESSION_LIFETIME_SECONDS
-    payload = f"{username}|{expires}"
+    payload = f"{username}|{expires}|{workspace_id or ''}"
     payload_b64 = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("utf-8").rstrip("=")
     sig = hmac.new(secret, payload_b64.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"{payload_b64}.{sig}"
 
 
 def resolve_session(token: str):
-    """Given a token from the cookie, returns the username it belongs to, or
-    None if it's missing/malformed/tampered-with/expired. Verifies entirely
-    from the token itself (signature + embedded expiry) — no server-side
-    file lookup, so this keeps working right after a container rebuild."""
+    """Given a token from the cookie, returns (username, workspace_id) —
+    workspace_id is None unless this particular session embedded a specific
+    temporary one (shared demo accounts only — see create_session). Returns
+    (None, None) if the token is missing/malformed/tampered-with/expired.
+    Verifies entirely from the token itself (signature + embedded expiry),
+    so this keeps working right after a container rebuild."""
     if not token or "." not in token:
-        return None
+        return None, None
     payload_b64, _, sig = token.rpartition(".")
     secret = _get_session_secret()
     expected_sig = hmac.new(secret, payload_b64.encode("utf-8"), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(sig, expected_sig):
-        return None   # bad signature - either tampered with, or signed under an old/different secret
+        return None, None   # bad signature - either tampered with, or signed under an old/different secret
     try:
         padded = payload_b64 + "=" * (-len(payload_b64) % 4)
         payload = base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8")
-        username, _, expires_str = payload.rpartition("|")
+        parts = payload.split("|")
+        if len(parts) == 3:
+            username, expires_str, ws_part = parts
+        elif len(parts) == 2:
+            # Backward compat: a token issued before workspace_id was added
+            # to the payload (old format was "username|expires").
+            username, expires_str = parts
+            ws_part = ""
+        else:
+            return None, None
         expires = int(expires_str)
     except Exception:
-        return None
+        return None, None
     if time.time() > expires:
-        return None
-    return username
+        return None, None
+    return username, (ws_part or None)
 
 
 def destroy_session(token: str):
