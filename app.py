@@ -240,6 +240,8 @@ def init_state():
     ss.setdefault("_loaded_workspace_id", None)  # which (workspace, slide) data is currently sitting in session_state
     ss.setdefault("active_slide_id", None)        # 🗂 Slides — which slide of the workspace is active this run
     ss.setdefault("_active_slide_for_ws", None)   # which workspace active_slide_id above was resolved for
+    ss.setdefault("_last_upload_sig_map", {})     # {slide_storage_id: (file_name, file_size)} — per-SLIDE upload
+                                                    # dedup guard (see _get_last_upload_sig / BUG FIX note below)
 
 
 init_state()
@@ -289,6 +291,35 @@ def switch_active_slide(slide_id: str):
     st.session_state["active_slide_id"] = slide_id
     st.session_state["_active_slide_for_ws"] = wsid
     ws.set_active_slide(wsid, slide_id)
+
+
+# --------------------------------------------------------------------------------
+# BUG FIX (reported): "slide 1 ka data slide 2 me dikhta hai" / data changing on
+# slide switch. Root cause: the Connect Data page's st.file_uploader had NO key,
+# so Streamlit treated it as the SAME widget regardless of which slide was
+# active — a file picked while on Slide 1 stayed sitting in the browser's
+# uploader even after switching to Slide 2. The old dedup guard
+# (_last_upload_sig) was also a single GLOBAL value, not scoped per slide, so
+# clicking "🔄 Refresh" (which reset that guard to None) made the app treat
+# Slide 1's still-selected file as "new" again and silently reload it — INTO
+# whichever slide happened to be active at that moment.
+#
+# FIX: (1) the uploader below is now given a key that includes the active
+# slide's storage id, so switching slides always mounts a FRESH, empty
+# uploader (old file selection can never carry over); (2) the dedup guard is
+# now a dict keyed by slide storage id instead of one shared value, as
+# defense in depth.
+# --------------------------------------------------------------------------------
+def _get_last_upload_sig():
+    return st.session_state._last_upload_sig_map.get(effective_storage_id())
+
+
+def _set_last_upload_sig(sig):
+    st.session_state._last_upload_sig_map[effective_storage_id()] = sig
+
+
+def _clear_last_upload_sig():
+    st.session_state._last_upload_sig_map.pop(effective_storage_id(), None)
 
 
 def can_edit() -> bool:
@@ -2208,7 +2239,7 @@ if page == "📥 Connect Data":
         st.write("")
         if st.button("🔄 Refresh", help="Re-check the currently loaded dataset / clear a stuck upload and start over",
                      use_container_width=True):
-            st.session_state._last_upload_sig = None
+            _clear_last_upload_sig()
             st.rerun()
 
     if st.session_state.role in (auth.ROLE_ADMIN, auth.ROLE_CLIENT, auth.ROLE_VIEWER):
@@ -2300,7 +2331,7 @@ if page == "📥 Connect Data":
             st.session_state.dashboard_charts = []
             st.session_state.pinned_kpis = []
             st.session_state.dashboard_slicers = []
-            st.session_state._last_upload_sig = None
+            _clear_last_upload_sig()
             st.session_state.data_source_is_db = False
             st.session_state.db_last_load_sql = ""
             st.session_state.db_last_load_label = ""
@@ -2318,9 +2349,14 @@ if page == "📥 Connect Data":
         with src_tab_file:
             up_col, sample_col = st.columns([3, 1])
             with up_col:
+                # KEY IS SLIDE-SCOPED (bug fix): including the active slide's storage id
+                # in the widget key forces Streamlit to mount a brand-new, EMPTY uploader
+                # every time the active slide changes, instead of carrying over whatever
+                # file was still sitting in the uploader from a previously-viewed slide.
                 uploaded = st.file_uploader(
                     "Import data (CSV, XLSX, JSON, PDF) — pick multiple files to combine them into one dataset",
                     type=["csv", "tsv", "xlsx", "xls", "json", "pdf"], accept_multiple_files=True,
+                    key=f"cd_uploader_{effective_storage_id()}",
                 )
                 if uploaded:
                     if len(uploaded) > 1:
@@ -2333,18 +2369,19 @@ if page == "📥 Connect Data":
                         combine_mode = "stack" if combine_label.startswith("Stack") else "columns"
                         if st.button(f"🔗 Combine & Load {len(uploaded)} files", type="primary"):
                             if load_files(uploaded, combine_mode=combine_mode) is not None:
-                                st.session_state._last_upload_sig = None  # multi-file combos aren't cheaply re-checked; just don't re-trigger single-file path
+                                _clear_last_upload_sig()  # multi-file combos aren't cheaply re-checked; just don't re-trigger single-file path
                                 st.rerun()
                     else:
                         # Streamlit re-runs this whole script on every click anywhere on the page,
                         # and `uploaded` still holds the same file as long as it's sitting in the
                         # uploader — so without this guard, load_file() re-ran (and errored, since
                         # the file's stream was already consumed) on every single interaction, not
-                        # just right after a genuine new upload.
+                        # just right after a genuine new upload. Scoped PER SLIDE (see helpers
+                        # above) so this guard can never mistake one slide's upload for another's.
                         sig = (uploaded[0].name, uploaded[0].size)
-                        if st.session_state.get("_last_upload_sig") != sig:
+                        if _get_last_upload_sig() != sig:
                             if load_file(uploaded[0]) is not None:
-                                st.session_state._last_upload_sig = sig
+                                _set_last_upload_sig(sig)
                                 st.rerun()
             with sample_col:
                 sample_choice = st.selectbox("Try with sample data", list(SAMPLE_DATASETS.keys()),
