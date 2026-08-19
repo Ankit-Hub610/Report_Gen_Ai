@@ -726,10 +726,6 @@ def _logo_img_html(logo_bytes: bytes, mime: str, width: int, extra_style: str = 
 def login_screen():
     brand = st.session_state.get("app_brand") or DEFAULT_BRAND
 
-    _lang_col1, _lang_col2 = st.columns([9, 1])
-    with _lang_col2:
-        i18n.language_toggle(key_suffix="_login")
-
     if brand.get("interactive_bg_enabled"):
         _render_interactive_login_background()
     else:
@@ -1994,17 +1990,13 @@ def customize_variant(fam, variant, meta, key_prefix):
 # ==================================================================================
 with st.sidebar:
     _b = st.session_state.app_brand
-    _lang_sb1, _lang_sb2 = st.columns([9, 1])
-    with _lang_sb2:
-        i18n.language_toggle(key_suffix="_sidebar")
-    with _lang_sb1:
-        _text_html = (
-            f"<div style='font-size:{_b['font_size']}px; color:{_b['color']}; "
-            f"font-weight:{'700' if _b['bold'] else '400'}; "
-            f"font-style:{'italic' if _b['italic'] else 'normal'}; "
-            f"font-family:{_b['font_family']}; margin-bottom:0.2rem;'>{_b['text']}</div>"
-        )
-        _render_glow_target("brand_glow_text", "text", _b, _text_html)
+    _text_html = (
+        f"<div style='font-size:{_b['font_size']}px; color:{_b['color']}; "
+        f"font-weight:{'700' if _b['bold'] else '400'}; "
+        f"font-style:{'italic' if _b['italic'] else 'normal'}; "
+        f"font-family:{_b['font_family']}; margin-bottom:0.2rem;'>{_b['text']}</div>"
+    )
+    _render_glow_target("brand_glow_text", "text", _b, _text_html)
     st.caption(f"{i18n.t('logged_in_as')} **{st.session_state.username}** ({st.session_state.role})")
     st.caption(f"💡Tool Guidance - ⚙️Settings > ❓how this tool work")
 
@@ -2141,6 +2133,11 @@ with st.sidebar:
         st.session_state._session_token = None
         _clear_session_cookie()
         st.rerun()
+
+# ---- Language dropdown, top-right of the main content (next to where the
+# app's own Share/toolbar icons sit), on every page after login. A labelled
+# dropdown, not an icon — see modules/i18n.py:language_dropdown(). ----
+i18n.language_dropdown(key_suffix="_topbar")
 
 
 # ==================================================================================
