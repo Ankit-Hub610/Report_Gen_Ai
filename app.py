@@ -281,15 +281,92 @@ def effective_storage_id():
     return ws.slide_storage_id(effective_workspace_id(), active_slide_id())
 
 
+def persist_workspace_now(force_full: bool = False):
+    """Writes the CURRENT session_state to disk for the active (workspace,
+    slide) right now, in this exact line of execution - never deferred.
+
+    BUG FIX (reported): "1st slide me data upload kiya, 2nd slide me gaya,
+    uska bhi upload kiya, wapis 1st pe gaya to data delete ho gaya tha, 2nd
+    pe bhi nahi tha" - the dataset appeared to vanish after visiting/creating
+    another slide.
+
+    Root cause: the ONLY place that ever wrote df_raw to disk was one block
+    at the very BOTTOM of this file (see "AUTO-SAVE WORKSPACE TO DISK"),
+    meant to run once at the end of every single script run. But the
+    📥 Connect Data page - the page you are ALWAYS on right after an upload,
+    a Google Sheet load, or a database load - calls st.stop() at the end of
+    its own render (so it doesn't fall through and start drawing the next
+    page's content underneath itself). st.stop() halts the ENTIRE script
+    immediately, so execution never reaches that bottom auto-save block at
+    all while sitting on Connect Data. The freshly uploaded dataset sat only
+    in st.session_state - correctly visible for the rest of THIS session,
+    but never actually written to workspace_state/<slide>/current.pkl. The
+    instant you switched to another Slide (or another workspace, via 'View
+    as'), sync_workspace_from_disk() correctly wiped session_state for the
+    new (workspace, slide) pair and reloaded from disk - which never had
+    the data, so it looked exactly like it had been "deleted apne aap".
+    Switching back to the original slide then loaded ITS on-disk copy, which
+    was just as unsaved as the other one - so both looked empty.
+
+    Fix: don't wait for the bottom of the script. Call this function
+    directly, synchronously, at the exact moment new data is applied
+    (_apply_loaded_df / _refresh_loaded_df) - BEFORE any page can st.stop()
+    out from under it. The bottom-of-file block still exists and still
+    calls this same function on every run that doesn't hit an early
+    st.stop() (dashboard pin/unpin, slicer tweaks, etc.), so nothing about
+    the light-save performance fix is lost.
+    """
+    ss = st.session_state
+    if not ss.get("authenticated") or ss.get("df_raw") is None:
+        return
+    wsid_now = effective_storage_id()
+    if force_full or ss.get("_last_saved_df_id") != id(ss.get("df_raw")):
+        ws.save(ss, wsid_now)
+        ss["_last_saved_df_id"] = id(ss.get("df_raw"))
+    else:
+        ws.save_light(ss, wsid_now)
+
+
 def switch_active_slide(slide_id: str):
     """Switches the session onto a different Slide of the current workspace
     and persists that choice, so it sticks across a page reload / other
     sessions sharing the account. The actual data swap happens automatically
     on the next sync_workspace_from_disk() call, exactly like an admin
-    'View as' switch — see that function's docstring."""
+    'View as' switch — see that function's docstring.
+
+    BUG FIX (reported): "1st slide me data upload kiya, 2nd slide me gaya,
+    uska bhi upload kiya, wapis 1st pe gaya to data delete tha, 2nd pe bhi
+    nahi tha" - the ACTUAL mechanism (confirmed by an automated repro):
+    creating/switching to a new slide would appear to work for one render,
+    then silently SNAP BACK to the previous slide on the very next rerun -
+    and any upload made right after that silent snap-back landed in the
+    PREVIOUS slide's storage, overwriting it, while the slide the user
+    thought they were on stayed empty.
+
+    Root cause: the sidebar's Slide picker is
+        st.selectbox(..., index=<computed from active slide>, key="_slide_switcher_select")
+    Streamlit widgets remember their OWN last value under `key` across
+    reruns. When BOTH `index` and `key` are given, and `key` already holds
+    a value that's still a valid option, Streamlit uses the REMEMBERED key
+    value and ignores `index`. Since nothing here ever told that widget's
+    own stored key to follow along, switching slides only changed our
+    active_slide_id/registry - the dropdown's own memory stayed on the old
+    slide, so the very next render silently treated that stale dropdown
+    value as "the user re-picked the old slide" and switched back.
+
+    Fix: we CANNOT just assign st.session_state["_slide_switcher_select"]
+    directly here - Streamlit forbids writing to a widget's own key once
+    that widget has already been instantiated earlier in the same script
+    run (this function is called both before AND after the picker renders,
+    e.g. from the 'Manage slides' popover which sits below it). Instead,
+    set a one-shot pending flag; the picker's own rendering code (below)
+    applies it to its key and clears it right before instantiating the
+    widget on the NEXT run - always safe, since that always happens before
+    the widget exists for that run."""
     wsid = effective_workspace_id()
     st.session_state["active_slide_id"] = slide_id
     st.session_state["_active_slide_for_ws"] = wsid
+    st.session_state["_pending_slide_select_sync"] = slide_id
     ws.set_active_slide(wsid, slide_id)
 
 
@@ -1494,6 +1571,9 @@ def _apply_loaded_df(df, source_name):
     st.session_state.dashboard_slicers = []
     st.session_state.data_source_is_db = False   # a fresh file/sample load — any previous DB link no longer applies
     st.session_state.data_source_is_gsheet = False  # a fresh file/sample load — any previous Google Sheet link no longer applies
+    persist_workspace_now(force_full=True)  # BUG FIX: save immediately, don't rely on reaching the bottom of the
+                                             # script — the Connect Data page's st.stop() prevents that (see
+                                             # persist_workspace_now()'s docstring for the full story).
     if cap_note:
         st.warning(f"🆓 Free plan is capped at {ul.FREE_PLAN_LIMITS['max_rows']:,} rows — "
                    f"loaded the first {ul.FREE_PLAN_LIMITS['max_rows']:,} rows of this file. "
@@ -1522,6 +1602,7 @@ def _refresh_loaded_df(df, source_name):
     st.session_state.meta = de.profile_columns(df)
     st.session_state.data_source_name = source_name + (f" {cap_note}" if cap_note else "")
     st.session_state.db_last_refreshed_at = time.time()
+    persist_workspace_now(force_full=True)  # BUG FIX: same reasoning as _apply_loaded_df — save immediately.
 
 
 def _run_db_refresh():
@@ -2127,9 +2208,24 @@ with st.sidebar:
         _active_slide = active_slide_id()
         _slide_ids = [s["id"] for s in _slides]
         _slide_labels = {s["id"]: s["name"] for s in _slides}
+        # BUG FIX: this widget used to pass BOTH `index=` (computed from our
+        # own active-slide tracking) AND `key=` together. Streamlit prefers
+        # the widget's own remembered `key` value over `index` whenever that
+        # remembered value is still a valid option - so switching slides
+        # (create/rename/delete/pick) would silently snap back to whatever
+        # was last selected, because nothing kept the two in sync. Fixed by
+        # dropping `index` entirely and driving the widget PURELY off its
+        # own `key`, which we now explicitly (re)sync from our side — via
+        # the pending-sync flag below on a programmatic switch, or here on
+        # this account's very first render of this widget.
+        _pending_sync = st.session_state.pop("_pending_slide_select_sync", None)
+        if _pending_sync is not None and _pending_sync in _slide_ids:
+            st.session_state["_slide_switcher_select"] = _pending_sync
+        elif "_slide_switcher_select" not in st.session_state or \
+                st.session_state["_slide_switcher_select"] not in _slide_ids:
+            st.session_state["_slide_switcher_select"] = _active_slide
         _chosen_slide = st.selectbox(
             "🗂 Slide", _slide_ids,
-            index=_slide_ids.index(_active_slide) if _active_slide in _slide_ids else 0,
             format_func=lambda sid: _slide_labels.get(sid, sid),
             help="Each slide is a separate dataset + dashboard, like browser tabs. "
                  "Switching never loses or overwrites another slide's data.",
@@ -5061,13 +5157,14 @@ have no access to any credential screen, and never see this tab.
 # (dataset + config) only runs when the dataset actually changed; every
 # other interaction uses save_light(), which is cheap because it never
 # touches the dataset.
-if st.session_state.authenticated and st.session_state.df_raw is not None:
-    _wsid_now = effective_storage_id()
-    if st.session_state.get("_last_saved_df_id") != id(st.session_state.df_raw):
-        ws.save(st.session_state, _wsid_now)
-        st.session_state._last_saved_df_id = id(st.session_state.df_raw)
-    else:
-        ws.save_light(st.session_state, _wsid_now)
+# NOTE: the dataset itself (df_raw) is now ALSO saved immediately, synchronously,
+# the moment it's loaded/refreshed - see persist_workspace_now() and its call sites
+# in _apply_loaded_df()/_refresh_loaded_df() for why that's necessary (some pages,
+# e.g. Connect Data, st.stop() before ever reaching this point). This call remains
+# here so every OTHER interaction (pin/unpin a KPI, add/remove a chart, tweak a
+# slicer, rename the dashboard...) still gets picked up on whichever page the user
+# is currently on, without needing its own explicit save call everywhere.
+persist_workspace_now()
 
 
 # footer
