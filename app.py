@@ -39,6 +39,7 @@ from modules import measures as ms, builder_engine as be
 from modules import workspace_store as ws
 from modules import query_engine as qe
 from modules import db_connector as dbc
+from modules import gsheet_connector as gsc
 from modules import ai_chat as ac
 from modules import email_service as es
 from modules import intel_engine as ie
@@ -207,6 +208,23 @@ def init_state():
     ss.setdefault("db_auto_sync_seconds", 0)     # 0 = off; >0 = auto-refresh interval selected on Connect Data page
     ss.setdefault("db_queries", [])         # list of query-tab dicts, see modules/db_connector.py
     ss.setdefault("db_query_results", {})   # {query_id: DataFrame}
+
+    # Google Sheet Connector (Connect Data page) - NEVER persisted to disk, same as the DB connector above
+    ss.setdefault("gsheet_mode", "Public Link")          # "Public Link" or "Private (Service Account)"
+    ss.setdefault("gsheet_url", "")                       # last-typed sheet URL/ID (public mode)
+    ss.setdefault("gsheet_gid", "0")                       # last-typed tab gid (public mode)
+    ss.setdefault("gsheet_sa_json", "")                    # pasted service-account JSON text (session-only, private mode)
+    ss.setdefault("gsheet_sa_info", None)                  # parsed dict, once validated
+    ss.setdefault("gsheet_connected", False)               # private mode: service account validated against the sheet
+    ss.setdefault("gsheet_sheet_id", "")                   # private mode: sheet id currently connected
+    ss.setdefault("data_source_is_gsheet", False)          # was the CURRENT df_raw loaded from a Google Sheet?
+    ss.setdefault("gsheet_last_load_mode", "")              # "public" or "private" - so refresh knows which path to re-run
+    ss.setdefault("gsheet_last_load_url", "")                # public mode: url/id + gid used, for refresh
+    ss.setdefault("gsheet_last_load_gid", "0")
+    ss.setdefault("gsheet_last_load_worksheet", "")           # private mode: worksheet name used, for refresh
+    ss.setdefault("gsheet_last_load_label", "")               # shown in the "connected live" banner
+    ss.setdefault("gsheet_last_refreshed_at", None)            # time.time() of last successful (re)load
+    ss.setdefault("gsheet_auto_sync_seconds", 0)                # 0 = off; >0 = auto-refresh interval
 
     # 📈 Full Analysis page
     ss.setdefault("intel_role_overrides", {})   # user-confirmed column-role mapping (persisted)
@@ -1444,6 +1462,7 @@ def _apply_loaded_df(df, source_name):
     st.session_state.pinned_kpis = []
     st.session_state.dashboard_slicers = []
     st.session_state.data_source_is_db = False   # a fresh file/sample load — any previous DB link no longer applies
+    st.session_state.data_source_is_gsheet = False  # a fresh file/sample load — any previous Google Sheet link no longer applies
     if cap_note:
         st.warning(f"🆓 Free plan is capped at {ul.FREE_PLAN_LIMITS['max_rows']:,} rows — "
                    f"loaded the first {ul.FREE_PLAN_LIMITS['max_rows']:,} rows of this file. "
@@ -1488,6 +1507,34 @@ def _run_db_refresh():
         _refresh_loaded_df(cleaned, st.session_state.data_source_name)
         return True, f"Refreshed — {len(cleaned):,} rows as of now."
     except dbc.QueryError as e:
+        return False, f"Refresh failed: {e}"
+
+
+def _run_gsheet_refresh():
+    """Re-runs the last-used Google Sheet load (public CSV or private worksheet)
+    and applies the result. Returns (ok, message). Safe to call from a button
+    OR from an auto-sync rerun."""
+    mode = st.session_state.gsheet_last_load_mode
+    try:
+        if mode == "public":
+            if not st.session_state.gsheet_last_load_url:
+                return False, ("No live Google Sheet connection in this browser session — go to "
+                                "**📥 Connect Data → Google Sheet** and load it again.")
+            df = gsc.load_public_sheet(st.session_state.gsheet_last_load_url, st.session_state.gsheet_last_load_gid)
+        elif mode == "private":
+            if not (st.session_state.gsheet_sa_info and st.session_state.gsheet_sheet_id):
+                return False, ("No live Google Sheet connection in this browser session — go to "
+                                "**📥 Connect Data → Google Sheet** and reconnect (the service account "
+                                "key isn't kept between browser sessions, for security)." )
+            client = gsc.get_client(st.session_state.gsheet_sa_info)
+            df = gsc.load_private_worksheet(client, st.session_state.gsheet_sheet_id,
+                                             st.session_state.gsheet_last_load_worksheet)
+        else:
+            return False, "No live Google Sheet connection in this browser session."
+        cleaned = de.clean_dataframe(df)
+        _refresh_loaded_df(cleaned, st.session_state.data_source_name)
+        return True, f"Refreshed — {len(cleaned):,} rows as of now."
+    except (gsc.ConnectionError, gsc.QueryError) as e:
         return False, f"Refresh failed: {e}"
 
 
@@ -2209,6 +2256,42 @@ if page == "📥 Connect Data":
             elif st.session_state.db_auto_sync_seconds and not AUTOREFRESH_AVAILABLE:
                 st.warning("Auto-sync needs the `streamlit-autorefresh` package — add it to requirements.txt to enable this.")
 
+        if st.session_state.data_source_is_gsheet:
+            gs_col1, gs_col2, gs_col3 = st.columns([2, 1, 2])
+            with gs_col1:
+                if st.session_state.gsheet_last_refreshed_at:
+                    ago = int(time.time() - st.session_state.gsheet_last_refreshed_at)
+                    ago_txt = f"{ago}s ago" if ago < 60 else f"{ago // 60}m ago"
+                    st.caption(f"📊 Connected live to **{st.session_state.gsheet_last_load_label}** — last refreshed {ago_txt}.")
+                else:
+                    st.caption(f"📊 Connected live to **{st.session_state.gsheet_last_load_label}**.")
+            with gs_col2:
+                if st.button("🔄 Refresh now", key="gsheet_manual_refresh_btn", use_container_width=True):
+                    ok, msg = _run_gsheet_refresh()
+                    (st.success if ok else st.error)(msg)
+                    if ok:
+                        st.rerun()
+            with gs_col3:
+                gs_sync_choice = st.selectbox(
+                    "Auto-sync", ["Off", "Every 10s", "Every 30s", "Every 1 min", "Every 5 min"],
+                    index=["Off", "Every 10s", "Every 30s", "Every 1 min", "Every 5 min"].index(
+                        {0: "Off", 10: "Every 10s", 30: "Every 30s", 60: "Every 1 min", 300: "Every 5 min"}
+                        .get(st.session_state.gsheet_auto_sync_seconds, "Off")
+                    ),
+                    key="gsheet_auto_sync_choice", label_visibility="collapsed",
+                    help="Automatically re-pull the sheet's latest rows, without clicking Refresh.",
+                )
+                st.session_state.gsheet_auto_sync_seconds = {
+                    "Off": 0, "Every 10s": 10, "Every 30s": 30, "Every 1 min": 60, "Every 5 min": 300,
+                }[gs_sync_choice]
+            if st.session_state.gsheet_auto_sync_seconds and AUTOREFRESH_AVAILABLE:
+                st_autorefresh(interval=st.session_state.gsheet_auto_sync_seconds * 1000, key="gsheet_connect_page_auto_sync")
+                ok, msg = _run_gsheet_refresh()
+                if not ok:
+                    st.error(msg)
+            elif st.session_state.gsheet_auto_sync_seconds and not AUTOREFRESH_AVAILABLE:
+                st.warning("Auto-sync needs the `streamlit-autorefresh` package — add it to requirements.txt to enable this.")
+
         if can_edit() and st.button("🗑️ Clear loaded data (start over with a new file/database)"):
             st.session_state.df_raw = None
             st.session_state.meta = None
@@ -2222,10 +2305,14 @@ if page == "📥 Connect Data":
             st.session_state.db_last_load_sql = ""
             st.session_state.db_last_load_label = ""
             st.session_state.db_auto_sync_seconds = 0
+            st.session_state.data_source_is_gsheet = False
+            st.session_state.gsheet_last_load_mode = ""
+            st.session_state.gsheet_last_load_label = ""
+            st.session_state.gsheet_auto_sync_seconds = 0
             st.rerun()
 
     if can_edit():
-        src_tab_file, src_tab_db = st.tabs(["📁 Upload File", "🔌 Connect Database"])
+        src_tab_file, src_tab_gsheet, src_tab_db = st.tabs(["📁 Upload File", "🔗 Google Sheet", "🔌 Connect Database"])
 
         # ---------------- FILE UPLOAD ----------------
         with src_tab_file:
@@ -2266,6 +2353,115 @@ if page == "📥 Connect Data":
                     load_sample(SAMPLE_DATASETS[sample_choice])
                     st.rerun()
                 st.caption("3 industries available — proves this works on any data, not just one kind.")
+
+        # ---------------- GOOGLE SHEET CONNECT ----------------
+        with src_tab_gsheet:
+            st.caption("Connect a Google Sheet as a live dataset. Pick **Public Link** if the sheet can be "
+                       "shared openly, or **Private / Service Account** to keep it restricted.")
+            gsheet_mode = st.radio(
+                "How is this sheet shared?",
+                ["Public Link", "Private (Service Account)"],
+                index=["Public Link", "Private (Service Account)"].index(st.session_state.gsheet_mode),
+                horizontal=True, key="gsheet_mode_pick",
+            )
+            st.session_state.gsheet_mode = gsheet_mode
+
+            if gsheet_mode == "Public Link":
+                st.caption("No setup needed — just share the sheet as **Anyone with the link → Viewer** "
+                           "(Share button, top-right of the sheet in Google Sheets) and paste the link below.")
+                gs_url = st.text_input("Google Sheet link (or ID)", value=st.session_state.gsheet_url,
+                                        placeholder="https://docs.google.com/spreadsheets/d/xxxxxxxx/edit#gid=0",
+                                        key="gsheet_url_input")
+                st.session_state.gsheet_url = gs_url
+                gs_gid = st.text_input("Tab (gid) — leave as 0 for the first tab", value=st.session_state.gsheet_gid,
+                                        key="gsheet_gid_input", help=gsc.list_public_tabs_hint())
+                st.session_state.gsheet_gid = gs_gid
+                if st.button("📥 Load this as my dataset", type="primary", key="gsheet_public_load_btn"):
+                    try:
+                        result_df = gsc.load_public_sheet(gs_url, gs_gid or "0")
+                        cleaned = de.clean_dataframe(result_df)
+                        sheet_id = gsc.extract_sheet_id(gs_url)
+                        _apply_loaded_df(cleaned, f"Google Sheet: {sheet_id}")
+                        st.session_state.data_source_is_gsheet = True
+                        st.session_state.data_source_is_db = False
+                        st.session_state.gsheet_last_load_mode = "public"
+                        st.session_state.gsheet_last_load_url = gs_url
+                        st.session_state.gsheet_last_load_gid = gs_gid or "0"
+                        st.session_state.gsheet_last_load_label = f"Google Sheet: {sheet_id}"
+                        st.session_state.gsheet_last_refreshed_at = time.time()
+                        st.success(f"Loaded {len(cleaned):,} rows from the sheet.")
+                        st.rerun()
+                    except gsc.ConnectionError as e:
+                        st.error(str(e))
+
+            else:  # Private (Service Account)
+                st.caption("For sheets that must stay restricted. Needs a Google Cloud **service account** JSON "
+                           "key: create one in Google Cloud Console → APIs & Services → Credentials, enable the "
+                           "Google Sheets API, then share your sheet with the service account's `client_email` "
+                           "(found inside the JSON) as a Viewer. The key is used only for this browser session — "
+                           "never saved to disk.")
+                if not gsc.GSPREAD_AVAILABLE:
+                    st.warning("`gspread` and `google-auth` aren't installed in this environment yet. Add them to "
+                               "requirements.txt and reinstall to use this option.")
+
+                with st.expander("🔑 Service account", expanded=not st.session_state.gsheet_connected):
+                    sa_upload = st.file_uploader("Upload service-account JSON key", type=["json"], key="gsheet_sa_upload")
+                    sa_pasted = st.text_area("...or paste the JSON key", value=st.session_state.gsheet_sa_json,
+                                              height=100, key="gsheet_sa_text")
+                    sa_raw = sa_upload.read().decode("utf-8") if sa_upload else sa_pasted
+                    if sa_upload:
+                        st.session_state.gsheet_sa_json = sa_raw
+
+                    sa_sheet_id = st.text_input("Google Sheet link (or ID)", value=st.session_state.gsheet_sheet_id,
+                                                 placeholder="https://docs.google.com/spreadsheets/d/xxxxxxxx/edit",
+                                                 key="gsheet_sa_sheet_input")
+
+                    scc1, scc2 = st.columns([1, 3])
+                    with scc1:
+                        if st.button("🔗 Test & Connect", type="primary", use_container_width=True, key="gsheet_sa_connect_btn"):
+                            try:
+                                info = gsc.parse_service_account_json(sa_raw)
+                                client = gsc.get_client(info)
+                                gsc.test_connection(client, sa_sheet_id)
+                                st.session_state.gsheet_sa_info = info
+                                st.session_state.gsheet_sa_json = sa_raw
+                                st.session_state.gsheet_sheet_id = sa_sheet_id
+                                st.session_state.gsheet_connected = True
+                                st.success(f"Connected — sharing OK for {info.get('client_email', 'this service account')}.")
+                            except gsc.ConnectionError as e:
+                                st.session_state.gsheet_connected = False
+                                st.error(f"Could not connect: {e}")
+                    with scc2:
+                        if st.session_state.gsheet_connected and st.button("🔌 Disconnect", key="gsheet_sa_disconnect_btn"):
+                            st.session_state.gsheet_connected = False
+                            st.session_state.gsheet_sa_info = None
+                            st.session_state.gsheet_sa_json = ""
+                            st.rerun()
+
+                if st.session_state.gsheet_connected and st.session_state.gsheet_sa_info:
+                    st.success(f"🟢 Connected — {st.session_state.gsheet_sa_info.get('client_email', 'service account')}")
+                    client = gsc.get_client(st.session_state.gsheet_sa_info)
+                    tabs_found = gsc.list_worksheets(client, st.session_state.gsheet_sheet_id)
+                    if tabs_found:
+                        pick_ws = st.selectbox("Tab to load", tabs_found, key="gsheet_ws_pick")
+                        if st.button("📥 Load this as my dataset", type="primary", key="gsheet_private_load_btn"):
+                            try:
+                                result_df = gsc.load_private_worksheet(client, st.session_state.gsheet_sheet_id, pick_ws)
+                                cleaned = de.clean_dataframe(result_df)
+                                label = f"Google Sheet: {pick_ws}"
+                                _apply_loaded_df(cleaned, label)
+                                st.session_state.data_source_is_gsheet = True
+                                st.session_state.data_source_is_db = False
+                                st.session_state.gsheet_last_load_mode = "private"
+                                st.session_state.gsheet_last_load_worksheet = pick_ws
+                                st.session_state.gsheet_last_load_label = label
+                                st.session_state.gsheet_last_refreshed_at = time.time()
+                                st.success(f"Loaded {len(cleaned):,} rows from **{pick_ws}**.")
+                                st.rerun()
+                            except gsc.QueryError as e:
+                                st.error(f"Load failed: {e}")
+                    else:
+                        st.info("No tabs found in this sheet.")
 
         # ---------------- DATABASE CONNECT ----------------
         with src_tab_db:
@@ -2340,6 +2536,7 @@ if page == "📥 Connect Data":
                             cleaned = de.clean_dataframe(result_df)
                             _apply_loaded_df(cleaned, f"{st.session_state.db_conn_type}: {pick_table}")
                             st.session_state.data_source_is_db = True
+                            st.session_state.data_source_is_gsheet = False
                             st.session_state.db_last_load_sql = custom_sql
                             st.session_state.db_last_load_label = f"{st.session_state.db_conn_type}: {pick_table}"
                             st.session_state.db_last_refreshed_at = time.time()
