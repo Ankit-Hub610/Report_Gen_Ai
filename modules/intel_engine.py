@@ -318,7 +318,36 @@ def detect_anomalies(df: pd.DataFrame, roles: dict, z_thresh=2.0) -> list:
 # --------------------------------------------------------------------------------
 # TOP / BOTTOM BREAKDOWNS + CONCENTRATION
 # --------------------------------------------------------------------------------
-def top_bottom_by_dimension(df: pd.DataFrame, dim_col, measure_col, n=5) -> dict:
+def _period_split_trend(df: pd.DataFrame, dim_col, measure_col, date_col, item_value) -> dict:
+    """Real trend (not invented) for ONE specific dimension value (e.g. one
+    actual product/customer/location/channel name) — compares its total in
+    the first half vs second half of the date range covered by the data.
+    Returns None when there isn't enough date history for this item to say
+    anything meaningful, so callers must always guard for that."""
+    if not date_col or date_col not in df.columns:
+        return None
+    tmp = df[[dim_col, measure_col, date_col]].copy()
+    tmp[measure_col] = _num(tmp[measure_col])
+    tmp[date_col] = pd.to_datetime(tmp[date_col], errors="coerce")
+    tmp = tmp.dropna(subset=[dim_col, measure_col, date_col])
+    tmp = tmp[tmp[dim_col].astype(str) == str(item_value)]
+    if tmp.empty or tmp[date_col].nunique() < 2:
+        return None
+    lo, hi = tmp[date_col].min(), tmp[date_col].max()
+    mid = lo + (hi - lo) / 2
+    first_half = float(tmp.loc[tmp[date_col] <= mid, measure_col].sum())
+    second_half = float(tmp.loc[tmp[date_col] > mid, measure_col].sum())
+    if first_half <= 0:
+        return None  # can't express a % change meaningfully from a zero base
+    pct = _safe_round(_pct(second_half - first_half, first_half))
+    if pct is None:
+        return None
+    direction = "Growing" if pct > 5 else ("Declining" if pct < -5 else "Flat")
+    return {"direction": direction, "change_pct": pct,
+            "first_half_value": round(first_half, 2), "second_half_value": round(second_half, 2)}
+
+
+def top_bottom_by_dimension(df: pd.DataFrame, dim_col, measure_col, n=5, date_col=None) -> dict:
     if not dim_col or not measure_col or dim_col not in df.columns or measure_col not in df.columns:
         return {"available": False}
     tmp = df[[dim_col, measure_col]].copy()
@@ -331,12 +360,20 @@ def top_bottom_by_dimension(df: pd.DataFrame, dim_col, measure_col, n=5) -> dict
     top_n = grouped.head(n)
     bottom_n = grouped.tail(n).sort_values()
     top5_share = _pct(grouped.head(5).sum(), total)
+
+    def _entry(k, v):
+        e = {"name": str(k), "value": round(float(v), 2), "share_pct": _safe_round(_pct(v, total))}
+        trend = _period_split_trend(df, dim_col, measure_col, date_col, k)
+        if trend:
+            e["trend"] = trend
+        return e
+
     return {
         "available": True,
         "dimension": dim_col,
         "measure": measure_col,
-        "top": [{"name": str(k), "value": round(float(v), 2), "share_pct": _safe_round(_pct(v, total))} for k, v in top_n.items()],
-        "bottom": [{"name": str(k), "value": round(float(v), 2), "share_pct": _safe_round(_pct(v, total))} for k, v in bottom_n.items()],
+        "top": [_entry(k, v) for k, v in top_n.items()],
+        "bottom": [_entry(k, v) for k, v in bottom_n.items()],
         "unique_count": int(grouped.shape[0]),
         "top5_share_pct": _safe_round(top5_share),
     }
@@ -441,9 +478,10 @@ def build_facts_bundle(df: pd.DataFrame, meta: dict, roles: dict) -> dict:
     health = compute_health(financials, trend, quality)
 
     rev_col = roles.get("revenue")
+    date_col = roles.get("date")
     breakdowns = {}
     for key in ("product", "customer", "location", "channel"):
-        breakdowns[key] = top_bottom_by_dimension(df, roles.get(key), rev_col)
+        breakdowns[key] = top_bottom_by_dimension(df, roles.get(key), rev_col, date_col=date_col)
 
     return {
         "row_count": len(df),
@@ -566,6 +604,22 @@ def generate_insights_and_recommendations(facts: dict) -> dict:
                            f"this is thin and leaves little room for error.")
     past_summary = " ".join(past_bits)
 
+    label_map = {"product": "product/category", "customer": "customer", "location": "location", "channel": "channel"}
+
+    # Real, named movers pulled from the breakdowns — used below so the forecast
+    # action names an ACTUAL top-performing product/channel (with its own
+    # measured trend) instead of a vague "see below" pointer.
+    growing_movers = []   # [(label, name, share_pct, change_pct)] sorted by share desc
+    for key, label in label_map.items():
+        b = bkd.get(key, {})
+        if not b.get("available") or not b.get("top"):
+            continue
+        best = b["top"][0]
+        trend = best.get("trend")
+        if trend and trend["direction"] == "Growing":
+            growing_movers.append((label, best["name"], best["share_pct"], trend["change_pct"]))
+    growing_movers.sort(key=lambda x: -(x[2] or 0))
+
     # ---- FUTURE ----
     future_bits = []
     if fc.get("available"):
@@ -580,11 +634,24 @@ def generate_insights_and_recommendations(facts: dict) -> dict:
         future_bits.append(f"Forecast confidence: **{fc['confidence']}** (this is an estimate, not a guarantee).")
         insights.append(f"Forecast direction for the next {len(fc['forecast_periods'])} month(s): {fdir}.")
         if fdir == "Downward":
-            actions.append("The forecast points **downward** — plan a retention/promo push now rather than "
-                           "after the drop shows up in the numbers.")
+            if growing_movers:
+                gl, gname, gshare, gchg = growing_movers[0]
+                actions.append(f"Overall revenue is forecast **downward**, but **{gname}** ({gl}) is still "
+                               f"growing (**{gchg:+.1f}%** first-half vs second-half of your data, {gshare}% "
+                               f"of value) — lean on it for a retention/promo push now, before the overall drop "
+                               f"shows up in the numbers.")
+            else:
+                actions.append("The forecast points **downward** — plan a retention/promo push now rather than "
+                               "after the drop shows up in the numbers.")
         elif fdir == "Upward":
-            actions.append("The forecast points **upward** — this is a good moment to invest in the "
-                           "channels/products already driving that growth (see below).")
+            if growing_movers:
+                gl, gname, gshare, gchg = growing_movers[0]
+                actions.append(f"The forecast points **upward**, largely consistent with **{gname}** ({gl}) — "
+                               f"already {gshare}% of value and growing **{gchg:+.1f}%** — this is a good moment "
+                               f"to put more marketing/inventory/staffing behind it while it's working.")
+            else:
+                actions.append("The forecast points **upward** — this is a good moment to invest in whichever "
+                               "product/channel is already driving that growth (see breakdowns below).")
     else:
         future_bits.append("Not enough monthly history to forecast the future yet "
                             "(need at least 4 months of date + revenue data).")
@@ -596,8 +663,9 @@ def generate_insights_and_recommendations(facts: dict) -> dict:
         actions.append("Data quality has gaps (missing values / duplicates / bad dates) — cleaning this up "
                        "will make every number above more reliable.")
 
-    # ---- CONCENTRATION / WHERE TO FOCUS & INVEST ----
-    label_map = {"product": "product/category", "customer": "customer", "location": "location", "channel": "channel"}
+    # ---- CONCENTRATION / WHERE TO FOCUS & INVEST — every action below names the
+    # actual value (from the loaded data) and, where date history allows, that
+    # specific item's own trend — not a generic pointer. ----
     for key, label in label_map.items():
         b = bkd.get(key, {})
         if not b.get("available"):
@@ -606,20 +674,61 @@ def generate_insights_and_recommendations(facts: dict) -> dict:
         if not top:
             continue
         best = top[0]
-        insights.append(f"Top {label}: **{best['name']}** — {best['share_pct']}% of measured value on its own.")
+        best_trend = best.get("trend")
+        trend_bit = f" — trending **{best_trend['direction'].lower()}** ({best_trend['change_pct']:+.1f}%)" if best_trend else ""
+        insights.append(f"Top {label}: **{best['name']}** — {best['share_pct']}% of measured value on its own{trend_bit}.")
+
         if b.get("top5_share_pct", 0) >= 60:
-            actions.append(f"The top 5 {label}s account for **{b['top5_share_pct']}%** of value — this is "
-                           f"concentrated. Focus retention effort here, but also invest in growing the next "
-                           f"tier down so the business isn't overly dependent on just a few {label}s.")
+            if best_trend and best_trend["direction"] == "Declining":
+                actions.append(f"The top 5 {label}s account for **{b['top5_share_pct']}%** of value, and your "
+                               f"single biggest one, **{best['name']}** ({best['share_pct']}%), is "
+                               f"**declining {best_trend['change_pct']:.1f}%** — this concentration makes that "
+                               f"decline a real risk to total revenue; prioritise fixing **{best['name']}** "
+                               f"before growing anything else.")
+            else:
+                actions.append(f"The top 5 {label}s account for **{b['top5_share_pct']}%** of value, led by "
+                               f"**{best['name']}** ({best['share_pct']}%){trend_bit} — focus retention effort "
+                               f"here, but also invest in growing the next tier down so the business isn't "
+                               f"overly dependent on just a few {label}s.")
         else:
-            actions.append(f"Value is fairly spread across {label}s (top 5 = {b['top5_share_pct']}%) — "
-                           f"invest more in **{best['name']}**, your single best performer, to grow it further.")
+            if best_trend and best_trend["direction"] == "Growing":
+                actions.append(f"Value is fairly spread across {label}s (top 5 = {b['top5_share_pct']}%) — "
+                               f"**{best['name']}**, your single best performer at {best['share_pct']}%, is also "
+                               f"**growing {best_trend['change_pct']:+.1f}%** — put more budget behind it while "
+                               f"it's working.")
+            else:
+                actions.append(f"Value is fairly spread across {label}s (top 5 = {b['top5_share_pct']}%) — "
+                               f"invest more in **{best['name']}**, your single best performer{trend_bit}, to "
+                               f"grow it further.")
         if b.get("bottom"):
             worst = b["bottom"][0]
+            worst_trend = worst.get("trend")
             if worst["share_pct"] < 1:
-                actions.append(f"**{worst['name']}** ({label}) is contributing almost nothing "
-                               f"({worst['share_pct']}%) — worth deciding whether to invest in fixing it "
-                               f"or drop focus on it.")
+                if worst_trend and worst_trend["direction"] == "Declining":
+                    actions.append(f"**{worst['name']}** ({label}) is contributing almost nothing "
+                                   f"({worst['share_pct']}%) and still **declining "
+                                   f"{worst_trend['change_pct']:.1f}%** — a reasonable case to drop focus on it "
+                                   f"and redirect that effort to {best['name']}.")
+                elif worst_trend and worst_trend["direction"] == "Growing":
+                    actions.append(f"**{worst['name']}** ({label}) is only {worst['share_pct']}% of value today "
+                                   f"but is **growing {worst_trend['change_pct']:+.1f}%** — worth giving it more "
+                                   f"time/investment before writing it off.")
+                else:
+                    actions.append(f"**{worst['name']}** ({label}) is contributing almost nothing "
+                                   f"({worst['share_pct']}%) — worth deciding whether to invest in fixing it "
+                                   f"or drop focus on it.")
+
+    # ---- CORRELATIONS → data-driven, not generic ----
+    corrs = facts.get("correlations") or []
+    if corrs:
+        c0 = corrs[0]
+        insights.append(f"**{c0['a']}** and **{c0['b']}** move together ({c0['strength'].lower()} "
+                        f"{c0['direction'].lower()} correlation, r={c0['corr']}).")
+        if c0["strength"] in ("Strong", "Moderate"):
+            verb = "rise together" if c0["direction"] == "Positive" else "move in opposite directions"
+            actions.append(f"**{c0['a']}** and **{c0['b']}** {verb} ({c0['strength'].lower()} correlation, "
+                           f"r={c0['corr']}) — you can use **{c0['a']}** as an early signal for **{c0['b']}**, "
+                           f"or investigate whether one is actually driving the other.")
 
     if facts["anomalies"]:
         insights.append(f"{len(facts['anomalies'])} unusual month(s) detected in revenue "
