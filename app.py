@@ -27,6 +27,7 @@ import copy
 import hashlib
 import time
 import datetime
+import uuid
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -756,9 +757,18 @@ def login_screen():
                     st.session_state.authenticated = True
                     st.session_state.username = u.strip()
                     st.session_state.role = role
-                    st.session_state.workspace_id = auth.get_workspace_id(u.strip())
+                    # Shared demo account: every separate login gets its own fresh,
+                    # isolated temporary workspace — so multiple people using the
+                    # SAME demo username/password never see each other's uploaded
+                    # data (unlike a normal account, whose workspace_id is fixed).
+                    if auth.is_shared_demo(u.strip()):
+                        _demo_ws = f"demo_{uuid.uuid4().hex[:10]}"
+                        st.session_state.workspace_id = _demo_ws
+                    else:
+                        _demo_ws = None
+                        st.session_state.workspace_id = auth.get_workspace_id(u.strip())
                     st.session_state.plan = auth.get_effective_plan(u.strip())
-                    _token = auth.create_session(u.strip())
+                    _token = auth.create_session(u.strip(), workspace_id=_demo_ws)
                     st.session_state._session_token = _token
                     _set_session_cookie(_token)  # survives a browser refresh, but not copy-paste into another browser
                     st.rerun()
@@ -1138,18 +1148,23 @@ if not st.session_state.authenticated:
         st.info("Restoring your session…")
         st.stop()
     _session_token = _all_cookies.get(SESSION_COOKIE_NAME)
-    _resolved_user = auth.resolve_session(_session_token) if _session_token else None
+    _resolved_user, _resolved_ws = auth.resolve_session(_session_token) if _session_token else (None, None)
     if _resolved_user and auth.user_exists(_resolved_user):
         st.session_state.authenticated = True
         st.session_state.username = _resolved_user
         st.session_state.role = auth.get_role(_resolved_user)
-        st.session_state.workspace_id = auth.get_workspace_id(_resolved_user)
+        # _resolved_ws is only set for a shared-demo login's temp workspace
+        # (embedded in the token itself) — preserve that SAME temp workspace
+        # across this refresh instead of resolving back to the shared
+        # account-level workspace_id, or the demo's isolation would break on
+        # every reload.
+        st.session_state.workspace_id = _resolved_ws or auth.get_workspace_id(_resolved_user)
         st.session_state.plan = auth.get_effective_plan(_resolved_user)
         # Sliding expiry: issue a fresh token (full SESSION_LIFETIME_SECONDS
         # from now) on every active visit, instead of counting down from the
         # original login. Someone who opens the app every day never hits the
         # 7-day expiry; someone who genuinely walks away for a week does.
-        _session_token = auth.create_session(_resolved_user)
+        _session_token = auth.create_session(_resolved_user, workspace_id=_resolved_ws)
         _set_session_cookie(_session_token)
         st.session_state._session_token = _session_token
 
@@ -4493,6 +4508,15 @@ elif page == "🔐 Admin Panel":
                     [f"Share data with client: {c}" for c in client_options],
                 )
 
+            demo_choice = st.checkbox(
+                "🎪 Shared demo account (hand this SAME username/password out to multiple people)",
+                help="Every separate login gets its own fresh, isolated, temporary workspace — so no "
+                     "two people logging in with these same demo credentials ever see each other's "
+                     "uploaded data or overwrite it. Use this for a public/demo login; leave unchecked "
+                     "for a real client/viewer account. If you're only resetting the password on an "
+                     "EXISTING demo account, re-check this box too, or it turns back off.",
+            )
+
             submitted = st.form_submit_button("Create / update account", type="primary")
             if submitted:
                 if not nu.strip() or not np1:
@@ -4508,7 +4532,7 @@ elif page == "🔐 Admin Panel":
                     if role in (auth.ROLE_VIEWER, auth.ROLE_REPORT_VIEWER) and link_choice and link_choice.startswith("Share data with client: "):
                         workspace_id = link_choice.replace("Share data with client: ", "")
                     auth.create_or_update_user(nu.strip(), np1, role, workspace_id=workspace_id,
-                                               email=nu_email.strip(), plan=plan)
+                                               email=nu_email.strip(), plan=plan, is_shared_demo=demo_choice)
                     st.success(f"Account '{nu.strip()}' saved as {role_choice} ({plan_choice})"
                                + (f", sharing data with '{workspace_id}'." if workspace_id else ", with its own data workspace."))
                     st.rerun()
@@ -4630,6 +4654,31 @@ elif page == "🔐 Admin Panel":
                     st.session_state.active_slide_id = "default"
                     st.session_state._active_slide_for_ws = target_ws
                 st.success(f"Workspace '{target_ws}' cleared — back to a single empty slide.")
+                st.rerun()
+
+        st.divider()
+        st.subheader("🎪 Clear demo workspaces")
+        st.caption(
+            "Every login to a **shared demo account** (see 👥 Manage Accounts → 'Shared demo account') "
+            "creates its own one-off temporary workspace, named like `demo_a1b2c3d4e5`, so different "
+            "people using the same demo credentials never see each other's data. Those temp workspaces "
+            "are never reused and never auto-delete — clear them here once in a while so old demo "
+            "uploads don't sit on disk forever. This never touches any real client's workspace."
+        )
+        _demo_ws_ids = [w for w in ws.list_all_workspace_dirs() if w.startswith("demo_")]
+        if not _demo_ws_ids:
+            st.info("No demo workspaces on disk right now.")
+        else:
+            st.info(f"**{len(_demo_ws_ids)}** demo workspace(s) found: {', '.join(_demo_ws_ids[:10])}"
+                    + (f" … and {len(_demo_ws_ids) - 10} more" if len(_demo_ws_ids) > 10 else ""))
+            confirm_demo_clear = st.checkbox(
+                "Yes, delete all of the above — anyone currently in a demo session loses their demo data.",
+                key="confirm_demo_ws_clear",
+            )
+            if st.button("🗑️ Clear all demo workspaces now", disabled=not confirm_demo_clear):
+                for _dw in _demo_ws_ids:
+                    ws.delete_workspace_entirely(_dw)
+                st.success(f"Cleared {len(_demo_ws_ids)} demo workspace(s).")
                 st.rerun()
 
     with tab_payments:
