@@ -475,11 +475,26 @@ def build_full_analysis_xlsx(facts, ir, health, roles, cleaning_log, derived_log
             if not b.get("available"):
                 continue
             wsb = new_sheet(f"{label} Breakdown")
-            top_cols = list(b["top"][0].keys()) if b["top"] else []
-            r = write_table(wsb, 1, top_cols, [[r_.get(c, "") for c in top_cols] for r_ in b["top"]],
+
+            # Flatten each entry's nested "trend" dict (direction/change_pct/etc.)
+            # into plain scalar columns — Excel cells can't hold a dict value.
+            def _flatten_rows(entries):
+                flat = []
+                for r_ in entries:
+                    row = {k: v for k, v in r_.items() if k != "trend"}
+                    tr = r_.get("trend")
+                    row["Trend"] = tr["direction"] if tr else ""
+                    row["Trend Change %"] = tr["change_pct"] if tr else ""
+                    flat.append(row)
+                return flat
+
+            top_flat = _flatten_rows(b["top"])
+            bottom_flat = _flatten_rows(b.get("bottom") or [])
+            top_cols = list(top_flat[0].keys()) if top_flat else []
+            r = write_table(wsb, 1, top_cols, [[r_.get(c, "") for c in top_cols] for r_ in top_flat],
                              title=f"Top {label} (measured on {b['measure']})")
-            if b.get("bottom"):
-                write_table(wsb, r, top_cols, [[r_.get(c, "") for c in top_cols] for r_ in b["bottom"]],
+            if bottom_flat:
+                write_table(wsb, r, top_cols, [[r_.get(c, "") for c in top_cols] for r_ in bottom_flat],
                             title=f"Bottom {label}")
 
     if which in ("page2", "both"):
