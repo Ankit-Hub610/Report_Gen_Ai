@@ -55,9 +55,12 @@ import os
 import secrets
 import time
 
+from . import supabase_store
+
 TRIAL_DAYS = 14   # how long a brand-new "free" account gets before it's blocked pending upgrade
 
 CRED_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "credentials.json")
+CRED_BLOB_KEY = "credentials.json"   # Supabase app_kv key - see supabase_store.py
 SESSION_LIFETIME_SECONDS = 7 * 24 * 60 * 60   # 7 days of inactivity before a "stay logged in" link expires
 
 ROLE_ADMIN = "admin"
@@ -134,6 +137,26 @@ def _migrate_if_old_format(raw: dict) -> dict:
 
 
 def _load_store() -> dict:
+    """Reads accounts. Tries Supabase FIRST (if configured) since that's the
+    copy that actually survives a container rebuild on an ephemeral-disk
+    host (Streamlit Community Cloud) - local disk is kept as a fast mirror
+    for the rest of this run either way. Falls back to local disk (and then
+    to a brand-new default store) if Supabase isn't configured/reachable, so
+    an install with no Supabase secrets set behaves exactly as before."""
+    blob = supabase_store.get_blob(CRED_BLOB_KEY)
+    if blob:
+        try:
+            raw = json.loads(blob.decode("utf-8"))
+            store = _migrate_if_old_format(raw)
+            try:
+                with open(CRED_FILE, "w") as f:
+                    json.dump(store, f, indent=2)
+            except Exception:
+                pass
+            return store
+        except Exception:
+            pass  # fall through to local disk below
+
     if not os.path.exists(CRED_FILE):
         store = _default_store()
         _save_store(store)
@@ -154,6 +177,10 @@ def _load_store() -> dict:
 def _save_store(store: dict):
     with open(CRED_FILE, "w") as f:
         json.dump(store, f, indent=2)
+    try:
+        supabase_store.put_blob(CRED_BLOB_KEY, json.dumps(store, indent=2).encode("utf-8"))
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------------
@@ -184,12 +211,32 @@ def get_plan(username: str) -> str:
     return (user or {}).get("plan", "standard")
 
 
+def compute_trial_status(trial_start) -> dict:
+    """Pure function: given a trial_start timestamp, returns
+    {'days_left': int, 'expired': bool}. Shared by get_trial_status()
+    (account-level trial) and get_demo_identity_trial_status() (per-person
+    trial for a shared demo login - see get_or_create_demo_identity)."""
+    if trial_start is None:
+        return {"days_left": TRIAL_DAYS, "expired": False}
+    elapsed_days = (time.time() - trial_start) / 86400.0
+    days_left = max(0, math.ceil(TRIAL_DAYS - elapsed_days))
+    return {"days_left": days_left, "expired": elapsed_days >= TRIAL_DAYS}
+
+
 def get_trial_status(username: str) -> dict:
     """For a 'free' plan account: {'days_left': int, 'expired': bool}.
     trial_start is set the moment an account first becomes 'free' (at
     creation, via set_plan, or via reset_trial). If it's somehow missing
     (e.g. a very old record), it's initialized to right now so nobody is
-    retroactively expired by this change."""
+    retroactively expired by this change.
+
+    NOTE: for a SHARED demo account (is_shared_demo == True), this should
+    NOT govern any individual visitor's trial countdown - every person
+    sharing those credentials needs their OWN 15-day clock, tied to who
+    THEY are (their email/phone), not to when the shared account itself was
+    created. See get_or_create_demo_identity() / compute_trial_status() for
+    that per-person version; app.py's login screen uses those instead of
+    this function for a shared-demo login."""
     store = _load_store()
     user = store["users"].get((username or "").strip())
     if not user:
@@ -199,9 +246,7 @@ def get_trial_status(username: str) -> dict:
         start = time.time()
         user["trial_start"] = start
         _save_store(store)
-    elapsed_days = (time.time() - start) / 86400.0
-    days_left = max(0, math.ceil(TRIAL_DAYS - elapsed_days))
-    return {"days_left": days_left, "expired": elapsed_days >= TRIAL_DAYS}
+    return compute_trial_status(start)
 
 
 def get_subscription_status(username: str) -> dict:
@@ -527,58 +572,72 @@ def _get_session_secret() -> bytes:
     return bytes.fromhex(secret_hex)
 
 
-def create_session(username: str, workspace_id: str = None) -> str:
+def create_session(username: str, workspace_id: str = None, trial_start: float = None) -> str:
     """Called right after a successful login (and again to silently extend
     an already-valid one — see app.py's cookie-restore block). Returns a
     signed, stateless token to store in the browser cookie.
 
     workspace_id: only passed for a SHARED DEMO account — embeds that
-    login's own freshly-generated temporary workspace_id directly in the
-    token, so it's self-verifying just like everything else here and
-    survives a browser refresh (same token → same temp workspace) without
-    needing any server-side record. Omit for a normal account; the caller
-    resolves workspace_id from auth.get_workspace_id(username) instead."""
+    login's own per-person workspace_id (see get_or_create_demo_identity)
+    directly in the token, so it's self-verifying just like everything else
+    here and survives a browser refresh without needing any server-side
+    record. Omit for a normal account; the caller resolves workspace_id
+    from auth.get_workspace_id(username) instead.
+
+    trial_start: only passed alongside workspace_id for a shared demo
+    login — that person's own trial_start (from the same identity record),
+    so their remaining-days count also survives a refresh without a
+    server-side lookup. Omit for a normal account (its trial_start already
+    lives in credentials.json, keyed by username)."""
     secret = _get_session_secret()
     expires = int(time.time()) + SESSION_LIFETIME_SECONDS
-    payload = f"{username}|{expires}|{workspace_id or ''}"
+    payload = f"{username}|{expires}|{workspace_id or ''}|{trial_start or ''}"
     payload_b64 = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("utf-8").rstrip("=")
     sig = hmac.new(secret, payload_b64.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"{payload_b64}.{sig}"
 
 
 def resolve_session(token: str):
-    """Given a token from the cookie, returns (username, workspace_id) —
-    workspace_id is None unless this particular session embedded a specific
-    temporary one (shared demo accounts only — see create_session). Returns
-    (None, None) if the token is missing/malformed/tampered-with/expired.
-    Verifies entirely from the token itself (signature + embedded expiry),
-    so this keeps working right after a container rebuild."""
+    """Given a token from the cookie, returns (username, workspace_id,
+    trial_start) — workspace_id/trial_start are None unless this particular
+    session embedded them (shared demo accounts only — see create_session).
+    Returns (None, None, None) if the token is missing/malformed/tampered-
+    with/expired. Verifies entirely from the token itself (signature +
+    embedded expiry), so this keeps working right after a container
+    rebuild."""
     if not token or "." not in token:
-        return None, None
+        return None, None, None
     payload_b64, _, sig = token.rpartition(".")
     secret = _get_session_secret()
     expected_sig = hmac.new(secret, payload_b64.encode("utf-8"), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(sig, expected_sig):
-        return None, None   # bad signature - either tampered with, or signed under an old/different secret
+        return None, None, None   # bad signature - tampered with, or signed under an old/different secret
     try:
         padded = payload_b64 + "=" * (-len(payload_b64) % 4)
         payload = base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8")
         parts = payload.split("|")
-        if len(parts) == 3:
+        if len(parts) == 4:
+            username, expires_str, ws_part, trial_part = parts
+        elif len(parts) == 3:
+            # Backward compat: a token issued before trial_start was added
+            # to the payload.
             username, expires_str, ws_part = parts
+            trial_part = ""
         elif len(parts) == 2:
             # Backward compat: a token issued before workspace_id was added
             # to the payload (old format was "username|expires").
             username, expires_str = parts
             ws_part = ""
+            trial_part = ""
         else:
-            return None, None
+            return None, None, None
         expires = int(expires_str)
     except Exception:
-        return None, None
+        return None, None, None
     if time.time() > expires:
-        return None, None
-    return username, (ws_part or None)
+        return None, None, None
+    trial_start = float(trial_part) if trial_part else None
+    return username, (ws_part or None), trial_start
 
 
 def destroy_session(token: str):
@@ -644,3 +703,102 @@ def consume_password_reset_token(token: str):
     if token in resets:
         del resets[token]
         _save_resets(resets)
+
+
+# ==================================================================================
+# SHARED-DEMO PER-PERSON IDENTITY
+# ----------------------------------------------------------------------------------
+# A shared demo login (e.g. username "demo" / password "demo123", handed out
+# to every prospective client) used to give EVERY separate login a brand-new
+# random temporary workspace - so re-opening the app the next day looked like
+# all your data got wiped, even though nothing was actually deleted (the old
+# workspace was just orphaned, with nothing left pointing at it).
+#
+# Fix: at login, a demo visitor also gives an email or phone number. That
+# identifier is looked up here - first time, it gets a fresh workspace_id and
+# its OWN trial_start (a real independent TRIAL_DAYS-day clock, not shared
+# with anyone else using the same demo credentials); every later login with
+# the SAME identifier gets back the SAME workspace_id and the SAME
+# trial_start, so their data and their remaining trial days are exactly
+# where they left them - on any browser/device, since this is keyed by
+# identifier rather than a browser cookie.
+#
+# Persisted the same way as credentials.json - local disk as a fast mirror,
+# Supabase (if configured) as the copy that survives a container rebuild.
+# ==================================================================================
+DEMO_IDENTITIES_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                     "demo_identities.json")
+DEMO_IDENTITIES_BLOB_KEY = "demo_identities.json"
+
+
+def _load_demo_identities() -> dict:
+    blob = supabase_store.get_blob(DEMO_IDENTITIES_BLOB_KEY)
+    if blob:
+        try:
+            data = json.loads(blob.decode("utf-8"))
+            try:
+                with open(DEMO_IDENTITIES_FILE, "w") as f:
+                    json.dump(data, f, indent=2)
+            except Exception:
+                pass
+            return data
+        except Exception:
+            pass
+    if not os.path.exists(DEMO_IDENTITIES_FILE):
+        return {}
+    try:
+        with open(DEMO_IDENTITIES_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_demo_identities(data: dict):
+    try:
+        with open(DEMO_IDENTITIES_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+    try:
+        supabase_store.put_blob(DEMO_IDENTITIES_BLOB_KEY, json.dumps(data, indent=2).encode("utf-8"))
+    except Exception:
+        pass
+
+
+def _normalize_identifier(identifier: str) -> str:
+    return (identifier or "").strip().lower()
+
+
+def get_or_create_demo_identity(base_username: str, identifier: str) -> dict:
+    """base_username: the shared demo account's own username (e.g. "demo").
+    identifier: whatever the visitor typed - email or phone number - used
+    purely to recognize the SAME person coming back, never as a real login
+    credential (the password stays the shared demo123 for everyone).
+
+    Returns {"workspace_id": str, "trial_start": float}. First call for a
+    given (base_username, identifier) pair creates a new isolated workspace
+    and starts that person's own TRIAL_DAYS-day clock; every later call with
+    the same pair returns exactly the same values, so their data and trial
+    countdown are stable across logins, browsers, and devices.
+
+    NOTE: this is identity by "what they typed", not a verified email/phone
+    (no OTP/confirmation link) - it stops the day-to-day "my data disappeared"
+    problem, but a visitor who deliberately types a different email each time
+    can still get a fresh trial. Fine for a low-stakes demo funnel; if trial
+    abuse ever becomes a real problem, add email/OTP verification on top of
+    this same identity record without changing its shape."""
+    key = f"{(base_username or '').strip()}:{_normalize_identifier(identifier)}"
+    data = _load_demo_identities()
+    record = data.get(key)
+    if record and record.get("workspace_id"):
+        return record
+    import uuid
+    record = {
+        "workspace_id": f"demo_{uuid.uuid4().hex[:12]}",
+        "trial_start": time.time(),
+        "identifier": _normalize_identifier(identifier),
+        "base_username": (base_username or "").strip(),
+    }
+    data[key] = record
+    _save_demo_identities(data)
+    return record
