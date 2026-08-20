@@ -418,6 +418,27 @@ def can_edit_dashboard() -> bool:
     return st.session_state.role in (auth.ROLE_ADMIN, auth.ROLE_CLIENT, auth.ROLE_REPORT_VIEWER)
 
 
+def _coerce_light_defaults(ss):
+    """Safety net after loading saved workspace state: a handful of
+    PERSISTED_KEYS are always expected to be a dict/list (never None) by
+    the code that reads them (e.g. _render_chart_with_zoom does
+    st.session_state.dashboard_zoom.get(...) directly, with no None-check).
+    If a None ever slips into one of these — an old saved file from before
+    that key existed, a corrupted/interrupted write, anything — this
+    coerces it back to the correct empty type instead of leaving an
+    AttributeError/TypeError landmine for the next click. Best-effort,
+    never raises."""
+    _dict_keys = ("filters", "dashboard_zoom", "intel_role_overrides")
+    _list_keys = ("dashboard_charts", "pinned_kpis", "custom_kpis", "custom_charts",
+                  "dashboard_slicers", "intel_action_checks")
+    for k in _dict_keys:
+        if ss.get(k) is None:
+            ss[k] = {}
+    for k in _list_keys:
+        if ss.get(k) is None:
+            ss[k] = []
+
+
 def _render_chart_with_zoom(fig, zoom_key: str, widget_key: str, editable: bool = True):
     """Renders a Boss Dashboard chart with a compact '🔍 Zoom' range slider above
     it. The chosen zoom window (0-100%) is stored in st.session_state.dashboard_zoom
@@ -425,6 +446,8 @@ def _render_chart_with_zoom(fig, zoom_key: str, widget_key: str, editable: bool 
     and the caller then reuses that same fig for the PDF export, so whatever zoom
     is showing on screen is exactly what appears in the exported PDF too. Returns
     the (possibly zoom-applied) fig so the caller can hand it to chart_png_items."""
+    if st.session_state.dashboard_zoom is None:   # belt-and-suspenders — see _coerce_light_defaults
+        st.session_state.dashboard_zoom = {}
     zoom = st.session_state.dashboard_zoom.get(zoom_key, [0, 100])
     if editable:
         zc1, zc2 = st.columns([1, 20])
@@ -527,6 +550,7 @@ def sync_workspace_from_disk(force: bool = False):
             for k, v in light.items():
                 if v is not None:
                     ss[k] = v
+            _coerce_light_defaults(ss)
             ss["_light_synced_snapshot"] = copy.deepcopy({k: ss.get(k) for k in ws.LIGHT_KEYS})
 
     if workspace_changed:
@@ -537,6 +561,7 @@ def sync_workspace_from_disk(force: bool = False):
             for k, v in saved.items():
                 if v is not None:
                     ss[k] = v
+        _coerce_light_defaults(ss)
         # What we just loaded from disk is already in sync with disk - mark it
         # as such so the end-of-script auto-save doesn't immediately re-save
         # the whole dataset again this same run.
