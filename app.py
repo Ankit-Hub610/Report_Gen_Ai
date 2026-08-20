@@ -74,7 +74,10 @@ SAMPLE_DATASETS = {
 DEFAULT_THEME = {
     "bg_color": "#0E1117",
     "panel_color": "#161A23",
-    "font_color": "#F5F5F5",
+    "font_color": "#1a1a1a",  # was #F5F5F5 (near-white) — invisible against the
+                              # actual (light) Boss Dashboard page background, which
+                              # doesn't use bg_color/panel_color for its own chrome.
+                              # Dark text is the one that's actually readable there.
     "accent_color": "#2C6E49",
     "font_name": "Helvetica",
     "font_family": "Arial",
@@ -295,6 +298,36 @@ def ai_history_storage_id():
     if st.session_state.role == auth.ROLE_REPORT_VIEWER:
         return f"{base}__rv_{st.session_state.username}"
     return base
+
+
+# Which dashboard-config keys make up a "pinned card/chart" for the purposes
+# of copying them to another slide (see copy_pinned_cards_to_slide below).
+# Deliberately mirrors workspace_store.LIGHT_KEYS minus anything that's
+# slide-identity (dashboard_name stays each slide's own) or report-specific
+# (intel_* keys) rather than card/chart styling.
+DASHBOARD_CARD_KEYS = ["dashboard_charts", "pinned_kpis", "custom_kpis",
+                       "custom_charts", "dashboard_slicers", "dashboard_zoom"]
+
+
+def copy_pinned_cards_to_slide(target_slide_id: str) -> None:
+    """Copies the CURRENTLY ACTIVE slide's pinned KPI cards + charts —
+    including their styling/colours (custom_kpis/custom_charts already carry
+    their own style dict) — onto another slide of the SAME workspace.
+
+    Never touches either slide's underlying dataset (df_raw/meta): each
+    slide keeps its own data, so the exact same card/chart DEFINITIONS just
+    get recomputed against whatever data the target slide has — which is
+    the point (2 slides, 2 different datasets, same-looking dashboard).
+
+    This OVERWRITES the target slide's existing pinned_kpis/dashboard_charts/
+    custom_kpis/custom_charts/dashboard_slicers/dashboard_zoom — the caller
+    is responsible for warning/confirming before calling this."""
+    target_storage_id = ws.slide_storage_id(effective_workspace_id(), target_slide_id)
+    target_light = ws.load_light(target_storage_id)  # start from target's own saved state
+    merged = dict(target_light)
+    for k in DASHBOARD_CARD_KEYS:
+        merged[k] = copy.deepcopy(st.session_state.get(k))
+    ws.save_light(merged, target_storage_id)
 
 
 def persist_workspace_now(force_full: bool = False):
@@ -2357,6 +2390,32 @@ with st.sidebar:
                         switch_active_slide(_next_active)
                         st.success("Slide deleted.")
                         st.rerun()
+
+                if len(_slides) > 1:
+                    st.divider()
+                    st.markdown("**Copy pinned cards/charts to another slide**")
+                    st.caption(
+                        "Copies this slide's pinned KPI cards + charts — same columns, same colours/style — "
+                        "onto another slide. Each slide keeps its own data, so the cards will show that "
+                        "slide's own numbers, just styled the same way. **Overwrites** whatever cards/charts "
+                        "the target slide currently has."
+                    )
+                    _copy_targets = [s for s in _slides if s["id"] != _active_slide]
+                    _copy_target_id = st.selectbox(
+                        "Target slide", [s["id"] for s in _copy_targets],
+                        format_func=lambda sid: _slide_labels.get(sid, sid),
+                        key="_slide_copy_target",
+                    )
+                    _confirm_copy = st.checkbox(
+                        f"Yes, overwrite '{_slide_labels.get(_copy_target_id, '')}' cards/charts with "
+                        f"'{_slide_labels.get(_active_slide)}' cards/charts",
+                        key="_slide_copy_confirm",
+                    )
+                    if st.button("📋 Copy to selected slide", key="_slide_copy_btn",
+                                 use_container_width=True, disabled=not _confirm_copy):
+                        copy_pinned_cards_to_slide(_copy_target_id)
+                        st.success(f"Copied to '{_slide_labels.get(_copy_target_id, '')}'.")
+                        st.session_state.pop("_slide_copy_confirm", None)
         st.divider()
 
     sync_workspace_from_disk()
@@ -2383,6 +2442,7 @@ with st.sidebar:
             nav_options.append("💡 Business Insights")
         nav_options.append("📈 Full Analysis")
         nav_options.append("🤖 AI Assistant")
+        nav_options.append("⚙️ Settings")   # Defaults tab only — see the Settings page's role check
     if st.session_state.role == auth.ROLE_ADMIN:
         nav_options.append("🔐 Admin Panel")
     page = st.radio("Navigate", nav_options, label_visibility="collapsed")
@@ -4321,16 +4381,27 @@ elif page == "🤖 AI Assistant":
 elif page == "⚙️ Settings":
     st.title("⚙️ Settings")
 
-    tab_names = ["🎨 Defaults", "🔑 My Account"]
-    if st.session_state.role == auth.ROLE_CLIENT:
-        tab_names.append("👥 My Report Viewers")
-    tab_names.append("ℹ️ How This Tool Works")
-    tabs = st.tabs(tab_names)
-    tab_defaults, tab_account = tabs[0], tabs[1]
-    tab_report_viewers = tabs[2] if st.session_state.role == auth.ROLE_CLIENT else None
-    tab_about = tabs[-1]
+    if st.session_state.role == auth.ROLE_REPORT_VIEWER:
+        # Report Viewer (client's boss/manager) only ever gets the "Default
+        # Theme" formatting controls below — no password/account management
+        # (this isn't their workspace) and no report-viewer management (only
+        # the CLIENT who owns the workspace can create those logins).
+        tab_defaults = st.container()
+        tab_account = None
+        tab_report_viewers = None
+        tab_about = None
+    else:
+        tab_names = ["🎨 Defaults", "🔑 My Account"]
+        if st.session_state.role == auth.ROLE_CLIENT:
+            tab_names.append("👥 My Report Viewers")
+        tab_names.append("ℹ️ How This Tool Works")
+        tabs = st.tabs(tab_names)
+        tab_defaults, tab_account = tabs[0], tabs[1]
+        tab_report_viewers = tabs[2] if st.session_state.role == auth.ROLE_CLIENT else None
+        tab_about = tabs[-1]
 
-    with tab_account:
+    if tab_account is not None:
+      with tab_account:
         st.subheader("Change my password")
         st.caption("Only changes **your own** login — no one else's password or data is affected, "
                    "and your admin can still reset your password if you ever get locked out.")
@@ -4740,7 +4811,8 @@ elif page == "⚙️ Settings":
 
         st.session_state.theme = th
 
-    with tab_about:
+    if tab_about is not None:
+      with tab_about:
         st.subheader("What this tool does")
         # NOTE: this tab is shown to every role (client / viewer / report
         # viewer / admin). Nothing about the Admin Panel - or that one even
