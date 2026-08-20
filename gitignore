@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+.DS_Store
+sessions.json
+workspace_state/
+password_resets.json
+demo_identities.json  # contains visitors' raw email/phone numbers - private, never public on GitHub
+                       # (safe now that Supabase is the real persistent copy — see modules/supabase_store.py)
