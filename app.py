@@ -165,6 +165,7 @@ def init_state():
     ss.setdefault("role", None)
     ss.setdefault("plan", "standard")   # "standard" (unlimited) or "free" (capped, see usage_limits.py)
     ss.setdefault("workspace_id", None)      # which data workspace this account owns (Phase 4: multi-tenant)
+    ss.setdefault("demo_trial_start", None)  # per-person trial clock for a shared-demo login (see _current_trial_status)
     ss.setdefault("view_as_workspace", None)  # admin-only: workspace_id currently being viewed/managed instead of their own
 
     ss.setdefault("df_raw", None)
@@ -424,15 +425,6 @@ def _render_chart_with_zoom(fig, zoom_key: str, widget_key: str, editable: bool 
     and the caller then reuses that same fig for the PDF export, so whatever zoom
     is showing on screen is exactly what appears in the exported PDF too. Returns
     the (possibly zoom-applied) fig so the caller can hand it to chart_png_items."""
-    # Defensive fallback: self-heals any workspace whose on-disk dashboard_zoom
-    # was already saved as None by the sync_workspace_from_disk bug (see the
-    # fix in sync_workspace_from_disk() above) BEFORE this fix was deployed -
-    # without this, those existing workspaces would keep crashing here even
-    # after the root-cause fix above, since save_light()/load_light() only
-    # overwrite a key on load if the saved value is not None (so an
-    # already-None value already sitting on disk never self-corrects).
-    if st.session_state.dashboard_zoom is None:
-        st.session_state.dashboard_zoom = {}
     zoom = st.session_state.dashboard_zoom.get(zoom_key, [0, 100])
     if editable:
         zc1, zc2 = st.columns([1, 20])
@@ -479,20 +471,7 @@ def sync_workspace_from_disk(force: bool = False):
     if workspace_changed:
         for k in ws.PERSISTED_KEYS:
             ss[k] = [] if isinstance(ss.get(k), list) else None
-        # BUG FIX (reported): "Selected Charts" pe AttributeError crash ho raha tha
-        # ("'NoneType' object has no attribute 'get'" from _render_chart_with_zoom).
-        # Root cause: the loop above only knows two shapes - "was a list" -> [],
-        # everything else -> None. dashboard_zoom (and filters) are DICTS, not
-        # lists, so they were wiped to None here instead of {} - and stayed None
-        # if the on-disk saved copy for this workspace didn't have a valid
-        # dashboard_zoom yet (older save predating this feature, or a workspace
-        # that already got corrupted to None by this same bug on a previous
-        # run - once None, save_light()/load_light()'s "only overwrite if v is
-        # not None" logic can never self-heal it). Every dict-shaped persisted
-        # key needs its own explicit {} reset here, same as filters already had.
         ss["filters"] = {}
-        ss["dashboard_zoom"] = {}
-        ss["intel_role_overrides"] = {}
         ss["p3_sql_result"] = None  # SQL Query tab result belongs to the previous workspace — drop it on switch
         ss["p3_sql_error"] = None
     else:
@@ -870,6 +849,19 @@ def _logo_img_html(logo_bytes: bytes, mime: str, width: int, extra_style: str = 
         return None, None
 
 
+def _current_trial_status() -> dict:
+    """Trial status for whoever's logged in right now. For a shared-demo
+    login this uses THEIR OWN trial_start (set at auth.get_or_create_demo_identity
+    time, carried in st.session_state.demo_trial_start / the session cookie)
+    instead of the shared demo account's record — so each demo visitor gets
+    their own independent TRIAL_DAYS-day countdown. For a normal account,
+    falls back to auth.get_trial_status() as before."""
+    _demo_start = st.session_state.get("demo_trial_start")
+    if _demo_start is not None:
+        return auth.compute_trial_status(_demo_start)
+    return auth.get_trial_status(st.session_state.username)
+
+
 def login_screen():
     brand = st.session_state.get("app_brand") or DEFAULT_BRAND
 
@@ -898,25 +890,47 @@ def login_screen():
         with st.form("login_form"):
             u = st.text_input("Username")
             p = st.text_input("Password", type="password")
+            # Shown for everyone (Streamlit forms can't react to the
+            # username field mid-form to conditionally show/hide this), but
+            # only actually REQUIRED/used below for a shared-demo account —
+            # a normal client/viewer login just ignores it.
+            demo_identifier = st.text_input(
+                "Email or phone (demo login only)",
+                help="If you're using a shared demo login, this is how we recognize you next time so "
+                     "your data and free-trial days are waiting for you — even from a different device. "
+                     "Not needed for a normal account.",
+            )
             submitted = st.form_submit_button("Login", use_container_width=True)
             if submitted:
                 role = auth.verify_login(u, p)
-                if role:
+                # Shared demo account: identify the PERSON (by email/phone),
+                # not just the login event — so the same visitor gets back
+                # the SAME isolated workspace and the SAME running trial
+                # countdown every time, instead of a brand-new one on every
+                # separate login (which used to make it look like all their
+                # data got wiped overnight). Checked BEFORE marking the
+                # session authenticated, so a missing identifier just
+                # re-shows the login form instead of leaving a half-logged-in
+                # session with no workspace/token set.
+                if role and auth.is_shared_demo(u.strip()) and not (demo_identifier or "").strip():
+                    st.error("Please enter your email or phone so we can save your progress for next time.")
+                elif role:
                     st.session_state.authenticated = True
                     st.session_state.username = u.strip()
                     st.session_state.role = role
-                    # Shared demo account: every separate login gets its own fresh,
-                    # isolated temporary workspace — so multiple people using the
-                    # SAME demo username/password never see each other's uploaded
-                    # data (unlike a normal account, whose workspace_id is fixed).
                     if auth.is_shared_demo(u.strip()):
-                        _demo_ws = f"demo_{uuid.uuid4().hex[:10]}"
+                        _identity = auth.get_or_create_demo_identity(u.strip(), demo_identifier)
+                        _demo_ws = _identity["workspace_id"]
+                        _demo_trial_start = _identity["trial_start"]
                         st.session_state.workspace_id = _demo_ws
+                        st.session_state.demo_trial_start = _demo_trial_start
                     else:
                         _demo_ws = None
+                        _demo_trial_start = None
                         st.session_state.workspace_id = auth.get_workspace_id(u.strip())
+                        st.session_state.demo_trial_start = None
                     st.session_state.plan = auth.get_effective_plan(u.strip())
-                    _token = auth.create_session(u.strip(), workspace_id=_demo_ws)
+                    _token = auth.create_session(u.strip(), workspace_id=_demo_ws, trial_start=_demo_trial_start)
                     st.session_state._session_token = _token
                     _set_session_cookie(_token)  # survives a browser refresh, but not copy-paste into another browser
                     st.rerun()
@@ -1296,23 +1310,27 @@ if not st.session_state.authenticated:
         st.info("Restoring your session…")
         st.stop()
     _session_token = _all_cookies.get(SESSION_COOKIE_NAME)
-    _resolved_user, _resolved_ws = auth.resolve_session(_session_token) if _session_token else (None, None)
+    _resolved_user, _resolved_ws, _resolved_trial = (
+        auth.resolve_session(_session_token) if _session_token else (None, None, None)
+    )
     if _resolved_user and auth.user_exists(_resolved_user):
         st.session_state.authenticated = True
         st.session_state.username = _resolved_user
         st.session_state.role = auth.get_role(_resolved_user)
-        # _resolved_ws is only set for a shared-demo login's temp workspace
-        # (embedded in the token itself) — preserve that SAME temp workspace
-        # across this refresh instead of resolving back to the shared
-        # account-level workspace_id, or the demo's isolation would break on
-        # every reload.
+        # _resolved_ws is only set for a shared-demo login's per-person
+        # workspace (embedded in the token itself, keyed by the email/phone
+        # they identified with — see auth.get_or_create_demo_identity) —
+        # preserve that SAME workspace across this refresh instead of
+        # resolving back to the shared account-level workspace_id, or the
+        # demo's per-person persistence would break on every reload.
         st.session_state.workspace_id = _resolved_ws or auth.get_workspace_id(_resolved_user)
         st.session_state.plan = auth.get_effective_plan(_resolved_user)
+        st.session_state.demo_trial_start = _resolved_trial  # None for a normal (non-demo) account
         # Sliding expiry: issue a fresh token (full SESSION_LIFETIME_SECONDS
         # from now) on every active visit, instead of counting down from the
         # original login. Someone who opens the app every day never hits the
         # 7-day expiry; someone who genuinely walks away for a week does.
-        _session_token = auth.create_session(_resolved_user, workspace_id=_resolved_ws)
+        _session_token = auth.create_session(_resolved_user, workspace_id=_resolved_ws, trial_start=_resolved_trial)
         _set_session_cookie(_session_token)
         st.session_state._session_token = _session_token
 
@@ -1471,7 +1489,7 @@ def upgrade_dialog():
 
 
 if st.session_state.plan == "free" and st.session_state.role != auth.ROLE_ADMIN:
-    _trial = auth.get_trial_status(st.session_state.username)
+    _trial = _current_trial_status()
     if _trial["expired"]:
         st.title("⏳ Your free trial has ended")
         st.warning(f"Your {auth.TRIAL_DAYS}-day free trial finished. Upgrade to Standard to keep using "
@@ -1489,6 +1507,7 @@ if st.session_state.plan == "free" and st.session_state.role != auth.ROLE_ADMIN:
             st.session_state.role = None
             st.session_state.plan = "standard"
             st.session_state.workspace_id = None
+            st.session_state.demo_trial_start = None
             st.session_state._session_token = None
             _clear_session_cookie()
             st.rerun()
@@ -1513,6 +1532,7 @@ if st.session_state.plan == "expired_standard" and st.session_state.role != auth
         st.session_state.role = None
         st.session_state.plan = "standard"
         st.session_state.workspace_id = None
+        st.session_state.demo_trial_start = None
         st.session_state._session_token = None
         _clear_session_cookie()
         st.rerun()
@@ -2317,7 +2337,7 @@ with st.sidebar:
     st.session_state.page = page
     st.divider()
     if st.session_state.plan == "free" and st.session_state.role != auth.ROLE_ADMIN:
-        _trial_sb = auth.get_trial_status(st.session_state.username)
+        _trial_sb = _current_trial_status()
         if _trial_sb["days_left"] is not None:
             st.caption(f"🆓 Free trial: **{_trial_sb['days_left']} day(s) left**")
     if st.session_state.data_source_name:
@@ -2335,6 +2355,7 @@ with st.sidebar:
         st.session_state.username = None
         st.session_state.role = None
         st.session_state.workspace_id = None
+        st.session_state.demo_trial_start = None
         st.session_state.view_as_workspace = None
         st.session_state._loaded_workspace_id = None
         st.session_state.active_slide_id = None
@@ -4772,7 +4793,7 @@ elif page == "💎 Plans":
         if AUTOREFRESH_AVAILABLE and not st.session_state.get("upgrade_dialog_open"):
             st_autorefresh(interval=20 * 1000, key="plans_page_autorefresh")
     if st.session_state.plan == "free" and st.session_state.role != auth.ROLE_ADMIN:
-        _trial_pp = auth.get_trial_status(st.session_state.username)
+        _trial_pp = _current_trial_status()
         if _trial_pp["days_left"] is not None:
             st.info(f"🆓 You're on the **Free** plan — **{_trial_pp['days_left']} day(s) left** "
                    f"in your {auth.TRIAL_DAYS}-day trial.")
