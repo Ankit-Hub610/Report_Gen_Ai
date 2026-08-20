@@ -285,6 +285,18 @@ def effective_storage_id():
     return ws.slide_storage_id(effective_workspace_id(), active_slide_id())
 
 
+def ai_history_storage_id():
+    """Same underlying data workspace as effective_storage_id(), but the AI
+    Assistant CHAT LOG is kept in its own separate bucket for a report_viewer
+    (a client's boss/manager) — so their conversation is private to them,
+    never visible to (or overwritten by) the client's own AI Assistant chat,
+    even though both are asking questions about the exact same dataset."""
+    base = effective_storage_id()
+    if st.session_state.role == auth.ROLE_REPORT_VIEWER:
+        return f"{base}__rv_{st.session_state.username}"
+    return base
+
+
 def persist_workspace_now(force_full: bool = False):
     """Writes the CURRENT session_state to disk for the active (workspace,
     slide) right now, in this exact line of execution - never deferred.
@@ -2358,7 +2370,19 @@ with st.sidebar:
     if st.session_state.df_raw is not None and ppt.detect_title_column(st.session_state.df_raw, st.session_state.meta):
         nav_options.insert(4, "💡 Business Insights")  # right after Boss Dashboard
     if st.session_state.role == auth.ROLE_REPORT_VIEWER:
-        nav_options = ["⭐ Boss Dashboard"]   # nothing else exists for this account, not even Settings
+        # Report Viewer (a client's boss/manager): Boss Dashboard (full control,
+        # scoped to that page — see can_edit_dashboard()) PLUS view + filter
+        # access to Full Analysis / Business Insights / AI Assistant — but never
+        # Connect Data, Custom Builder, Data Table, or Settings (no upload, no
+        # dashboard curation, no account management). can_edit() is already False
+        # for this role, so every save/pin/upload button on these pages is
+        # already hidden/disabled automatically — this only changes which PAGES
+        # are reachable at all.
+        nav_options = ["⭐ Boss Dashboard"]
+        if st.session_state.df_raw is not None and ppt.detect_title_column(st.session_state.df_raw, st.session_state.meta):
+            nav_options.append("💡 Business Insights")
+        nav_options.append("📈 Full Analysis")
+        nav_options.append("🤖 AI Assistant")
     if st.session_state.role == auth.ROLE_ADMIN:
         nav_options.append("🔐 Admin Panel")
     page = st.radio("Navigate", nav_options, label_visibility="collapsed")
@@ -3574,6 +3598,12 @@ elif page == "📈 Full Analysis":
         st.divider()
         if st.button("➡️ Continue to Page 2 — Summary & Recommendations", type="primary", key="intel_go_part2"):
             st.session_state.intel_part = 2
+            # The radio above has its own key ("intel_part_radio"), so once it's
+            # rendered once, Streamlit reads ITS OWN keyed session_state value on
+            # every rerun and ignores the index= param — setting intel_part alone
+            # was silently doing nothing. Setting the radio's own key directly is
+            # what actually moves the selection to Page 2.
+            st.session_state["intel_part_radio"] = "📈 Page 2 — Summary & Recommendations"
             st.rerun()
 
     # ==========================================================================
@@ -3789,6 +3819,7 @@ elif page == "📈 Full Analysis":
         st.divider()
         if st.button("⬅️ Back to Page 1", key="intel_back_part1"):
             st.session_state.intel_part = 1
+            st.session_state["intel_part_radio"] = "📋 Page 1 — Full Analysis"  # same fix as Continue button above
             st.rerun()
 
 
@@ -4060,9 +4091,11 @@ elif page == "🤖 AI Assistant":
 
     # Pull this slide's saved chat history (5-day auto-expiring) exactly once
     # per slide per session — after that, session_state is the live copy.
-    if st.session_state._chat_history_loaded_ws != effective_storage_id():
-        st.session_state.ai_chat_history = ws.load_chat_history(effective_storage_id())
-        st.session_state._chat_history_loaded_ws = effective_storage_id()
+    # Uses ai_history_storage_id() (not effective_storage_id()) so a report
+    # viewer's chat is private to them, separate from the client's own chat.
+    if st.session_state._chat_history_loaded_ws != ai_history_storage_id():
+        st.session_state.ai_chat_history = ws.load_chat_history(ai_history_storage_id())
+        st.session_state._chat_history_loaded_ws = ai_history_storage_id()
 
     if not api_key:
         if st.session_state.role == auth.ROLE_ADMIN:
@@ -4179,11 +4212,11 @@ elif page == "🤖 AI Assistant":
                     "role": "assistant", "content": result["answer"],
                     "sql_used": result["sql_used"], "proof_df": result["proof_df"], "ts": time.time(),
                 })
-        ws.save_chat_history(st.session_state.ai_chat_history, effective_storage_id())
+        ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
 
     if st.session_state.ai_chat_history and st.button("🗑️ Clear chat"):
         st.session_state.ai_chat_history = []
-        ws.save_chat_history([], effective_storage_id())
+        ws.save_chat_history([], ai_history_storage_id())
         st.rerun()
 
     # ------------------------------------------------------------------------
@@ -4331,11 +4364,15 @@ elif page == "⚙️ Settings":
             st.subheader("Give your boss/manager their own login")
             st.caption(
                 "Creates a **Report Viewer** account, locked to only your data. They can log in from "
-                "anywhere (no need to be in the same room as you) and will see **only the Boss "
-                "Dashboard** — nothing else in this app. There they get full control: view everything, "
-                "**export PDF**, and **manage slicers** (add/remove/change which filter fields show). "
-                "They can never see your other data, other clients' data, or reach any other page. "
-                "Your admin can always see and manage these accounts too."
+                "anywhere (no need to be in the same room as you) and will see **Boss Dashboard**, "
+                "**Full Analysis**, **Business Insights** (if applicable) and their own **AI Assistant** "
+                "chat — never Connect Data, Custom Builder, Data Table, or Settings. On Boss Dashboard "
+                "they get full control: view everything, **export PDF**, and **manage slicers**. On "
+                "Full Analysis / Business Insights they can view, use filters, and export reports, but "
+                "can't upload data, change slicer settings, or edit your dashboard. Their AI Assistant "
+                "chat is private to them — separate from your own AI conversation, even though it's "
+                "answering from the same data. They can never see your other data, other clients' "
+                "data, or reach any other page. Your admin can always see and manage these accounts too."
             )
             my_report_viewers = [u for u in auth.list_users()
                                   if u["role"] == auth.ROLE_REPORT_VIEWER
