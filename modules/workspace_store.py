@@ -29,6 +29,8 @@ import shutil
 import time
 import uuid
 
+from . import supabase_store
+
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STORE_ROOT = os.path.join(APP_DIR, "workspace_state")
 
@@ -133,6 +135,11 @@ def _atomic_pickle(payload: dict, store_file: str) -> None:
     os.replace(tmp_path, store_file)  # atomic on POSIX - no half-written files
 
 
+def _light_blob_key(workspace_id: str) -> str:
+    safe = _SAFE_ID_RE.sub("_", (workspace_id or "default").strip()) or "default"
+    return f"workspace_light/{safe}.pkl"
+
+
 def save(session_state, workspace_id: str) -> None:
     """FULL save - writes both the heavy (dataset) file and the light
     (dashboard config) file. Best-effort: never raises, a failed save just
@@ -150,20 +157,38 @@ def save(session_state, workspace_id: str) -> None:
         _atomic_pickle(heavy_payload, _store_file(workspace_id))
         light_payload = {k: session_state.get(k) for k in LIGHT_KEYS}
         _atomic_pickle(light_payload, _light_store_file(workspace_id))
+        try:
+            supabase_store.put_blob(_light_blob_key(workspace_id), pickle.dumps(light_payload))
+        except Exception:
+            pass
     except Exception:
         pass
+    # NOTE: the heavy dataset (df_raw) is intentionally NOT synced to
+    # Supabase here - it can be large, and app_kv is meant for small config
+    # blobs. On an ephemeral-disk host, a rare cold restart can still lose
+    # the loaded dataset itself (re-upload needed) even though the
+    # dashboard layout, KPIs, filters, and trial/workspace identity all
+    # survive via the light sync below. Ask if you want the raw dataset
+    # persisted too (e.g. via Supabase Storage) - it's a bigger change.
 
 
 def save_light(session_state, workspace_id: str) -> None:
     """Cheap save - writes ONLY the small dashboard-config keys (pinned KPIs,
     charts, slicers, dashboard name, pivot reports, filters). Never touches
     the (possibly large) dataset file, so this is fast enough to call after
-    every single click. Best-effort: never raises."""
+    every single click. Best-effort: never raises. Also mirrors this small
+    payload to Supabase (if configured) so it survives a container rebuild -
+    this is what makes Boss Dashboard / pinned KPIs / filters stop
+    disappearing after the app sleeps and reopens on an ephemeral-disk host."""
     try:
         d = _safe_dir(workspace_id)
         os.makedirs(d, exist_ok=True)
         light_payload = {k: session_state.get(k) for k in LIGHT_KEYS}
         _atomic_pickle(light_payload, _light_store_file(workspace_id))
+        try:
+            supabase_store.put_blob(_light_blob_key(workspace_id), pickle.dumps(light_payload))
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -188,9 +213,24 @@ def load(workspace_id: str):
 
 
 def load_light(workspace_id: str) -> dict:
-    """Returns just the saved dashboard-config dict for this workspace
-    (cheap - never reads the dataset file). Returns {} if nothing saved yet
-    or the file is unreadable."""
+    """Returns just the saved dashboard-config dict for this workspace.
+    Tries Supabase FIRST (if configured) since that's the copy that
+    survives a container rebuild; falls back to local disk otherwise
+    (and mirrors a Supabase hit back to local disk as a fast cache for the
+    rest of this run). Returns {} if nothing saved anywhere / unreadable."""
+    blob = supabase_store.get_blob(_light_blob_key(workspace_id))
+    if blob:
+        try:
+            payload = pickle.loads(blob) or {}
+            try:
+                d = _safe_dir(workspace_id)
+                os.makedirs(d, exist_ok=True)
+                _atomic_pickle(payload, _light_store_file(workspace_id))
+            except Exception:
+                pass
+            return payload
+        except Exception:
+            pass
     light_file = _light_store_file(workspace_id)
     if not os.path.exists(light_file):
         return {}
@@ -549,6 +589,9 @@ def _github_put_file(cfg, path, content_bytes, message):
         return False
 
 
+_BRAND_BLOB_KEY = "branding.pkl"   # Supabase app_kv key
+
+
 def save_branding(brand: dict) -> None:
     try:
         os.makedirs(STORE_ROOT, exist_ok=True)
@@ -556,6 +599,10 @@ def save_branding(brand: dict) -> None:
         with open(tmp_path, "wb") as f:
             pickle.dump(brand, f)
         os.replace(tmp_path, _BRAND_FILE)
+    except Exception:
+        pass
+    try:
+        supabase_store.put_blob(_BRAND_BLOB_KEY, pickle.dumps(brand))
     except Exception:
         pass
     cfg = _github_config()
@@ -568,10 +615,26 @@ def save_branding(brand: dict) -> None:
 
 def load_branding():
     """Returns the saved brand dict, or None if nothing's been saved yet /
-    unreadable (treated as 'use defaults', never crashes). Tries GitHub first
-    (if configured) since that's the copy that actually survives a restart;
-    falls back to local disk otherwise, which is always tried and kept as a
-    fast local mirror for the rest of this run."""
+    unreadable (treated as 'use defaults', never crashes). Tries Supabase
+    first (if configured — simplest to set up, no GitHub token needed),
+    then GitHub (if configured), since either is the copy that actually
+    survives a restart on an ephemeral-disk host; falls back to local disk
+    otherwise, which is always tried and kept as a fast local mirror for the
+    rest of this run."""
+    blob = supabase_store.get_blob(_BRAND_BLOB_KEY)
+    if blob:
+        try:
+            brand = pickle.loads(blob)
+            try:
+                os.makedirs(STORE_ROOT, exist_ok=True)
+                with open(_BRAND_FILE, "wb") as f:
+                    pickle.dump(brand, f)
+            except Exception:
+                pass
+            return brand
+        except Exception:
+            pass
+
     cfg = _github_config()
     if cfg:
         content, _ = _github_get_file(cfg, GITHUB_BRAND_PATH)
