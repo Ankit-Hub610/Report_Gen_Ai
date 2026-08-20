@@ -202,6 +202,9 @@ def init_state():
     ss.setdefault("db_conn_uri", "")
     ss.setdefault("db_conn_type", "PostgreSQL")
     ss.setdefault("db_connected", False)
+    ss.setdefault("db_connect_error", None)   # persists a failed Test & Connect message across
+                                               # reruns so it doesn't flash and vanish (see the
+                                               # Test & Connect button code, Connect Data page)
     ss.setdefault("data_source_is_db", False)   # was the CURRENT df_raw loaded from a database (vs file upload)?
     ss.setdefault("db_last_load_sql", "")        # exact query used, so "Refresh from database" can re-run it
     ss.setdefault("db_last_load_label", "")      # table/description shown in the "connected live" banner
@@ -2711,10 +2714,17 @@ if page == "📥 Connect Data":
                             dbc.test_connection(uri)
                             st.session_state.db_conn_uri = uri
                             st.session_state.db_connected = True
-                            st.success("Connected successfully.")
+                            st.session_state.db_connect_error = None
                         except dbc.ConnectionError as e:
                             st.session_state.db_connected = False
-                            st.error(f"Could not connect: {e}")
+                            # Stored in session_state (not just st.error() here) so it
+                            # survives an extra automatic rerun (e.g. CookieManager's
+                            # get_all() finishing async — see the comment above
+                            # cookie_manager.get_all() earlier in this file) instead of
+                            # flashing and disappearing before it can be read.
+                            st.session_state.db_connect_error = str(e)
+                if st.session_state.get("db_connect_error"):
+                    st.error(f"Could not connect: {st.session_state.db_connect_error}")
                 with cc2:
                     if st.session_state.db_connected and st.button("🔌 Disconnect", key="cd_db_disconnect_btn"):
                         st.session_state.db_connected = False
@@ -3926,10 +3936,16 @@ elif page == "🗂 Data Table":
                             st.session_state.db_connected = True
                             if not st.session_state.db_queries:
                                 st.session_state.db_queries = [dbc.new_query_tab("Query 1")]
-                            st.success("Connected successfully.")
+                            st.session_state.db_connect_error = None
                         except dbc.ConnectionError as e:
                             st.session_state.db_connected = False
-                            st.error(f"Could not connect: {e}")
+                            # Persisted in session_state so it survives an extra
+                            # automatic rerun instead of flashing and disappearing
+                            # before it can be read (see the matching comment on
+                            # the Connect Data page's Test & Connect button).
+                            st.session_state.db_connect_error = str(e)
+                if st.session_state.get("db_connect_error"):
+                    st.error(f"Could not connect: {st.session_state.db_connect_error}")
                 with cc2:
                     if st.session_state.db_connected and st.button("🔌 Disconnect", key="db_disconnect_btn"):
                         st.session_state.db_connected = False
