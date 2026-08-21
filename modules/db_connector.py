@@ -16,6 +16,7 @@ SELECT/WITH statement is allowed; obviously destructive keywords are
 rejected before anything is sent to the database.
 """
 
+import json
 import re
 import time
 
@@ -138,6 +139,32 @@ def _validate(sql: str) -> str:
     return stripped
 
 
+def _stringify_unhashable_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Postgres JSON/JSONB columns (e.g. an 'extra_data' column) come back
+    from SQLAlchemy as native Python dict/list objects, not strings.
+
+    That breaks almost everything downstream: pandas' .nunique(), groupby,
+    sort_values, drop_duplicates, and every filter widget in this app all
+    need to hash each value, and dict/list are unhashable in Python - so a
+    JSONB column crashes with "TypeError: unhashable type: 'dict'" the
+    moment the app tries to profile or analyze it (as opposed to a CSV/Excel
+    load, where everything already arrives as plain text).
+
+    Fix: convert any column that contains dict/list values into its JSON
+    text representation right when the query result is read, so the rest of
+    the app can treat it exactly like any other text column.
+    """
+    for col in df.columns:
+        if df[col].dtype == object:
+            sample = df[col].dropna()
+            if not sample.empty and sample.map(lambda v: isinstance(v, (dict, list))).any():
+                df[col] = df[col].map(
+                    lambda v: json.dumps(v, default=str, ensure_ascii=False)
+                    if isinstance(v, (dict, list)) else v
+                )
+    return df
+
+
 def run_query(uri: str, sql: str, row_limit: int = MAX_ROWS) -> pd.DataFrame:
     """Runs a single read-only SELECT against the external database and
     returns the result as a DataFrame, capped at row_limit rows."""
@@ -149,6 +176,7 @@ def run_query(uri: str, sql: str, row_limit: int = MAX_ROWS) -> pd.DataFrame:
             rows = result.fetchmany(row_limit + 1)
             cols = list(result.keys())
         df = pd.DataFrame(rows, columns=cols)
+        df = _stringify_unhashable_columns(df)
         if len(df) > row_limit:
             df = df.head(row_limit)
         return df
