@@ -1411,39 +1411,53 @@ if _reset_token and not st.session_state.authenticated:
 # stuck browser can't trap someone on a blank screen forever) after several
 # attempts.
 if st.session_state.get("_logging_out"):
-    # NOTE: explicit unique key — cookie_manager.get_all() is also called
-    # further below (login-restore block) with its own default key; kept
-    # separate mainly to avoid StreamlitDuplicateElementKey if both ever ran
-    # in the same script pass (they no longer can — see below — but this
-    # stays as a safety margin).
-    _lo_cookies = cookie_manager.get_all(key="get_all_logout_check")
-    if _lo_cookies is None:
-        st.info("Logging out…")
-        st.stop()
-    if _lo_cookies.get(SESSION_COOKIE_NAME):
-        _lo_retries = st.session_state.get("_logout_retry_count", 0)
-        if _lo_retries < 5:
-            st.session_state["_logout_retry_count"] = _lo_retries + 1
-            _clear_session_cookie()
-            st.info("Logging out…")
-            st.rerun()
-        # Retries exhausted (very unusual — e.g. browser blocking cookie
-        # writes entirely): stop treating this as "logging out" and show
-        # the login screen anyway rather than stall forever.
-    st.session_state["_logging_out"] = False
-    st.session_state.pop("_logout_retry_count", None)
-    # BUG FIX (round 2 — reported again after the first fix): confirming the
-    # cookie is gone here isn't enough on its own if execution is then
-    # allowed to fall through into the ordinary cookie-restore block just
-    # below, which does its OWN separate cookie_manager.get_all() call
-    # (its own key/component instance) and — if that call's answer disagreed
-    # even slightly with the one just confirmed above (a different keyed
-    # component instance doing its own independent round trip) — could
-    # resolve a still-valid token and log the person straight back in. Once
-    # we've confirmed the logout here, show the login screen OURSELVES and
-    # stop immediately — never give the restore-from-cookie block below a
-    # chance to run on this same pass at all.
-    login_screen()
+    # BUG FIX (round 3 — reported twice more even after rounds 1 & 2):
+    # every earlier attempt here tried to reliably confirm, via
+    # CookieManager's own get_all()/delete() component calls, that the
+    # browser cookie was actually gone before continuing. That's STILL
+    # fundamentally racy: CookieManager (extra_streamlit_components) talks
+    # to the browser asynchronously through Streamlit's own component
+    # protocol, and there is no real guarantee about the ORDER in which
+    # multiple separate keyed component instances (the "delete" call vs a
+    # "get_all" call, each a distinct hidden component) actually mount,
+    # run their JS, and report back within a single script pass or across
+    # reruns — especially over Streamlit Cloud's real network latency
+    # rather than instant localhost. No amount of retrying/waiting on THAT
+    # mechanism can fully close the race, which is exactly why it kept
+    # coming back after two attempts to patch it that way.
+    #
+    # Real fix: stop depending on that async round-trip for logout
+    # entirely. Delete the cookie with a plain, synchronous browser
+    # <script> (document.cookie assignment happens instantly, in the same
+    # tick, no Streamlit component protocol involved) and then force a
+    # hard full-page reload. A hard reload throws away the entire
+    # browser-side Streamlit connection and starts a genuinely brand-new
+    # session on the very next request — and by the time that request is
+    # sent, the cookie has already been deleted synchronously in the line
+    # right before it. There's no window left for a stale cookie to be
+    # read back in.
+    st.components.v1.html(
+        f"""
+        <script>
+        function _wipeCookie(doc) {{
+            try {{
+                doc.cookie = "{SESSION_COOKIE_NAME}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/;";
+                doc.cookie = "{SESSION_COOKIE_NAME}=; expires=Thu, 01 Jan 1970 00:00:00 GMT;";
+            }} catch (e) {{ /* ignore — try the other document below */ }}
+        }}
+        // st.components.v1.html() renders inside its OWN iframe. Wipe the
+        // cookie both there (doesn't hurt) and, more importantly, on the
+        // actual top-level app page's document — that's the real origin
+        // the cookie was set on. Wrapped in try/catch since a sandboxed
+        // iframe could throw a cross-origin error reaching window.top.
+        _wipeCookie(document);
+        try {{ _wipeCookie(window.top.document); }} catch (e) {{ /* ignore */ }}
+        try {{ window.top.location.reload(); }} catch (e) {{ window.location.reload(); }}
+        </script>
+        """,
+        height=0,
+    )
+    st.info("Logging out…")
     st.stop()
 
 # A genuine browser refresh wipes st.session_state (a brand-new Streamlit session
