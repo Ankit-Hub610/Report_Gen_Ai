@@ -1412,9 +1412,10 @@ if _reset_token and not st.session_state.authenticated:
 # attempts.
 if st.session_state.get("_logging_out"):
     # NOTE: explicit unique key — cookie_manager.get_all() is also called
-    # further below (login-restore block) with its own default key on this
-    # SAME script run once _logging_out clears; two get_all() calls with the
-    # same default key in one run raises StreamlitDuplicateElementKey.
+    # further below (login-restore block) with its own default key; kept
+    # separate mainly to avoid StreamlitDuplicateElementKey if both ever ran
+    # in the same script pass (they no longer can — see below — but this
+    # stays as a safety margin).
     _lo_cookies = cookie_manager.get_all(key="get_all_logout_check")
     if _lo_cookies is None:
         st.info("Logging out…")
@@ -1427,10 +1428,23 @@ if st.session_state.get("_logging_out"):
             st.info("Logging out…")
             st.rerun()
         # Retries exhausted (very unusual — e.g. browser blocking cookie
-        # writes entirely): stop treating this as "logging out" and fall
-        # through to the login screen anyway rather than stall forever.
+        # writes entirely): stop treating this as "logging out" and show
+        # the login screen anyway rather than stall forever.
     st.session_state["_logging_out"] = False
     st.session_state.pop("_logout_retry_count", None)
+    # BUG FIX (round 2 — reported again after the first fix): confirming the
+    # cookie is gone here isn't enough on its own if execution is then
+    # allowed to fall through into the ordinary cookie-restore block just
+    # below, which does its OWN separate cookie_manager.get_all() call
+    # (its own key/component instance) and — if that call's answer disagreed
+    # even slightly with the one just confirmed above (a different keyed
+    # component instance doing its own independent round trip) — could
+    # resolve a still-valid token and log the person straight back in. Once
+    # we've confirmed the logout here, show the login screen OURSELVES and
+    # stop immediately — never give the restore-from-cookie block below a
+    # chance to run on this same pass at all.
+    login_screen()
+    st.stop()
 
 # A genuine browser refresh wipes st.session_state (a brand-new Streamlit session
 # starts), which used to bounce people straight back to the login screen just for
