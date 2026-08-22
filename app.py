@@ -679,18 +679,41 @@ cookie_manager = _get_cookie_manager()
 def _set_session_cookie(token: str):
     """Sets the 'stay logged in' cookie in the browser. Caller is
     responsible for calling st.rerun() right after this (CookieManager
-    handles its own component lifecycle - no manual page reload needed)."""
+    handles its own component lifecycle - no manual page reload needed).
+
+    BUG FIX: cookie_manager.set() renders a hidden component that has to
+    make a real round-trip to the browser (mount -> run its JS -> actually
+    write document.cookie) before the cookie genuinely exists. Every caller
+    of this function calls st.rerun() immediately afterwards, which tears
+    the current script run down right away - so that rerun could win the
+    race and fire BEFORE the browser had actually finished writing the
+    cookie. Session_state.authenticated was already True by then, so the
+    CURRENT tab looked perfectly logged in (nothing there depends on the
+    cookie), but the cookie itself silently never landed in the browser.
+    That's exactly what made a refresh, or opening the same URL in a new
+    tab of the SAME browser, bounce back to the login screen right after a
+    successful login - there was no cookie sitting there to restore from.
+    A short sleep here gives the component's JS time to actually finish
+    (document.cookie writes are effectively instant - well under 150ms)
+    before the caller's st.rerun() is allowed to run."""
     expires_at = datetime.datetime.now() + datetime.timedelta(seconds=auth.SESSION_LIFETIME_SECONDS)
     cookie_manager.set(SESSION_COOKIE_NAME, token, expires_at=expires_at, key="set_session_cookie")
+    time.sleep(0.15)
 
 
 def _clear_session_cookie():
     """Clears the 'stay logged in' cookie. Caller is responsible for calling
-    st.rerun() right after this."""
+    st.rerun() right after this.
+
+    Same race as _set_session_cookie above, in reverse: without a brief
+    pause here, a logout's st.rerun() could fire before the browser
+    finished deleting the cookie, leaving a stale cookie behind that could
+    log the person back in on their very next refresh."""
     try:
         cookie_manager.delete(SESSION_COOKIE_NAME, key="del_session_cookie")
     except KeyError:
         pass  # already gone (e.g. cookie had already expired) - nothing to clear
+    time.sleep(0.15)
 
 
 def _get_session_cookie():
