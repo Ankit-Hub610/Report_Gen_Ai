@@ -1383,6 +1383,55 @@ if _reset_token and not st.session_state.authenticated:
     reset_password_screen(_reset_token)
     st.stop()
 
+# BUG FIX (reported): "Logout karta hu but login firse ho jata he" — clicking
+# Logout would immediately log the person right back in.
+#
+# Root cause: session tokens are stateless/self-verifying (see
+# auth.destroy_session — it's a no-op on purpose, there's no server-side
+# record to delete), so logout security depends ENTIRELY on the browser
+# cookie actually being gone. _clear_session_cookie() asks CookieManager to
+# delete it, but that's a round trip out to the browser and back — the
+# Python call returns before the browser has necessarily finished (or even
+# started) that round trip. The old code only waited a fixed 150ms
+# (time.sleep) before calling st.rerun(), which is not a real confirmation —
+# it's a guess, and on Streamlit Cloud's real network latency (vs. instant
+# on localhost) it can easily lose that race. The very next script run then
+# hits the cookie-restore block below, still finds the (not-yet-deleted)
+# valid cookie sitting there, and logs the person straight back in — exactly
+# what was reported.
+#
+# Fix: mirror the same "don't trust a timer, wait for the real answer"
+# pattern already used by the cookie-restore logic just below (which
+# correctly treats cookie_manager.get_all() returning None as "haven't
+# heard back yet" rather than "logged out"). On Logout, set a flag instead
+# of assuming the delete worked; here, BEFORE any login-restore logic runs,
+# confirm via a real round trip that the cookie is actually gone before
+# letting the script proceed — retrying the delete a few times if the
+# browser hasn't reported back with "gone" yet, and only giving up (so a
+# stuck browser can't trap someone on a blank screen forever) after several
+# attempts.
+if st.session_state.get("_logging_out"):
+    # NOTE: explicit unique key — cookie_manager.get_all() is also called
+    # further below (login-restore block) with its own default key on this
+    # SAME script run once _logging_out clears; two get_all() calls with the
+    # same default key in one run raises StreamlitDuplicateElementKey.
+    _lo_cookies = cookie_manager.get_all(key="get_all_logout_check")
+    if _lo_cookies is None:
+        st.info("Logging out…")
+        st.stop()
+    if _lo_cookies.get(SESSION_COOKIE_NAME):
+        _lo_retries = st.session_state.get("_logout_retry_count", 0)
+        if _lo_retries < 5:
+            st.session_state["_logout_retry_count"] = _lo_retries + 1
+            _clear_session_cookie()
+            st.info("Logging out…")
+            st.rerun()
+        # Retries exhausted (very unusual — e.g. browser blocking cookie
+        # writes entirely): stop treating this as "logging out" and fall
+        # through to the login screen anyway rather than stall forever.
+    st.session_state["_logging_out"] = False
+    st.session_state.pop("_logout_retry_count", None)
+
 # A genuine browser refresh wipes st.session_state (a brand-new Streamlit session
 # starts), which used to bounce people straight back to the login screen just for
 # hitting F5/reload. Before falling back to the login screen, check the cookie
@@ -1605,6 +1654,7 @@ if st.session_state.plan == "free" and st.session_state.role != auth.ROLE_ADMIN:
             st.session_state.workspace_id = None
             st.session_state.demo_trial_start = None
             st.session_state._session_token = None
+            st.session_state["_logging_out"] = True  # see the fix note near the top of this file for why
             _clear_session_cookie()
             st.rerun()
         st.stop()
@@ -1630,6 +1680,7 @@ if st.session_state.plan == "expired_standard" and st.session_state.role != auth
         st.session_state.workspace_id = None
         st.session_state.demo_trial_start = None
         st.session_state._session_token = None
+        st.session_state["_logging_out"] = True  # see the fix note near the top of this file for why
         _clear_session_cookie()
         st.rerun()
     st.stop()
@@ -2496,6 +2547,7 @@ with st.sidebar:
         st.session_state.active_slide_id = None
         st.session_state._active_slide_for_ws = None
         st.session_state._session_token = None
+        st.session_state["_logging_out"] = True  # see the fix note near the top of this file for why
         _clear_session_cookie()
         st.rerun()
 
