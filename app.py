@@ -74,7 +74,10 @@ SAMPLE_DATASETS = {
 DEFAULT_THEME = {
     "bg_color": "#0E1117",
     "panel_color": "#161A23",
-    "font_color": "#F5F5F5",
+    "font_color": "#1a1a1a",  # was #F5F5F5 (near-white) — invisible against the
+                              # actual (light) Boss Dashboard page background, which
+                              # doesn't use bg_color/panel_color for its own chrome.
+                              # Dark text is the one that's actually readable there.
     "accent_color": "#2C6E49",
     "font_name": "Helvetica",
     "font_family": "Arial",
@@ -202,6 +205,9 @@ def init_state():
     ss.setdefault("db_conn_uri", "")
     ss.setdefault("db_conn_type", "PostgreSQL")
     ss.setdefault("db_connected", False)
+    ss.setdefault("db_connect_error", None)   # persists a failed Test & Connect message across
+                                               # reruns so it doesn't flash and vanish (see the
+                                               # Test & Connect button code, Connect Data page)
     ss.setdefault("data_source_is_db", False)   # was the CURRENT df_raw loaded from a database (vs file upload)?
     ss.setdefault("db_last_load_sql", "")        # exact query used, so "Refresh from database" can re-run it
     ss.setdefault("db_last_load_label", "")      # table/description shown in the "connected live" banner
@@ -280,6 +286,48 @@ def effective_storage_id():
     snapshots. Keep using effective_workspace_id() for things that stay the
     SAME across every slide of a workspace (plan, branding, admin actions)."""
     return ws.slide_storage_id(effective_workspace_id(), active_slide_id())
+
+
+def ai_history_storage_id():
+    """Same underlying data workspace as effective_storage_id(), but the AI
+    Assistant CHAT LOG is kept in its own separate bucket for a report_viewer
+    (a client's boss/manager) — so their conversation is private to them,
+    never visible to (or overwritten by) the client's own AI Assistant chat,
+    even though both are asking questions about the exact same dataset."""
+    base = effective_storage_id()
+    if st.session_state.role == auth.ROLE_REPORT_VIEWER:
+        return f"{base}__rv_{st.session_state.username}"
+    return base
+
+
+# Which dashboard-config keys make up a "pinned card/chart" for the purposes
+# of copying them to another slide (see copy_pinned_cards_to_slide below).
+# Deliberately mirrors workspace_store.LIGHT_KEYS minus anything that's
+# slide-identity (dashboard_name stays each slide's own) or report-specific
+# (intel_* keys) rather than card/chart styling.
+DASHBOARD_CARD_KEYS = ["dashboard_charts", "pinned_kpis", "custom_kpis",
+                       "custom_charts", "dashboard_slicers", "dashboard_zoom"]
+
+
+def copy_pinned_cards_to_slide(target_slide_id: str) -> None:
+    """Copies the CURRENTLY ACTIVE slide's pinned KPI cards + charts —
+    including their styling/colours (custom_kpis/custom_charts already carry
+    their own style dict) — onto another slide of the SAME workspace.
+
+    Never touches either slide's underlying dataset (df_raw/meta): each
+    slide keeps its own data, so the exact same card/chart DEFINITIONS just
+    get recomputed against whatever data the target slide has — which is
+    the point (2 slides, 2 different datasets, same-looking dashboard).
+
+    This OVERWRITES the target slide's existing pinned_kpis/dashboard_charts/
+    custom_kpis/custom_charts/dashboard_slicers/dashboard_zoom — the caller
+    is responsible for warning/confirming before calling this."""
+    target_storage_id = ws.slide_storage_id(effective_workspace_id(), target_slide_id)
+    target_light = ws.load_light(target_storage_id)  # start from target's own saved state
+    merged = dict(target_light)
+    for k in DASHBOARD_CARD_KEYS:
+        merged[k] = copy.deepcopy(st.session_state.get(k))
+    ws.save_light(merged, target_storage_id)
 
 
 def persist_workspace_now(force_full: bool = False):
@@ -2342,6 +2390,32 @@ with st.sidebar:
                         switch_active_slide(_next_active)
                         st.success("Slide deleted.")
                         st.rerun()
+
+                if len(_slides) > 1:
+                    st.divider()
+                    st.markdown("**Copy pinned cards/charts to another slide**")
+                    st.caption(
+                        "Copies this slide's pinned KPI cards + charts — same columns, same colours/style — "
+                        "onto another slide. Each slide keeps its own data, so the cards will show that "
+                        "slide's own numbers, just styled the same way. **Overwrites** whatever cards/charts "
+                        "the target slide currently has."
+                    )
+                    _copy_targets = [s for s in _slides if s["id"] != _active_slide]
+                    _copy_target_id = st.selectbox(
+                        "Target slide", [s["id"] for s in _copy_targets],
+                        format_func=lambda sid: _slide_labels.get(sid, sid),
+                        key="_slide_copy_target",
+                    )
+                    _confirm_copy = st.checkbox(
+                        f"Yes, overwrite '{_slide_labels.get(_copy_target_id, '')}' cards/charts with "
+                        f"'{_slide_labels.get(_active_slide)}' cards/charts",
+                        key="_slide_copy_confirm",
+                    )
+                    if st.button("📋 Copy to selected slide", key="_slide_copy_btn",
+                                 use_container_width=True, disabled=not _confirm_copy):
+                        copy_pinned_cards_to_slide(_copy_target_id)
+                        st.success(f"Copied to '{_slide_labels.get(_copy_target_id, '')}'.")
+                        st.session_state.pop("_slide_copy_confirm", None)
         st.divider()
 
     sync_workspace_from_disk()
@@ -2355,7 +2429,20 @@ with st.sidebar:
     if st.session_state.df_raw is not None and ppt.detect_title_column(st.session_state.df_raw, st.session_state.meta):
         nav_options.insert(4, "💡 Business Insights")  # right after Boss Dashboard
     if st.session_state.role == auth.ROLE_REPORT_VIEWER:
-        nav_options = ["⭐ Boss Dashboard"]   # nothing else exists for this account, not even Settings
+        # Report Viewer (a client's boss/manager): Boss Dashboard (full control,
+        # scoped to that page — see can_edit_dashboard()) PLUS view + filter
+        # access to Full Analysis / Business Insights / AI Assistant — but never
+        # Connect Data, Custom Builder, Data Table, or Settings (no upload, no
+        # dashboard curation, no account management). can_edit() is already False
+        # for this role, so every save/pin/upload button on these pages is
+        # already hidden/disabled automatically — this only changes which PAGES
+        # are reachable at all.
+        nav_options = ["⭐ Boss Dashboard"]
+        if st.session_state.df_raw is not None and ppt.detect_title_column(st.session_state.df_raw, st.session_state.meta):
+            nav_options.append("💡 Business Insights")
+        nav_options.append("📈 Full Analysis")
+        nav_options.append("🤖 AI Assistant")
+        nav_options.append("⚙️ Settings")   # Defaults tab only — see the Settings page's role check
     if st.session_state.role == auth.ROLE_ADMIN:
         nav_options.append("🔐 Admin Panel")
     page = st.radio("Navigate", nav_options, label_visibility="collapsed")
@@ -2711,10 +2798,17 @@ if page == "📥 Connect Data":
                             dbc.test_connection(uri)
                             st.session_state.db_conn_uri = uri
                             st.session_state.db_connected = True
-                            st.success("Connected successfully.")
+                            st.session_state.db_connect_error = None
                         except dbc.ConnectionError as e:
                             st.session_state.db_connected = False
-                            st.error(f"Could not connect: {e}")
+                            # Stored in session_state (not just st.error() here) so it
+                            # survives an extra automatic rerun (e.g. CookieManager's
+                            # get_all() finishing async — see the comment above
+                            # cookie_manager.get_all() earlier in this file) instead of
+                            # flashing and disappearing before it can be read.
+                            st.session_state.db_connect_error = str(e)
+                if st.session_state.get("db_connect_error"):
+                    st.error(f"Could not connect: {st.session_state.db_connect_error}")
                 with cc2:
                     if st.session_state.db_connected and st.button("🔌 Disconnect", key="cd_db_disconnect_btn"):
                         st.session_state.db_connected = False
@@ -3564,6 +3658,12 @@ elif page == "📈 Full Analysis":
         st.divider()
         if st.button("➡️ Continue to Page 2 — Summary & Recommendations", type="primary", key="intel_go_part2"):
             st.session_state.intel_part = 2
+            # The radio above has its own key ("intel_part_radio"), so once it's
+            # rendered once, Streamlit reads ITS OWN keyed session_state value on
+            # every rerun and ignores the index= param — setting intel_part alone
+            # was silently doing nothing. Setting the radio's own key directly is
+            # what actually moves the selection to Page 2.
+            st.session_state["intel_part_radio"] = "📈 Page 2 — Summary & Recommendations"
             st.rerun()
 
     # ==========================================================================
@@ -3779,6 +3879,7 @@ elif page == "📈 Full Analysis":
         st.divider()
         if st.button("⬅️ Back to Page 1", key="intel_back_part1"):
             st.session_state.intel_part = 1
+            st.session_state["intel_part_radio"] = "📋 Page 1 — Full Analysis"  # same fix as Continue button above
             st.rerun()
 
 
@@ -3926,10 +4027,16 @@ elif page == "🗂 Data Table":
                             st.session_state.db_connected = True
                             if not st.session_state.db_queries:
                                 st.session_state.db_queries = [dbc.new_query_tab("Query 1")]
-                            st.success("Connected successfully.")
+                            st.session_state.db_connect_error = None
                         except dbc.ConnectionError as e:
                             st.session_state.db_connected = False
-                            st.error(f"Could not connect: {e}")
+                            # Persisted in session_state so it survives an extra
+                            # automatic rerun instead of flashing and disappearing
+                            # before it can be read (see the matching comment on
+                            # the Connect Data page's Test & Connect button).
+                            st.session_state.db_connect_error = str(e)
+                if st.session_state.get("db_connect_error"):
+                    st.error(f"Could not connect: {st.session_state.db_connect_error}")
                 with cc2:
                     if st.session_state.db_connected and st.button("🔌 Disconnect", key="db_disconnect_btn"):
                         st.session_state.db_connected = False
@@ -4044,9 +4151,11 @@ elif page == "🤖 AI Assistant":
 
     # Pull this slide's saved chat history (5-day auto-expiring) exactly once
     # per slide per session — after that, session_state is the live copy.
-    if st.session_state._chat_history_loaded_ws != effective_storage_id():
-        st.session_state.ai_chat_history = ws.load_chat_history(effective_storage_id())
-        st.session_state._chat_history_loaded_ws = effective_storage_id()
+    # Uses ai_history_storage_id() (not effective_storage_id()) so a report
+    # viewer's chat is private to them, separate from the client's own chat.
+    if st.session_state._chat_history_loaded_ws != ai_history_storage_id():
+        st.session_state.ai_chat_history = ws.load_chat_history(ai_history_storage_id())
+        st.session_state._chat_history_loaded_ws = ai_history_storage_id()
 
     if not api_key:
         if st.session_state.role == auth.ROLE_ADMIN:
@@ -4163,11 +4272,11 @@ elif page == "🤖 AI Assistant":
                     "role": "assistant", "content": result["answer"],
                     "sql_used": result["sql_used"], "proof_df": result["proof_df"], "ts": time.time(),
                 })
-        ws.save_chat_history(st.session_state.ai_chat_history, effective_storage_id())
+        ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
 
     if st.session_state.ai_chat_history and st.button("🗑️ Clear chat"):
         st.session_state.ai_chat_history = []
-        ws.save_chat_history([], effective_storage_id())
+        ws.save_chat_history([], ai_history_storage_id())
         st.rerun()
 
     # ------------------------------------------------------------------------
@@ -4272,16 +4381,27 @@ elif page == "🤖 AI Assistant":
 elif page == "⚙️ Settings":
     st.title("⚙️ Settings")
 
-    tab_names = ["🎨 Defaults", "🔑 My Account"]
-    if st.session_state.role == auth.ROLE_CLIENT:
-        tab_names.append("👥 My Report Viewers")
-    tab_names.append("ℹ️ How This Tool Works")
-    tabs = st.tabs(tab_names)
-    tab_defaults, tab_account = tabs[0], tabs[1]
-    tab_report_viewers = tabs[2] if st.session_state.role == auth.ROLE_CLIENT else None
-    tab_about = tabs[-1]
+    if st.session_state.role == auth.ROLE_REPORT_VIEWER:
+        # Report Viewer (client's boss/manager) only ever gets the "Default
+        # Theme" formatting controls below — no password/account management
+        # (this isn't their workspace) and no report-viewer management (only
+        # the CLIENT who owns the workspace can create those logins).
+        tab_defaults = st.container()
+        tab_account = None
+        tab_report_viewers = None
+        tab_about = None
+    else:
+        tab_names = ["🎨 Defaults", "🔑 My Account"]
+        if st.session_state.role == auth.ROLE_CLIENT:
+            tab_names.append("👥 My Report Viewers")
+        tab_names.append("ℹ️ How This Tool Works")
+        tabs = st.tabs(tab_names)
+        tab_defaults, tab_account = tabs[0], tabs[1]
+        tab_report_viewers = tabs[2] if st.session_state.role == auth.ROLE_CLIENT else None
+        tab_about = tabs[-1]
 
-    with tab_account:
+    if tab_account is not None:
+      with tab_account:
         st.subheader("Change my password")
         st.caption("Only changes **your own** login — no one else's password or data is affected, "
                    "and your admin can still reset your password if you ever get locked out.")
@@ -4315,11 +4435,15 @@ elif page == "⚙️ Settings":
             st.subheader("Give your boss/manager their own login")
             st.caption(
                 "Creates a **Report Viewer** account, locked to only your data. They can log in from "
-                "anywhere (no need to be in the same room as you) and will see **only the Boss "
-                "Dashboard** — nothing else in this app. There they get full control: view everything, "
-                "**export PDF**, and **manage slicers** (add/remove/change which filter fields show). "
-                "They can never see your other data, other clients' data, or reach any other page. "
-                "Your admin can always see and manage these accounts too."
+                "anywhere (no need to be in the same room as you) and will see **Boss Dashboard**, "
+                "**Full Analysis**, **Business Insights** (if applicable) and their own **AI Assistant** "
+                "chat — never Connect Data, Custom Builder, Data Table, or Settings. On Boss Dashboard "
+                "they get full control: view everything, **export PDF**, and **manage slicers**. On "
+                "Full Analysis / Business Insights they can view, use filters, and export reports, but "
+                "can't upload data, change slicer settings, or edit your dashboard. Their AI Assistant "
+                "chat is private to them — separate from your own AI conversation, even though it's "
+                "answering from the same data. They can never see your other data, other clients' "
+                "data, or reach any other page. Your admin can always see and manage these accounts too."
             )
             my_report_viewers = [u for u in auth.list_users()
                                   if u["role"] == auth.ROLE_REPORT_VIEWER
@@ -4687,7 +4811,8 @@ elif page == "⚙️ Settings":
 
         st.session_state.theme = th
 
-    with tab_about:
+    if tab_about is not None:
+      with tab_about:
         st.subheader("What this tool does")
         # NOTE: this tab is shown to every role (client / viewer / report
         # viewer / admin). Nothing about the Admin Panel - or that one even
