@@ -712,6 +712,33 @@ def _cookie_key(label: str) -> str:
     return f"{label}_{st.session_state['_cookie_nonce']}"
 
 
+# ==================================================================================
+# BUG FIX #2 (the ACTUAL fix — the nonce-key approach above turned out to still
+# be fragile): "Login page pe chala jata hai, phir turant wapas app khul jata
+# he (auto-login)" — even with fresh, non-cached get_all() reads, the
+# underlying CookieManager's get_all() uses default={} (not default=None) the
+# instant a brand-new key is mounted, BEFORE the browser has actually replied.
+# That {} looks identical to "confirmed, no cookie" even though it really
+# means "haven't heard back yet" — so the retry loop could conclude "cookie's
+# gone" and clear _logging_out a run or two too early, right before the
+# browser's slower, REAL answer (still showing the not-yet-deleted cookie on
+# a laggy connection) arrives and gets picked up by the ordinary
+# restore-from-cookie check below — which then logs the person straight back
+# in. Chasing the exact timing of an async browser round trip like this is
+# inherently racy no matter how it's retried.
+#
+# Real fix: don't depend on winning that race at all. The moment someone
+# explicitly clicks Logout, remember that as a plain fact in THIS tab's
+# session_state — and never let the restore-from-cookie block undo it for
+# the rest of this tab's session, no matter what a delayed/ambiguous cookie
+# read reports. The cookie is still deleted for real (so a later genuine
+# browser refresh, which starts a brand-new session_state from scratch,
+# correctly stays logged out too) — this flag only prevents THIS SAME TAB,
+# THIS SAME SESSION from silently re-authenticating itself in the seconds
+# right after the click.
+st.session_state.setdefault("_explicitly_logged_out", False)
+
+
 def _set_session_cookie(token: str):
     """Sets the 'stay logged in' cookie in the browser. Caller is
     responsible for calling st.rerun() right after this (CookieManager
