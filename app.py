@@ -31,6 +31,7 @@ import uuid
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import extra_streamlit_components as stx
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -712,33 +713,6 @@ def _cookie_key(label: str) -> str:
     return f"{label}_{st.session_state['_cookie_nonce']}"
 
 
-# ==================================================================================
-# BUG FIX #2 (the ACTUAL fix — the nonce-key approach above turned out to still
-# be fragile): "Login page pe chala jata hai, phir turant wapas app khul jata
-# he (auto-login)" — even with fresh, non-cached get_all() reads, the
-# underlying CookieManager's get_all() uses default={} (not default=None) the
-# instant a brand-new key is mounted, BEFORE the browser has actually replied.
-# That {} looks identical to "confirmed, no cookie" even though it really
-# means "haven't heard back yet" — so the retry loop could conclude "cookie's
-# gone" and clear _logging_out a run or two too early, right before the
-# browser's slower, REAL answer (still showing the not-yet-deleted cookie on
-# a laggy connection) arrives and gets picked up by the ordinary
-# restore-from-cookie check below — which then logs the person straight back
-# in. Chasing the exact timing of an async browser round trip like this is
-# inherently racy no matter how it's retried.
-#
-# Real fix: don't depend on winning that race at all. The moment someone
-# explicitly clicks Logout, remember that as a plain fact in THIS tab's
-# session_state — and never let the restore-from-cookie block undo it for
-# the rest of this tab's session, no matter what a delayed/ambiguous cookie
-# read reports. The cookie is still deleted for real (so a later genuine
-# browser refresh, which starts a brand-new session_state from scratch,
-# correctly stays logged out too) — this flag only prevents THIS SAME TAB,
-# THIS SAME SESSION from silently re-authenticating itself in the seconds
-# right after the click.
-st.session_state.setdefault("_explicitly_logged_out", False)
-
-
 def _set_session_cookie(token: str):
     """Sets the 'stay logged in' cookie in the browser. Caller is
     responsible for calling st.rerun() right after this (CookieManager
@@ -784,6 +758,56 @@ def _get_session_cookie():
         return cookie_manager.get(cookie=SESSION_COOKIE_NAME)
     except Exception:
         return None  # cookie component hasn't finished its first mount yet - fails safe (just asks to log in again)
+
+
+# BUG FIX (reported, still happening after the retry-loop fix above): logout
+# would show the login screen for a split second and then bounce straight
+# back to the dashboard on its own — with no button click in between.
+#
+# Root cause: st.rerun() does NOT reload the page in the browser. It's a
+# WebSocket-driven re-run of the Python script that patches the existing
+# page's DOM in place - the browser never makes a fresh HTTP request, so
+# nothing forces it to re-read its own cookies from scratch. Every part of
+# "is the cookie really gone yet" therefore had to go through
+# CookieManager's own component channel (a hidden iframe that talks back to
+# Python asynchronously) - and that channel has well-documented timing bugs
+# (see extra_streamlit_components' GitHub issues: stale getAll() results
+# right after a set/delete, "haven't heard back yet" ambiguity, etc). On a
+# real host's network latency this race can still lose even with the
+# retry-loop above: the cookie gets reported "gone" one run too early, the
+# restore-on-refresh check right below it re-reads the same still-not-
+# -yet-actually-deleted browser cookie, and logs the person straight back
+# in — exactly the "flashes login, then bounces back" symptom.
+#
+# Fix: stop trying to confirm the delete through that async component
+# channel at all. Delete the cookie two ways at once (belt-and-suspenders —
+# the CookieManager call, AND a direct `document.cookie = ...` write, which
+# takes effect in the browser immediately, synchronously, no round trip),
+# then force a REAL browser page reload (window.top.location.reload()) —
+# not st.rerun(). A real reload means the very next script run starts from
+# a brand-new HTTP request; whatever's actually in the browser's cookie jar
+# by then (already cleared, since the JS above ran first) is what gets
+# read. No async component answer to wait for or race against.
+def _hard_logout():
+    """Call this instead of _clear_session_cookie() + st.rerun() on every
+    Logout button. Never returns (the page reload replaces the current
+    script run)."""
+    try:
+        cookie_manager.delete(SESSION_COOKIE_NAME, key="del_session_cookie_hard")
+    except Exception:
+        pass
+    components.html(
+        f"""
+        <script>
+        document.cookie = "{SESSION_COOKIE_NAME}=; Max-Age=0; path=/; SameSite=Lax";
+        document.cookie = "{SESSION_COOKIE_NAME}=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; SameSite=Lax";
+        try {{ window.top.location.reload(); }} catch (e) {{ window.location.reload(); }}
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+    st.stop()
 
 
 def _detect_theme_mode():
@@ -1725,10 +1749,7 @@ if st.session_state.plan == "free" and st.session_state.role != auth.ROLE_ADMIN:
             st.session_state.workspace_id = None
             st.session_state.demo_trial_start = None
             st.session_state._session_token = None
-            st.session_state["_logging_out"] = True  # see the fix note near the top of this file for why
-            _clear_session_cookie()
-            _bump_cookie_nonce()  # force the next get_all() to be a fresh read, not a cached pre-logout one
-            st.rerun()
+            _hard_logout()  # clears the cookie + forces a real browser reload; never returns
         st.stop()
 
 if st.session_state.plan == "expired_standard" and st.session_state.role != auth.ROLE_ADMIN:
@@ -1752,10 +1773,7 @@ if st.session_state.plan == "expired_standard" and st.session_state.role != auth
         st.session_state.workspace_id = None
         st.session_state.demo_trial_start = None
         st.session_state._session_token = None
-        st.session_state["_logging_out"] = True  # see the fix note near the top of this file for why
-        _clear_session_cookie()
-        _bump_cookie_nonce()  # force the next get_all() to be a fresh read, not a cached pre-logout one
-        st.rerun()
+        _hard_logout()  # clears the cookie + forces a real browser reload; never returns
     st.stop()
 
 
@@ -2620,10 +2638,7 @@ with st.sidebar:
         st.session_state.active_slide_id = None
         st.session_state._active_slide_for_ws = None
         st.session_state._session_token = None
-        st.session_state["_logging_out"] = True  # see the fix note near the top of this file for why
-        _clear_session_cookie()
-        _bump_cookie_nonce()  # force the next get_all() to be a fresh read, not a cached pre-logout one
-        st.rerun()
+        _hard_logout()  # clears the cookie + forces a real browser reload; never returns
 
 
 # ==================================================================================
