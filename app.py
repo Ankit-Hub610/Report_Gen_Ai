@@ -4237,20 +4237,26 @@ elif page == "🤖 AI Assistant":
         if st.session_state.role == auth.ROLE_ADMIN:
             # Only the admin ever sees a way to type a key in the UI — clients/viewers
             # never see this box, never see the key, and can't set their own.
-            st.warning("No free OpenRouter API key configured yet.")
-            with st.expander("🆓 How to get a free key (2 minutes, no credit card)", expanded=True):
+            st.warning("No free AI key configured yet.")
+            with st.expander("🆓 How to get a free key (1-2 minutes, no credit card)", expanded=True):
                 st.markdown(
-                    "1. Go to **[openrouter.ai](https://openrouter.ai)** and sign up (free).\n"
-                    "2. Open **Keys** → **Create Key** → copy it (starts with `sk-or-v1-...`).\n"
+                    "**Recommended — Google Gemini** (more reliable, better answer quality):\n"
+                    "1. Go to **[aistudio.google.com](https://aistudio.google.com)** and sign in with any Google account.\n"
+                    "2. Click **Get API key** → **Create API key** → copy it (starts with `AIza...`).\n"
                     "3. Paste it below to test it now — kept only in this browser session, never saved to disk.\n\n"
+                    "*(Alternative: an [openrouter.ai](https://openrouter.ai) key, starting with `sk-or-v1-...`, "
+                    "also still works — paste it the same way below, it's auto-detected. OpenRouter's free tier "
+                    "auto-picks whatever free model happens to be live, so answer quality can vary more than "
+                    "Gemini's — Gemini is the better default now.)*\n\n"
                     "**To turn the chatbot on for every client permanently** (so they never see this screen "
-                    "or the key), set it once on the server as an environment variable `OPENROUTER_API_KEY`, or add "
-                    "it to `.streamlit/secrets.toml` — see README. Clients then just get a working chatbot, "
-                    "with no key ever shown or editable on their side.\n\n"
-                    "*(Switched from Groq to OpenRouter because Groq's free tier blocks requests from "
-                    "cloud-hosted servers like Streamlit Cloud — OpenRouter doesn't have that restriction.)*"
+                    "or the key), set it once on the server as an environment variable `GEMINI_API_KEY` "
+                    "(or `OPENROUTER_API_KEY`), or add it to `.streamlit/secrets.toml` — see README. Clients "
+                    "then just get a working chatbot, with no key ever shown or editable on their side.\n\n"
+                    "*(Groq isn't offered here because its free tier blocks requests from cloud-hosted "
+                    "servers like Streamlit Cloud.)*"
                 )
-            typed_key = st.text_input("OpenRouter API key (admin only, this session)", type="password", key="ai_key_input")
+            typed_key = st.text_input("API key — Gemini or OpenRouter (admin only, this session)",
+                                       type="password", key="ai_key_input")
             if st.button("Save key for this session", type="primary") and typed_key:
                 st.session_state.ai_groq_key = typed_key
                 st.rerun()
