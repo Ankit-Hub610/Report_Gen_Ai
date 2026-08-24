@@ -1846,11 +1846,13 @@ def _apply_loaded_df(df, source_name):
     st.session_state.meta = de.profile_columns(df)
     st.session_state.data_source_name = source_name + (f" {cap_note}" if cap_note else "")
     st.session_state.filters = {}
-    st.session_state.dashboard_charts = []
-    st.session_state.pinned_kpis = []
     st.session_state.dashboard_slicers = []
     st.session_state.data_source_is_db = False   # a fresh file/sample load — any previous DB link no longer applies
-    st.session_state.data_source_is_gsheet = False  # a fresh file/sample load — any previous Google Sheet link no longer applies
+    st.session_state.data_source_is_gsheet = False  # a fresh file/sample load — any previous Google Sheet load link no longer applies
+    # AUTO-BUILD: every fresh upload starts with a ready-made dashboard (KPI
+    # cards + charts picked from the data itself) instead of a blank one the
+    # client has to build by hand — see auto_build_dashboard()'s docstring.
+    auto_build_dashboard(df, st.session_state.meta)
     persist_workspace_now(force_full=True)  # BUG FIX: save immediately, don't rely on reaching the bottom of the
                                              # script — the Connect Data page's st.stop() prevents that (see
                                              # persist_workspace_now()'s docstring for the full story).
@@ -2243,7 +2245,7 @@ def kpi_cards(kpis, pinnable=False, key_prefix="", df=None, filterable=False, re
                     value = ms.format_value(raw, ms.NUMBER_FORMAT_PRESETS.get(fmt_choice, "auto"), custom_code)
                     if card_filters:
                         sub = f"{sub} · {len(fdf):,} rows after this card's filter"
-                    st.metric(label, value, help=sub)
+                    st.metric(label, value, delta=k.get("delta"), help=sub)
                     with st.popover("⚙️ Format & Filter", use_container_width=True):
                         st.caption("Number format — this card only")
                         new_fmt = st.selectbox("Format", format_labels,
@@ -2259,7 +2261,7 @@ def kpi_cards(kpis, pinnable=False, key_prefix="", df=None, filterable=False, re
                         new_filters = be.render_filter_builder(df, card_filters, key_prefix=f"{key_prefix}kpi_{label}_")
                         filter_store[label] = new_filters
                 else:
-                    st.metric(label, value, help=sub)
+                    st.metric(label, value, delta=k.get("delta"), help=sub)
                 if pinnable:
                     pinned = label in st.session_state.pinned_kpis
                     new_val = st.checkbox("⭐ pin to dashboard", value=pinned, key=f"{key_prefix}pin_{label}_{row_start}_{j}")
@@ -2296,6 +2298,74 @@ def remove_from_dashboard(family, variant_id):
         c for c in st.session_state.dashboard_charts
         if not (c["family"] == family and c["variant"]["id"] == variant_id)
     ]
+
+
+def auto_build_dashboard(df, meta):
+    """Auto-picks a sensible starter set of KPI cards + charts for a dataset
+    that has NO dashboard configured yet, so a brand-new slide/workspace opens
+    with a ready, working dashboard instead of a blank page the client has to
+    build by hand. Purely deterministic (pandas + the existing role-detection
+    in intel_engine/chart_engine) - no AI call, so it's instant and free.
+
+    Picks, when the relevant column exists:
+      KPIs  - Total Records, Total/Avg of the primary measure (with the
+              ▲/▼ trend delta from compute_kpis), Unique customer/product
+              count, and the Date Range card.
+      Charts - a Line trend of the primary measure over time ("past →
+              present"), a Bar of the primary measure by the best category
+              (leaderboard-style comparison), and, when there's enough date
+              history, a Comparison-family variant that includes the
+              regression-based forecast from intel_engine (the "future"
+              side) if chart_engine exposes one - otherwise the Line trend
+              alone still tells the past/present story.
+
+    Only ever called when both pinned_kpis and dashboard_charts are empty
+    (a genuinely fresh dashboard) OR explicitly via the "Rebuild suggested
+    dashboard" button - see call sites for the exact guard in each case.
+    """
+    roles = ie.detect_roles(df, meta)
+    all_kpis = de.compute_kpis(df, meta)
+    kpi_by_label = {k["label"]: k for k in all_kpis}
+
+    wanted_labels = ["Total Records"]
+    primary = meta.get("primary_measure")
+    if primary:
+        wanted_labels += [f"Total {primary}", f"Avg {primary}"]
+    for role_key in ("customer", "product"):
+        col = roles.get(role_key)
+        if col:
+            wanted_labels.append(f"Unique {col}")
+    if meta.get("primary_date"):
+        wanted_labels.append("Date Range")
+    growth_label = next((lbl for lbl in kpi_by_label if lbl.startswith(f"{primary} Growth")), None) if primary else None
+    if growth_label:
+        wanted_labels.append(growth_label)
+
+    st.session_state.pinned_kpis = [lbl for lbl in wanted_labels if lbl in kpi_by_label][:6]
+
+    new_charts = []
+    if meta.get("primary_date") and primary:
+        line_variants = ce.generate_variants(df, meta, "Line")
+        best_line = next((v for v in line_variants if v.get("measure") == primary), line_variants[0] if line_variants else None)
+        if best_line:
+            new_charts.append({"family": "Line", "variant": copy.deepcopy(best_line)})
+
+    best_dim = roles.get("product") or roles.get("location") or roles.get("channel") or \
+        (meta["categorical_cols"][0] if meta["categorical_cols"] else None)
+    if best_dim and primary:
+        bar_variants = ce.generate_variants(df, meta, "Bar")
+        best_bar = next((v for v in bar_variants if v.get("dim") == best_dim and v.get("measure") == primary), None)
+        if best_bar:
+            new_charts.append({"family": "Bar", "variant": copy.deepcopy(best_bar)})
+
+    if roles.get("location") or roles.get("channel"):
+        pie_dim = roles.get("channel") or roles.get("location")
+        pie_variants = ce.generate_variants(df, meta, "Pie")
+        best_pie = next((v for v in pie_variants if v.get("dim") == pie_dim), pie_variants[0] if pie_variants else None)
+        if best_pie:
+            new_charts.append({"family": "Pie", "variant": copy.deepcopy(best_pie)})
+
+    st.session_state.dashboard_charts = new_charts
 
 
 def _safe_index(options, value, fallback=0):
