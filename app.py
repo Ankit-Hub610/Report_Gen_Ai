@@ -5126,7 +5126,7 @@ elif page == "⚙️ Settings":
         # exists - belongs here. That description lives ONLY inside the
         # Admin Panel page itself, gated to role == admin. Keep it that way.
         st.markdown("""
-**Sports Analytics Platform** turns any spreadsheet-shaped file into a boardroom-ready
+**RA_I Analytics Platform** turns any spreadsheet-shaped file into a boardroom-ready
 report, without you writing a single formula.
 
 **📊 Raw Analysis (Page 1)**
