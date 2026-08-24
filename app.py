@@ -4260,95 +4260,161 @@ elif page == "🤖 AI Assistant":
 
     kpis = de.compute_kpis(df_raw, meta)
     _ai_remaining_top = ul.remaining(st.session_state.workspace_id, st.session_state.plan, "ai_calls")
-    if _ai_remaining_top is not None:
-        st.caption(f"🆓 Free plan: {_ai_remaining_top} AI request(s) left today.")
 
-    for _turn_i, turn in enumerate(st.session_state.ai_chat_history):
-        with st.chat_message(turn["role"]):
-            st.markdown(turn["content"])
+    # ------------------------------------------------------------------------
+    # REDESIGNED CHAT UI (reported: old UI looked unprofessional, and the
+    # input box's position visibly jumped up/down as the conversation grew).
+    #
+    # Root cause of the jumping box: it was a plain st.container() sitting in
+    # normal page flow, right after the message list — so its on-screen
+    # position depended on how much chat history was above it. st.chat_input()
+    # is Streamlit's purpose-built chat input: it's ALWAYS rendered pinned to
+    # the bottom of the viewport by Streamlit itself, regardless of how much
+    # content is above it — so this alone fixes the jumping-box complaint
+    # structurally, not just cosmetically.
+    #
+    # Message bubbles are hand-built with our own HTML/CSS (instead of
+    # relying on st.chat_message()'s default avatar+bubble styling) so we get
+    # full, version-independent control over the look: user turns as a
+    # right-aligned rounded bubble, assistant turns as plain left-aligned
+    # text with no avatar/background — matching a clean, modern chat
+    # reference (e.g. ChatGPT) instead of the boxy grey/orange bubbles with
+    # circular avatar icons from before.
+    # ------------------------------------------------------------------------
+    st.markdown("""
+        <style>
+        .ai-chat-row { display: flex; margin: 4px 0 18px 0; }
+        .ai-chat-row.user { justify-content: flex-end; }
+        .ai-chat-row.assistant { justify-content: flex-start; }
+        .ai-bubble-user {
+            background: var(--primary-color, #FF4B4B); color: #fff;
+            padding: 10px 16px; border-radius: 18px 18px 4px 18px;
+            max-width: 70%; white-space: pre-wrap; word-wrap: break-word;
+            font-size: 0.95rem; line-height: 1.5;
+        }
+        .ai-bubble-assistant {
+            max-width: 85%; white-space: pre-wrap; word-wrap: break-word;
+            font-size: 0.95rem; line-height: 1.6; padding-top: 2px;
+        }
+        /* Segmented mode toggle: two plain buttons styled as one pill,
+           active side filled, inactive side ghost — replaces the default
+           radio's visible circle dot, which looked cheap/unpolished. */
+        div.st-key-ai_mode_row div[data-testid="stHorizontalBlock"] {
+            gap: 0 !important; width: fit-content; border: 1px solid rgba(128,128,128,0.35);
+            border-radius: 999px; padding: 3px; margin-bottom: 10px;
+        }
+        div.st-key-ai_mode_row button {
+            border-radius: 999px !important; border: none !important; box-shadow: none !important;
+        }
+        div.st-key-ai_mode_row div[data-testid="stHorizontalBlock"] > div:has(button[kind="secondary"]) button {
+            background: transparent !important;
+        }
+        /* Small ghost icon-buttons under each assistant reply (Copy / Regenerate).
+           Container keys are dynamic per-turn (ai_msg_actions_0, _1, ...), so
+           match on a class-name substring instead of one exact st-key-X class. */
+        div[class*="st-key-ai_msg_actions_"] button {
+            border: none !important; background: transparent !important; box-shadow: none !important;
+            color: rgba(128,128,128,0.9) !important; padding: 2px 8px !important;
+            font-size: 0.8rem !important; min-height: 0 !important;
+        }
+        div[class*="st-key-ai_msg_actions_"] button:hover { color: var(--primary-color, #FF4B4B) !important; }
+        </style>
+    """, unsafe_allow_html=True)
+
+    import html as _html_mod
+
+    def _render_bubble(role: str, content: str):
+        css_class = "ai-bubble-user" if role == "user" else "ai-bubble-assistant"
+        st.markdown(
+            f'<div class="ai-chat-row {role}"><div class="{css_class}">'
+            f'{_html_mod.escape(content)}</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    chat_scope = st.container()
+    with chat_scope:
+        for _turn_i, turn in enumerate(st.session_state.ai_chat_history):
+            _render_bubble(turn["role"], turn["content"])
             if turn.get("proof_df") is not None:
                 with st.expander("🔍 Proof (SQL + data used)"):
                     st.code(turn["sql_used"], language="sql")
                     st.dataframe(turn["proof_df"], use_container_width=True)
+            # Copy / Regenerate row under each assistant reply — Regenerate only
+            # makes sense on the LAST assistant turn (re-asks that same last
+            # question); Copy works the same for any of them.
+            if turn["role"] == "assistant":
+                is_last = (_turn_i == len(st.session_state.ai_chat_history) - 1)
+                with st.container(key=f"ai_msg_actions_{_turn_i}"):
+                    act_cols = st.columns([1, 1, 10]) if is_last else st.columns([1, 11])
+                    _copy_js = turn["content"].replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
+                    with act_cols[0]:
+                        if st.button("📋", key=f"ai_copy_{_turn_i}", help="Copy"):
+                            st.components.v1.html(
+                                f"<script>navigator.clipboard.writeText(`{_copy_js}`);"
+                                f"try{{window.top.navigator.clipboard.writeText(`{_copy_js}`);}}catch(e){{}}</script>",
+                                height=0)
+                    if is_last:
+                        with act_cols[1]:
+                            if st.button("🔄", key=f"ai_regen_{_turn_i}", help="Regenerate"):
+                                st.session_state["_ai_regenerate"] = True
+                                st.rerun()
 
-    # One unified pill-shaped input box (Claude-style) — text field + send
-    # button live inside ONE bordered/rounded container. Scoped CSS below
-    # strips the individual text-input/button borders so only the outer
-    # container's border shows, making it read as a single clean box.
-    st.session_state.setdefault("ai_page_draft", "")
+    if _ai_remaining_top is not None:
+        st.caption(f"🆓 Free plan: {_ai_remaining_top} AI request(s) left today.")
+
+    # Two-button segmented mode toggle — see CSS above for the pill styling.
     st.session_state.setdefault("ai_page_mode", "💬 Poocho")
-    st.markdown("""
-        <style>
-        div[data-testid="stVerticalBlockBorderWrapper"]:has(div.st-key-ai_unified_input) {
-            border-radius: 26px !important; padding: 6px 10px !important;
-        }
-        div.st-key-ai_unified_input div[data-testid="stTextInput"] > div {
-            border: none !important; background: transparent !important; box-shadow: none !important;
-        }
-        div.st-key-ai_unified_input div[data-testid="stTextInput"] input {
-            background: transparent !important;
-        }
-        div.st-key-ai_unified_input button {
-            border-radius: 50% !important; height: 2.4rem !important; width: 2.4rem !important;
-        }
-        </style>
-    """, unsafe_allow_html=True)
-
-    # ONE visual box, TWO modes via a small pill toggle above it — merging the
-    # actual behaviour into a single input would mean the AI has to GUESS
-    # whether you're asking a question or asking it to build something new;
-    # this keeps the box identical either way and just switches what it does
-    # with what you type, which is clearer than one input doing two things.
     _ai_modes = ["💬 Poocho", "🪄 Card/Chart banao"] if can_edit() else ["💬 Poocho"]
     if st.session_state.ai_page_mode not in _ai_modes:
         st.session_state.ai_page_mode = _ai_modes[0]
-    st.session_state.ai_page_mode = st.radio("Mode", _ai_modes, key="ai_page_mode_radio",
-                                              index=_ai_modes.index(st.session_state.ai_page_mode),
-                                              horizontal=True, label_visibility="collapsed")
+    with st.container(key="ai_mode_row"):
+        _mode_cols = st.columns(len(_ai_modes))
+        for _mi, _m in enumerate(_ai_modes):
+            with _mode_cols[_mi]:
+                _is_active = st.session_state.ai_page_mode == _m
+                if st.button(_m, key=f"ai_mode_btn_{_mi}",
+                             type="primary" if _is_active else "secondary",
+                             use_container_width=True):
+                    st.session_state.ai_page_mode = _m
+                    st.rerun()
     _ask_mode = st.session_state.ai_page_mode == "💬 Poocho"
     _placeholder = "Ask anything about your data..." if _ask_mode else 'e.g. "monthly revenue trend" or "top clients by total paid"'
 
-    with st.container(key="ai_unified_input", border=True):
-        text_col, send_col = st.columns([9, 1], vertical_alignment="center")
-        with text_col:
-            st.session_state.ai_page_draft = st.text_input(
-                "Ask", value=st.session_state.ai_page_draft, key="ai_page_draft_box",
-                placeholder=_placeholder, label_visibility="collapsed")
-        with send_col:
-            _icon = "🚀" if _ask_mode else "✨"
-            _send_clicked = st.button(_icon, key="ai_page_send_btn", type="primary", use_container_width=True,
-                                      disabled=not st.session_state.ai_page_draft.strip(),
-                                      help="Send" if _ask_mode else "Generate")
+    # st.chat_input() is ALWAYS pinned to the bottom of the viewport by
+    # Streamlit itself — this is what actually fixes the reported "box
+    # jumps up/down" behaviour, not just a CSS tweak.
+    _typed = st.chat_input(_placeholder, key="ai_page_chat_input")
+    _regenerating = st.session_state.pop("_ai_regenerate", False)
+    if _regenerating and st.session_state.ai_chat_history:
+        # Re-ask the last user question; drop the stale assistant reply
+        # being replaced (and its own history entry) before asking again.
+        _last_user_q = next((t["content"] for t in reversed(st.session_state.ai_chat_history)
+                              if t["role"] == "user"), None)
+        if st.session_state.ai_chat_history and st.session_state.ai_chat_history[-1]["role"] == "assistant":
+            st.session_state.ai_chat_history.pop()
+        _typed = _last_user_q
+        _ask_mode = True
 
-    question = st.session_state.ai_page_draft.strip() if (_send_clicked and _ask_mode) else None
-    ai_req = st.session_state.ai_page_draft.strip() if (_send_clicked and not _ask_mode) else None
-    if _send_clicked:
-        st.session_state.ai_page_draft = ""
+    question = _typed if (_typed and _ask_mode) else None
+    ai_req = _typed if (_typed and not _ask_mode) else None
     if question:
         st.session_state.ai_chat_history.append({"role": "user", "content": question, "ts": time.time()})
-        with st.chat_message("user"):
-            st.markdown(question)
-        with st.chat_message("assistant"):
-            ai_ok, ai_limit_msg = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "ai_calls")
-            if not ai_ok:
-                st.error(f"🚫 {ai_limit_msg}")
-                st.stop()
-            with st.spinner("Analysing your data..."):
-                result = ac.ask(question, df_raw, meta, kpis, st.session_state.dashboard_charts,
-                                 api_key, history=st.session_state.ai_chat_history[:-1])
-            if result["error"]:
-                st.error(result["error"])
-            else:
-                st.markdown(result["answer"])
-                if result["proof_df"] is not None:
-                    with st.expander("🔍 Proof (SQL + data used)"):
-                        st.code(result["sql_used"], language="sql")
-                        st.dataframe(result["proof_df"], use_container_width=True)
-                st.session_state.ai_chat_history.append({
-                    "role": "assistant", "content": result["answer"],
-                    "sql_used": result["sql_used"], "proof_df": result["proof_df"], "ts": time.time(),
-                })
+        ai_ok, ai_limit_msg = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "ai_calls")
+        if not ai_ok:
+            st.error(f"🚫 {ai_limit_msg}")
+            st.stop()
+        with st.spinner("Analysing..."):
+            result = ac.ask(question, df_raw, meta, kpis, st.session_state.dashboard_charts,
+                             api_key, history=st.session_state.ai_chat_history[:-1])
+        if result["error"]:
+            st.error(result["error"])
+        else:
+            st.session_state.ai_chat_history.append({
+                "role": "assistant", "content": result["answer"],
+                "sql_used": result["sql_used"], "proof_df": result["proof_df"], "ts": time.time(),
+            })
         ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
+        st.rerun()
 
     if st.session_state.ai_chat_history and st.button("🗑️ Clear chat"):
         st.session_state.ai_chat_history = []
