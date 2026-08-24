@@ -6,7 +6,7 @@ Pillow  # explicit — used to resize/recompress branding images (logo, login wa
         # reliably via GitHub (see app.py: _resize_for_branding). Streamlit already
         # depends on Pillow transitively, but pinning it here is more robust than
         # relying on that indirect dependency staying true forever.
-extra-streamlit-components  # CookieManager — real browser cookie for "stay logged in
+extra-streamlit-components>=0.1.60  # PINNED (min version) — CookieManager: real browser cookie for "stay logged in
                              # on refresh" (see app.py: _set_session_cookie /
                              # _get_session_cookie). Replaced an earlier hand-rolled
                              # components.html(<script>document.cookie=...) version
