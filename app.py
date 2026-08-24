@@ -675,6 +675,42 @@ def _get_cookie_manager():
 # path below and by the refresh-restore check further down this file.
 cookie_manager = _get_cookie_manager()
 
+# BUG FIX (reported): "Logout karta hu but login firse ho jata he" — this
+# was STILL happening even after the retry-confirm logic below was added,
+# because cookie_manager.get_all() caches its return value by element key.
+# Every call below used a FIXED key ("get_all_logout_check", or no key at
+# all = a fixed default), so on a rerun Streamlit saw "same key as last
+# time" and handed back the value it already had cached — NOT a fresh
+# round trip to the browser to actually re-read document.cookie. So even
+# though _clear_session_cookie() really did delete the cookie, every
+# get_all() call kept reporting the OLD "cookie present" answer from
+# before the delete (cached from this same tab's very first page load),
+# retries exhausted, and the normal restore-on-refresh check right below
+# saw that same stale "present" answer and logged the person straight
+# back in.
+#
+# Fix: fold a nonce into every get_all() key so a call after an explicit
+# cookie mutation is treated as a brand-new element (forcing a genuine
+# fresh browser read) instead of reusing a stale cached one.
+#
+# IMPORTANT: this nonce must NOT change on every single rerun — the
+# component's own "haven't heard back yet -> None -> st.stop() -> answer
+# arrives -> Streamlit auto-reruns" cycle needs the SAME key across that
+# wait, or the in-flight answer can never be delivered (a naive "bump on
+# every rerun" version of this fix would just get stuck in that cycle
+# forever). So the nonce only advances at the specific moments code below
+# just mutated the cookie and deliberately wants a fresh read next time -
+# see _bump_cookie_nonce() below.
+st.session_state.setdefault("_cookie_nonce", 0)
+
+
+def _bump_cookie_nonce():
+    st.session_state["_cookie_nonce"] += 1
+
+
+def _cookie_key(label: str) -> str:
+    return f"{label}_{st.session_state['_cookie_nonce']}"
+
 
 def _set_session_cookie(token: str):
     """Sets the 'stay logged in' cookie in the browser. Caller is
@@ -1411,11 +1447,11 @@ if _reset_token and not st.session_state.authenticated:
 # stuck browser can't trap someone on a blank screen forever) after several
 # attempts.
 if st.session_state.get("_logging_out"):
-    # NOTE: explicit unique key — cookie_manager.get_all() is also called
-    # further below (login-restore block) with its own default key on this
-    # SAME script run once _logging_out clears; two get_all() calls with the
-    # same default key in one run raises StreamlitDuplicateElementKey.
-    _lo_cookies = cookie_manager.get_all(key="get_all_logout_check")
+    # NOTE: key uses the nonce (stable while waiting for the component's
+    # answer, bumped only right after we mutate the cookie again below) so
+    # this genuinely re-reads the browser instead of returning a stale
+    # cached "cookie still present" answer from before it was deleted.
+    _lo_cookies = cookie_manager.get_all(key=_cookie_key("get_all_logout_check"))
     if _lo_cookies is None:
         st.info("Logging out…")
         st.stop()
@@ -1424,6 +1460,7 @@ if st.session_state.get("_logging_out"):
         if _lo_retries < 5:
             st.session_state["_logout_retry_count"] = _lo_retries + 1
             _clear_session_cookie()
+            _bump_cookie_nonce()  # force the NEXT get_all() to be a fresh read, not this same cached one
             st.info("Logging out…")
             st.rerun()
         # Retries exhausted (very unusual — e.g. browser blocking cookie
@@ -1450,7 +1487,14 @@ if st.session_state.get("_logging_out"):
 # automatic rerun CookieManager triggers once it has the real answer -
 # don't conclude "not logged in" from an answer that hasn't arrived yet.
 if not st.session_state.authenticated:
-    _all_cookies = cookie_manager.get_all()
+    # NOTE: key uses the nonce for the same reason as the logout-retry call
+    # above — a fixed/default key here was the other half of why logout
+    # silently failed: this call could keep reporting a cached "cookie
+    # present" answer from before an explicit logout deleted it, which
+    # logged the person straight back in on the very next check. The nonce
+    # stays stable across the ordinary "haven't heard back yet" wait, and
+    # only advances right after code above has actually mutated the cookie.
+    _all_cookies = cookie_manager.get_all(key=_cookie_key("get_all_restore"))
     if _all_cookies is None:
         st.info("Restoring your session…")
         st.stop()
@@ -1656,6 +1700,7 @@ if st.session_state.plan == "free" and st.session_state.role != auth.ROLE_ADMIN:
             st.session_state._session_token = None
             st.session_state["_logging_out"] = True  # see the fix note near the top of this file for why
             _clear_session_cookie()
+            _bump_cookie_nonce()  # force the next get_all() to be a fresh read, not a cached pre-logout one
             st.rerun()
         st.stop()
 
@@ -1682,6 +1727,7 @@ if st.session_state.plan == "expired_standard" and st.session_state.role != auth
         st.session_state._session_token = None
         st.session_state["_logging_out"] = True  # see the fix note near the top of this file for why
         _clear_session_cookie()
+        _bump_cookie_nonce()  # force the next get_all() to be a fresh read, not a cached pre-logout one
         st.rerun()
     st.stop()
 
@@ -2549,6 +2595,7 @@ with st.sidebar:
         st.session_state._session_token = None
         st.session_state["_logging_out"] = True  # see the fix note near the top of this file for why
         _clear_session_cookie()
+        _bump_cookie_nonce()  # force the next get_all() to be a fresh read, not a cached pre-logout one
         st.rerun()
 
 
