@@ -1,7 +1,7 @@
 """
 app.py
 ------
-SPORTS ANALYTICS PLATFORM
+RA-I ANALYTICS PLATFORM
 A password-protected, self-contained BI tool that works on ANY tabular
 dataset (CSV / XLSX / JSON / PDF). No column names are hard-coded anywhere -
 everything (KPIs, chart variants, filters) is auto-derived from whatever
