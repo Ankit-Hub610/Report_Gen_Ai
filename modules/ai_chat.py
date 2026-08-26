@@ -4,7 +4,7 @@ ai_chat.py
 Free, natural-language "Chat with your Data" assistant.
 
 TWO free providers are supported, auto-detected from the key's shape:
-  - Google Gemini (key starts with "AIza...") — PRIMARY/recommended. A fixed,
+  - Google Gemini (key starts with "AIza..." or the newer "AQ....") — PRIMARY/recommended. A fixed,
     genuinely strong general-purpose model (gemini-2.0-flash) with a
     generous free tier, no card required. Being a fixed model (not an
     auto-router that swaps between whatever's free that week) is what makes
@@ -51,7 +51,7 @@ loaded — see app.py's "🤖 AI Assistant" page.
 
 SETUP (one-time, free):
   1. Go to https://aistudio.google.com -> sign in with any Google account ->
-     Get API key -> Create API key -> copy it (starts with "AIza...").
+     Get API key -> Create API key -> copy it (starts with "AIza..." or "AQ....").
      (Alternative: https://openrouter.ai -> Keys -> Create key, starts with
      "sk-or-v1-...".)
   2. Either:
@@ -85,10 +85,12 @@ class ChatError(Exception):
 
 def detect_provider(api_key: str) -> str:
     """Keys need no manual provider dropdown — the shape says which service
-    they're for: Gemini keys always start with 'AIza', OpenRouter keys
-    always start with 'sk-or-'. Defaults to 'openrouter' for anything else
-    typed in (safest guess for a key of unrecognised shape)."""
-    if api_key and api_key.startswith("AIza"):
+    they're for: Gemini keys start with 'AIza' (legacy format) or 'AQ.'
+    (Google's newer "Auth Key" format, rolled out through 2026 — same
+    Gemini API, just a different-looking key). OpenRouter keys always
+    start with 'sk-or-'. Defaults to 'openrouter' for anything else typed
+    in (safest guess for a key of unrecognised shape)."""
+    if api_key and (api_key.startswith("AIza") or api_key.startswith("AQ.")):
         return "gemini"
     return "openrouter"
 
