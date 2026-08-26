@@ -3,22 +3,25 @@ ai_chat.py
 ----------
 Free, natural-language "Chat with your Data" assistant.
 
-Uses OpenRouter (https://openrouter.ai) which has a genuinely free tier —
-no credit card required — and an OpenAI-compatible endpoint, so this talks
-to it with plain `requests`, no extra SDK needed.
+TWO free providers are supported, auto-detected from the key's shape:
+  - Google Gemini (key starts with "AIza...") — PRIMARY/recommended. A fixed,
+    genuinely strong general-purpose model (gemini-2.0-flash) with a
+    generous free tier, no card required. Being a fixed model (not an
+    auto-router that swaps between whatever's free that week) is what makes
+    its answers consistent — this is what fixed the reported "general
+    questions get different/wrong answers every time" complaint, which was
+    traced to OpenRouter's free auto-router silently landing on a different,
+    often much weaker, model from one call to the next.
+  - OpenRouter (key starts with "sk-or-..." or set via OPENROUTER_API_KEY) —
+    kept as a fallback/alternative for anyone who already has that key, or
+    if Gemini's free tier is ever rate-limited. Uses the model id
+    "openrouter/free", OpenRouter's own auto-router.
 
-NOTE (why OpenRouter and not Groq): Groq's free API blocks requests coming
-from datacenter/cloud-hosted IPs (its own anti-abuse policy) — so it works
-when you run the app on your own laptop, but fails with a 403
-"Access denied. Please check your network settings." the moment the app is
-deployed to Streamlit Community Cloud, Render, or any other cloud host.
-OpenRouter does not have that restriction, so this works the same whether
-you run locally or deployed.
-
-We use the model id "openrouter/free" — OpenRouter's own auto-router that
-picks a currently-available free model that supports tool calling. Free
-model line-ups on OpenRouter rotate every few weeks, so pinning one exact
-free model name tends to break later; the auto-router avoids that.
+NOTE (why not Groq): Groq's free API blocks requests coming from
+datacenter/cloud-hosted IPs (its own anti-abuse policy) — so it works when
+you run the app on your own laptop, but fails with a 403 the moment the app
+is deployed to Streamlit Community Cloud, Render, or any other cloud host.
+Neither Gemini nor OpenRouter has that restriction.
 
 HOW IT ANSWERS ACCURATELY (not just guessing from memory):
 The model is given a "run_sql" tool. For anything that needs real numbers
@@ -30,11 +33,31 @@ the model so its final answer is grounded in the real data instead of
 hallucinated. The SQL + result table are also returned so the UI can show
 them as "proof" under the chat answer.
 
+PAST / PRESENT / FUTURE, all in one place:
+The system prompt now includes, whenever a dataset is loaded: the raw
+dataset shape (for "past" queries via run_sql), the CURRENT KPI cards
+(present state, including the month-over-month trend delta), and the
+pre-computed regression forecast from intel_engine.compute_forecast() for
+the next few periods (future) — all real, pre-calculated numbers, not the
+model's own guess, so "what will happen next" answers are grounded exactly
+like "what happened before" ones.
+
+WORKS WITHOUT ANY DATA LOADED, TOO:
+When no dataset is loaded yet, the assistant still answers general
+questions (like a normal AI chat) — it just skips the dataset/KPI/forecast
+sections of the prompt and doesn't offer the run_sql tool, since there's no
+table to query. The AI Assistant page no longer hard-stops until data is
+loaded — see app.py's "🤖 AI Assistant" page.
+
 SETUP (one-time, free):
-  1. Go to https://openrouter.ai -> sign up (free, no card) -> Keys -> Create key.
+  1. Go to https://aistudio.google.com -> sign in with any Google account ->
+     Get API key -> Create API key -> copy it (starts with "AIza...").
+     (Alternative: https://openrouter.ai -> Keys -> Create key, starts with
+     "sk-or-v1-...".)
   2. Either:
-       a) set environment variable OPENROUTER_API_KEY before running streamlit, OR
-       b) create .streamlit/secrets.toml with:  OPENROUTER_API_KEY = "sk-or-v1-..."
+       a) set environment variable GEMINI_API_KEY (or OPENROUTER_API_KEY)
+          before running streamlit, OR
+       b) create .streamlit/secrets.toml with:  GEMINI_API_KEY = "AIza..."
      If neither is set, only an admin login will see a place to paste the key
      for that session (kept only in memory, never written to disk) — regular
      client/viewer logins never see a key field at all.
@@ -50,6 +73,8 @@ from modules import query_engine as qe
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "openrouter/free"   # auto-router: picks a live free, tool-capable model
+GEMINI_MODEL = "gemini-2.0-flash"      # fixed model — see module docstring for why that matters
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 MAX_TOOL_ROUNDS = 3
 MAX_ROWS_TO_MODEL = 40   # cap how many result rows get sent back into the prompt (keeps cost/latency low)
 
@@ -58,15 +83,27 @@ class ChatError(Exception):
     pass
 
 
+def detect_provider(api_key: str) -> str:
+    """Keys need no manual provider dropdown — the shape says which service
+    they're for: Gemini keys always start with 'AIza', OpenRouter keys
+    always start with 'sk-or-'. Defaults to 'openrouter' for anything else
+    typed in (safest guess for a key of unrecognised shape)."""
+    if api_key and api_key.startswith("AIza"):
+        return "gemini"
+    return "openrouter"
+
+
 def get_api_key():
     """Looks for a key the admin already configured (env var or Streamlit
-    secrets) before falling back to whatever the admin typed into the UI
-    this session."""
-    key = os.environ.get("OPENROUTER_API_KEY")
+    secrets — Gemini checked first, it's the recommended default) before
+    falling back to whatever the admin typed into the UI this session."""
+    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
     if key:
         return key
     try:
         import streamlit as st
+        if "GEMINI_API_KEY" in st.secrets:
+            return st.secrets["GEMINI_API_KEY"]
         if "OPENROUTER_API_KEY" in st.secrets:
             return st.secrets["OPENROUTER_API_KEY"]
     except Exception:
@@ -88,7 +125,13 @@ def _dataset_summary(df: pd.DataFrame, meta: dict) -> str:
 def _kpi_summary(kpis: list) -> str:
     if not kpis:
         return "(no KPIs computed yet)"
-    return "\n".join(f"  - {k['label']}: {k['value']} ({k.get('sub','')})" for k in kpis)
+    lines = []
+    for k in kpis:
+        line = f"  - {k['label']}: {k['value']} ({k.get('sub','')})"
+        if k.get("delta"):
+            line += f" — trend: {k['delta']}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _dashboard_summary(dashboard_charts: list) -> str:
@@ -101,27 +144,80 @@ def _dashboard_summary(dashboard_charts: list) -> str:
     return "\n".join(out)
 
 
-def _system_prompt(df, meta, kpis, dashboard_charts):
+def _forecast_summary(forecast: dict) -> str:
+    """Formats intel_engine.compute_forecast()'s output for the prompt — the
+    "future" side of past/present/future. Always real numbers from an actual
+    regression, never the model's own guess (see module docstring)."""
+    if not forecast or not forecast.get("available"):
+        reason = (forecast or {}).get("reason", "Not enough date/revenue history to forecast yet.")
+        return f"(no forecast available — {reason})"
+    lines = [f"Method: {forecast['method']} (R² = {forecast['r2']}, confidence: {forecast['confidence']}, "
+             f"overall direction: {forecast['direction']})"]
+    for p, v in zip(forecast["forecast_periods"], forecast["forecast_values"]):
+        lines.append(f"  - {p} (projected): {v:,.2f}")
+    return "\n".join(lines)
+
+
+def _trend_summary(trend: dict) -> str:
+    """Formats intel_engine.compute_trend_growth()'s output — the "past"
+    story behind the present KPI numbers (best/worst month, overall % change,
+    CAGR), all pre-computed, real."""
+    if not trend or not trend.get("available"):
+        reason = (trend or {}).get("reason", "Not enough month-over-month history yet.")
+        return f"(no trend history available — {reason})"
+    lines = [f"Best month: {trend['best_period']} ({trend['best_period_value']:,.2f}), "
+             f"Worst month: {trend['worst_period']} ({trend['worst_period_value']:,.2f})",
+             f"Overall change (first month → last month): {trend.get('overall_change_pct')}%"]
+    if trend.get("cagr_pct") is not None:
+        lines.append(f"CAGR: {trend['cagr_pct']}%")
+    return "\n".join(lines)
+
+
+def _system_prompt(df, meta, kpis, dashboard_charts, trend=None, forecast=None):
+    has_data = df is not None
+    if not has_data:
+        return """You are a helpful, general-purpose AI assistant embedded in a BI dashboard app.
+No dataset is loaded in this session right now, so just answer the user's question directly and
+helpfully from your own knowledge — general knowledge, explanations, advice, definitions, how-to
+help, casual conversation, sports/news/trivia, writing help, math, coding help, translations, etc.
+— exactly like a normal general-purpose AI assistant (e.g. ChatGPT) would.
+
+If the user asks something that clearly needs THEIR OWN business data (e.g. "what was my revenue
+last month"), gently let them know you don't see any dataset loaded yet and they can load one on
+the 📥 Connect Data page — then answer whatever you still reasonably can in general terms.
+
+Reply in clear, simple language (Hindi/English mix is fine if the user writes that way). Keep
+answers concise — a short paragraph or a few bullet points, not an essay."""
+
     return f"""You are a helpful AI assistant embedded in a BI dashboard app. You can do TWO kinds
 of things, and you should figure out which one a question needs:
 
-1. QUESTIONS ABOUT THE USER'S OWN LOADED DATASET (their business data, KPIs, charts) — for
-   these, you MUST ground every number in a real run_sql result. Never guess or make up numbers
-   for the user's data.
+1. QUESTIONS ABOUT THE USER'S OWN LOADED DATASET (their business data, KPIs, charts, trend history,
+   or forecast) — for these, ground every number either in the PRE-COMPUTED PAST TREND / FUTURE
+   FORECAST facts given to you below, or, for anything not already covered there, in a real
+   run_sql result. Never guess or make up numbers for the user's data.
 2. ANYTHING ELSE — general knowledge, explanations, advice, definitions, how-to help, casual
    conversation, sports/news/trivia, writing help, math, coding help, translations, etc. — answer
    these directly and helpfully from your own knowledge, exactly like a normal general-purpose AI
    assistant (e.g. ChatGPT) would. Do NOT refuse or deflect a question just because it isn't about
-   the loaded dataset — only the DATASET-related numbers need the run_sql grounding rule above;
-   your general knowledge answers don't need a tool call at all.
+   the loaded dataset — only the DATASET-related numbers need grounding; your general knowledge
+   answers don't need a tool call at all.
 
 Reply in clear, simple language (Hindi/English mix is fine if the user writes that way).
 
-DATASET
+DATASET (use run_sql for anything specific/historical not already summarised below — this is your
+"PAST" source of truth: individual records, custom date ranges, breakdowns, etc.)
 {_dataset_summary(df, meta)}
 
-CURRENT KPI CARDS ON THE DASHBOARD
+PRESENT — CURRENT KPI CARDS ON THE DASHBOARD (includes month-over-month trend where available)
 {_kpi_summary(kpis)}
+
+PAST — TREND HISTORY (pre-computed, real — best/worst month, overall change, CAGR)
+{_trend_summary(trend)}
+
+FUTURE — FORECAST (pre-computed via linear regression on monthly history — ALWAYS label this as a
+projection, never state it as a certainty, and mention the confidence level given)
+{_forecast_summary(forecast)}
 
 CHARTS ALREADY PINNED TO THE BOSS DASHBOARD
 {_dashboard_summary(dashboard_charts)}
@@ -129,17 +225,19 @@ CHARTS ALREADY PINNED TO THE BOSS DASHBOARD
 TOOL AVAILABLE: run_sql(query)
 - Runs a single read-only SQL SELECT (DuckDB syntax) against the table `{qe.DEFAULT_TABLE_NAME}` and
   returns the result rows.
-- Use it ONLY when the question is actually about the user's loaded dataset and needs an actual
-  number, record, trend, or comparison from it —
+- Use it for anything specific about the user's loaded dataset that ISN'T already answered by the
+  PRESENT/PAST/FUTURE sections above — e.g. "which record is number 5", a custom date range, a
+  breakdown by a specific column, etc.
   e.g. "which record is number 5" -> SELECT * FROM {qe.DEFAULT_TABLE_NAME} LIMIT 1 OFFSET 4;
-  "last 3 months trend" -> GROUP BY month on the date column, filtered to the last 3 months.
 - For anything NOT about this dataset, don't call this tool at all — just answer normally.
 - Only SELECT/WITH is allowed. No INSERT/UPDATE/DELETE/DDL.
 - You may call it more than once if the first query needs refining.
 
 WHEN YOU ANSWER A DATASET QUESTION
-- Ground every number in a run_sql result — don't estimate.
+- Ground every number in the facts given above, or a run_sql result — don't estimate.
 - Explain the finding in plain language first, then the supporting number(s).
+- A "what's happening / what happened / what's coming next" style question should draw on
+  PRESENT + PAST + FUTURE together where relevant, not just one of them.
 - When it's useful, suggest which chart type would visualise this well and which columns to put
   on which axis (e.g. "a Line chart with {meta.get('primary_date','the date column')} on X and
   the totals on Y would show this trend clearly").
@@ -165,6 +263,22 @@ TOOLS = [{
             "required": ["query"],
         },
     },
+}]
+
+# Same tool, expressed in Gemini's function-declaration shape (no "type": "function" wrapper,
+# and no JSON-Schema $-prefixed keys beyond what Gemini's subset supports — this subset is fine).
+GEMINI_TOOLS = [{
+    "function_declarations": [{
+        "name": "run_sql",
+        "description": "Run a read-only SQL SELECT query against the loaded dataset and return the results.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "A single read-only SQL SELECT/WITH statement."}
+            },
+            "required": ["query"],
+        },
+    }]
 }]
 
 
