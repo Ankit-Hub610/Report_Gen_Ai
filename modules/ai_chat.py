@@ -73,10 +73,32 @@ from modules import query_engine as qe
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "openrouter/free"   # auto-router: picks a live free, tool-capable model
-GEMINI_MODEL = "gemini-2.0-flash"      # fixed model — see module docstring for why that matters
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+GEMINI_MODEL_DEFAULT = "gemini-3.6-flash"   # fixed model — see module docstring for why that matters.
+# Google occasionally retires/renames free Gemini models (e.g. gemini-2.0-flash was retired in
+# 2026). Rather than hardcoding one name that breaks again later, an admin can override it without
+# touching code: set GEMINI_MODEL as an env var or Streamlit secret to whatever model name Google's
+# error message (or https://ai.google.dev/gemini-api/docs/models) currently recommends.
 MAX_TOOL_ROUNDS = 3
 MAX_ROWS_TO_MODEL = 40   # cap how many result rows get sent back into the prompt (keeps cost/latency low)
+
+
+def get_gemini_model():
+    """Resolves the Gemini model name at call time (not import time) so an
+    admin-set override in secrets/env always wins over the built-in default."""
+    model = os.environ.get("GEMINI_MODEL")
+    if model:
+        return model
+    try:
+        import streamlit as st
+        if "GEMINI_MODEL" in st.secrets:
+            return st.secrets["GEMINI_MODEL"]
+    except Exception:
+        pass
+    return GEMINI_MODEL_DEFAULT
+
+
+def _gemini_url():
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{get_gemini_model()}:generateContent"
 
 
 class ChatError(Exception):
@@ -294,7 +316,7 @@ def _call_gemini(api_key, system_instruction, contents, tools=None, temperature=
     if tools:
         body["tools"] = tools
     resp = requests.post(
-        GEMINI_URL,
+        _gemini_url(),
         headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
         json=body,
         timeout=60,
@@ -302,6 +324,11 @@ def _call_gemini(api_key, system_instruction, contents, tools=None, temperature=
     if resp.status_code in (401, 403):
         raise ChatError("Gemini API key rejected — check the key at aistudio.google.com "
                          "(Get API key). Make sure it was pasted in full, with no extra spaces.")
+    if resp.status_code == 404:
+        raise ChatError(f"Gemini model '{get_gemini_model()}' is no longer available (Google "
+                         f"retires old free models over time). Set GEMINI_MODEL in Secrets to "
+                         f"whatever model name Google's error/docs currently recommend, then "
+                         f"reboot the app. Raw error: {resp.text[:200]}")
     if resp.status_code == 429:
         raise ChatError("Gemini free-tier rate limit hit — wait a minute and try again.")
     if resp.status_code >= 400:
