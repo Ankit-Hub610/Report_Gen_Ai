@@ -4415,24 +4415,14 @@ elif page == "🤖 AI Assistant":
         }
         [data-testid="stChatInput"] textarea { font-size: 0.95rem !important; }
 
-        /* --- Toolbar row (mode pill + clear-chat icon) ----------------------
-           Previously the mode pill sat isolated with lots of dead whitespace
-           around it, and "Clear chat" was a separate full bordered button
-           further down the page — two disconnected floating boxes. Now both
-           share one flex row: pill on the left, one small ghost icon on the
-           right, so it reads as a single toolbar instead of stray widgets. */
+        /* --- Toolbar row (just the clear-chat icon now) ----------------------
+           Used to also hold a 3-button mode-picker pill (Poocho/Card-Chart/
+           Image) — removed (see the "ONE UNIFIED INPUT" block below in this
+           page) so the AI itself detects intent from the message instead of
+           the user picking a mode by hand, ChatGPT-style. Kept as a flex row
+           in case more small icon actions land here later. */
         div.st-key-ai_toolbar_row div[data-testid="stHorizontalBlock"] {
             align-items: center; gap: 0 !important; margin: 2px 0 14px 0;
-        }
-        div.st-key-ai_mode_row div[data-testid="stHorizontalBlock"] {
-            gap: 0 !important; width: fit-content; border: 1px solid rgba(128,128,128,0.22);
-            border-radius: 999px; padding: 3px; background: rgba(128,128,128,0.05);
-        }
-        div.st-key-ai_mode_row button {
-            border-radius: 999px !important; border: none !important; box-shadow: none !important;
-        }
-        div.st-key-ai_mode_row div[data-testid="stHorizontalBlock"] > div:has(button[kind="secondary"]) button {
-            background: transparent !important;
         }
         div.st-key-ai_clear_btn button {
             border: none !important; background: transparent !important; box-shadow: none !important;
@@ -4501,41 +4491,31 @@ elif page == "🤖 AI Assistant":
     if _ai_remaining_top is not None:
         st.caption(f"🆓 Free plan: {_ai_remaining_top} AI request(s) left today.")
 
-    # Toolbar row: mode pill on the left, a small ghost "clear chat" icon on
-    # the right — one row instead of two disconnected floating widgets.
-    st.session_state.setdefault("ai_page_mode", "💬 Poocho")
-    _ai_modes = ["💬 Poocho", "🪄 Card/Chart banao", "🖼️ Image banao"] if can_edit() else ["💬 Poocho"]
-    if st.session_state.ai_page_mode not in _ai_modes:
-        st.session_state.ai_page_mode = _ai_modes[0]
-    with st.container(key="ai_toolbar_row"):
-        _tb_left, _tb_right = st.columns([5, 1])
-        with _tb_left:
-            with st.container(key="ai_mode_row"):
-                _mode_cols = st.columns(len(_ai_modes))
-                for _mi, _m in enumerate(_ai_modes):
-                    with _mode_cols[_mi]:
-                        _is_active = st.session_state.ai_page_mode == _m
-                        if st.button(_m, key=f"ai_mode_btn_{_mi}",
-                                     type="primary" if _is_active else "secondary",
-                                     use_container_width=True):
-                            st.session_state.ai_page_mode = _m
-                            st.rerun()
-        with _tb_right:
-            if st.session_state.ai_chat_history:
+    # ------------------------------------------------------------------------
+    # ONE UNIFIED INPUT — NO MANUAL MODE PICKER
+    # ------------------------------------------------------------------------
+    # BUG FIX (reported): a 3-button row ("💬 Poocho" / "🪄 Card/Chart banao" /
+    # "🖼️ Image banao") used to sit above the input, forcing the user to pick
+    # a mode by hand before every message — "kuch bhi bolo vo samajh jata he,
+    # jesa ChatGPT" was the ask. The picker is gone; there's just the one
+    # chat box below now. ac.ask() itself figures out — from the wording
+    # alone, via 3 tool declarations the model chooses between — whether this
+    # is a data/general question, an image request, or a new chart/KPI-card
+    # request, and returns which one it picked in result["kind"]. This block
+    # just renders whichever kind comes back; see modules/ai_chat.py for the
+    # actual intent-routing logic.
+    if st.session_state.ai_chat_history:
+        with st.container(key="ai_toolbar_row"):
+            _tb_left, _tb_right = st.columns([5, 1])
+            with _tb_right:
                 with st.container(key="ai_clear_btn"):
                     if st.button("🗑️ Clear", key="ai_clear_chat_btn", help="Clear this chat"):
                         st.session_state.ai_chat_history = []
                         ws.save_chat_history([], ai_history_storage_id())
                         st.rerun()
-    _ask_mode = st.session_state.ai_page_mode == "💬 Poocho"
-    _image_mode = st.session_state.ai_page_mode == "🖼️ Image banao"
-    if _ask_mode:
-        _placeholder = "Ask anything about your data..."
-    elif _image_mode:
-        _placeholder = 'e.g. "ek banner banao badminton tournament ke liye" or "a friendly cartoon cricket ball logo"'
-    else:
-        _placeholder = 'e.g. "monthly revenue trend" or "top clients by total paid"'
 
+    _placeholder = ("Ask anything, or ask me to build a chart/KPI card, or generate an image..."
+                    if can_edit() else "Ask anything about your data...")
 
     # st.chat_input() is ALWAYS pinned to the bottom of the viewport by
     # Streamlit itself — this is what actually fixes the reported "box
@@ -4550,65 +4530,43 @@ elif page == "🤖 AI Assistant":
         if st.session_state.ai_chat_history and st.session_state.ai_chat_history[-1]["role"] == "assistant":
             st.session_state.ai_chat_history.pop()
         _typed = _last_user_q
-        _ask_mode = True
 
-    question = _typed if (_typed and _ask_mode) else None
-    image_req = _typed if (_typed and _image_mode) else None
-    ai_req = _typed if (_typed and not _ask_mode and not _image_mode) else None
-    if question:
-        st.session_state.ai_chat_history.append({"role": "user", "content": question, "ts": time.time()})
+    if _typed:
+        st.session_state.ai_chat_history.append({"role": "user", "content": _typed, "ts": time.time()})
         ai_ok, ai_limit_msg = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "ai_calls")
         if not ai_ok:
             st.error(f"🚫 {ai_limit_msg}")
             st.stop()
         with st.spinner("Analysing..."):
-            result = ac.ask(question, df_raw, meta, kpis, st.session_state.dashboard_charts,
-                             api_key, history=st.session_state.ai_chat_history[:-1])
-        if result["error"]:
-            st.error(result["error"])
-        else:
-            st.session_state.ai_chat_history.append({
-                "role": "assistant", "content": result["answer"],
-                "sql_used": result["sql_used"], "proof_df": result["proof_df"], "ts": time.time(),
-            })
-        ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
-        st.rerun()
+            result = ac.ask(_typed, df_raw, meta, kpis, st.session_state.dashboard_charts,
+                             api_key, history=st.session_state.ai_chat_history[:-1], can_edit=can_edit())
 
-    if image_req:
-        st.session_state.ai_chat_history.append({"role": "user", "content": image_req, "ts": time.time()})
-        ai_ok, ai_limit_msg = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "ai_calls")
-        if not ai_ok:
-            st.error(f"🚫 {ai_limit_msg}")
-            st.stop()
-        with st.spinner("Generating image..."):
-            img_result = ac.generate_image(image_req, api_key)
-        if img_result["error"]:
-            st.error(img_result["error"])
+        if result["kind"] == "card_chart" and not result["error"]:
+            # A chart/KPI-card request never becomes a chat bubble — same as
+            # before, it renders as an Add/Pin preview box further down.
+            st.session_state.ai_chat_history.pop()
+            st.session_state["_ai_card_spec"] = result["spec"]
+        elif result["error"]:
+            st.error(result["error"])
+            ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
         else:
             st.session_state.ai_chat_history.append({
-                "role": "assistant", "content": img_result.get("text") or "",
-                "image_b64": img_result["image_b64"], "image_mime": img_result["mime_type"],
+                "role": "assistant", "content": result.get("answer") or "",
+                "sql_used": result.get("sql_used"), "proof_df": result.get("proof_df"),
+                "image_b64": result.get("image_b64"), "image_mime": result.get("mime_type"),
                 "ts": time.time(),
             })
-        ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
+            ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
         st.rerun()
 
     # ------------------------------------------------------------------------
-    # AUTO-BUILD A KPI CARD OR CHART FROM A PLAIN-LANGUAGE REQUIREMENT
-    # (view-only accounts never see "🪄 Card/Chart banao" mode above, so
-    # ai_req is always None for them — nothing below this point can trigger)
+    # ADD/PIN PREVIEW FOR AN AI-DESIGNED KPI CARD OR CHART
+    # (view-only accounts never get the design_card_or_chart tool offered to
+    # the model — see can_edit=can_edit() above — so _ai_card_spec never gets
+    # set for them; nothing below this point can trigger for a viewer)
     # ------------------------------------------------------------------------
     if not can_edit():
         st.stop()
-
-    if ai_req:
-        with st.spinner("Designing a card/chart from your data..."):
-            gen_result = ac.suggest_card_or_chart(ai_req.strip(), df_raw, api_key)
-        if gen_result.get("error"):
-            st.error(gen_result["error"])
-            st.session_state["_ai_card_spec"] = None
-        else:
-            st.session_state["_ai_card_spec"] = gen_result["spec"]
 
     ai_spec = st.session_state.get("_ai_card_spec")
     if ai_spec:
