@@ -453,9 +453,11 @@ def _call_gemini(api_key, system_instruction, contents, tools=None, temperature=
 def _gemini_extract(data):
     """Pulls (text, function_call, raw_model_content) out of a generateContent
     response. function_call is {"name": ..., "args": {...}} or None."""
-    content = data["candidates"][0].get("content", {"role": "model", "parts": []})
+    content = data["candidates"][0].get("content") or {"role": "model", "parts": []}
     text_parts, fn_call = [], None
-    for p in content.get("parts", []):
+    for p in (content.get("parts") or []):
+        if not isinstance(p, dict):
+            continue
         if "text" in p:
             text_parts.append(p["text"])
         elif "functionCall" in p:
@@ -508,10 +510,16 @@ def ask(question, df, meta, kpis, dashboard_charts, api_key, history=None, can_e
     if not api_key:
         return _result(error="No AI API key configured yet — add one below (it's free).")
 
-    system_prompt = _system_prompt(df, meta, kpis, dashboard_charts)
-    if detect_provider(api_key) == "gemini":
-        return _ask_gemini(question, df, system_prompt, api_key, history, can_edit)
-    return _ask_openrouter(question, df, system_prompt, api_key, history, can_edit)
+    try:
+        system_prompt = _system_prompt(df, meta, kpis, dashboard_charts)
+        if detect_provider(api_key) == "gemini":
+            return _ask_gemini(question, df, system_prompt, api_key, history, can_edit)
+        return _ask_openrouter(question, df, system_prompt, api_key, history, can_edit)
+    except Exception as e:
+        # Outermost safety net — even a failure building the prompt itself
+        # (before either provider call starts) must never crash the whole
+        # page; see the matching comment inside _ask_gemini for the full story.
+        return _result(error=f"Unexpected error while answering ({type(e).__name__}: {e}) — try again.")
 
 
 def _ask_openrouter(question, df, system_prompt, api_key, history, can_edit):
@@ -564,6 +572,14 @@ def _ask_openrouter(question, df, system_prompt, api_key, history, can_edit):
     except requests.RequestException as e:
         return _result(sql_used=last_sql, proof_df=last_proof,
                         error=f"Network error reaching OpenRouter — check internet: {e}")
+    except Exception as e:
+        # Last-resort catch-all: an unexpected response shape from the AI
+        # provider must never crash the whole page (this is what was
+        # happening — an uncaught TypeError bubbled all the way up to
+        # Streamlit's page-level error handler, which redacts the real
+        # message). Now it always degrades to a normal, visible chat error.
+        return _result(sql_used=last_sql, proof_df=last_proof,
+                        error=f"Unexpected error while answering ({type(e).__name__}: {e}) — try again.")
 
 
 def _ask_gemini(question, df, system_prompt, api_key, history, can_edit):
@@ -614,6 +630,11 @@ def _ask_gemini(question, df, system_prompt, api_key, history, can_edit):
     except requests.RequestException as e:
         return _result(sql_used=last_sql, proof_df=last_proof,
                         error=f"Network error reaching Gemini — check internet: {e}")
+    except Exception as e:
+        # Same last-resort catch-all as the OpenRouter path above — see that
+        # comment for why this matters.
+        return _result(sql_used=last_sql, proof_df=last_proof,
+                        error=f"Unexpected error while answering ({type(e).__name__}: {e}) — try again.")
 
 
 # ==================================================================================
@@ -866,6 +887,8 @@ def suggest_card_or_chart(requirement: str, df: pd.DataFrame, api_key):
         return {"spec": None, "error": "AI didn't return a valid card/chart definition — try rephrasing your requirement."}
     except requests.RequestException as e:
         return {"spec": None, "error": f"Network error reaching OpenRouter — check internet: {e}"}
+    except Exception as e:
+        return {"spec": None, "error": f"Unexpected error designing that ({type(e).__name__}: {e}) — try again."}
 
 # ==================================================================================
 # IMAGE GENERATION (Gemini "Nano Banana" — free tier, same API key as the text model)
@@ -919,19 +942,40 @@ def generate_image(prompt: str, api_key: str):
             return {"image_b64": None, "mime_type": None, "text": None,
                     "error": f"Gemini declined to generate that image{reason_txt}. Try rephrasing."}
 
-        parts = candidates[0].get("content", {}).get("parts", [])
+        # BUG FIX (reported: "TypeError" crashed the whole page after asking
+        # for an image): `.get("content", {})` only falls back to {} when the
+        # "content" KEY IS MISSING - if Gemini returns the key present but set
+        # to null (happens on some finish reasons, e.g. safety-filtered or
+        # truncated image output), .get() returns that None as-is, and the
+        # next .get("parts", ...) call on it threw an uncaught error that
+        # propagated all the way up and crashed the page (nothing downstream
+        # was catching it — see the broad except Exception added below too).
+        content = candidates[0].get("content") or {}
+        parts = content.get("parts") or []
         image_b64, mime_type, text = None, None, None
         for p in parts:
-            if "inlineData" in p:
+            if not isinstance(p, dict):
+                continue
+            if "inlineData" in p and isinstance(p["inlineData"], dict):
                 image_b64 = p["inlineData"].get("data")
                 mime_type = p["inlineData"].get("mimeType", "image/png")
-            elif "text" in p:
+            elif isinstance(p.get("text"), str):
                 text = (text or "") + p["text"]
 
         if not image_b64:
+            finish_reason = candidates[0].get("finishReason")
+            reason_txt = f" (finish reason: {finish_reason})" if finish_reason else ""
             return {"image_b64": None, "mime_type": None, "text": text,
-                    "error": "Gemini didn't return an image for that — try rephrasing the request."}
+                    "error": f"Gemini didn't return an image for that{reason_txt} — try rephrasing the request."}
         return {"image_b64": image_b64, "mime_type": mime_type, "text": text, "error": None}
     except requests.RequestException as e:
         return {"image_b64": None, "mime_type": None, "text": None,
                 "error": f"Network error reaching Gemini — check internet: {e}"}
+    except Exception as e:
+        # Catch-all last resort: an unexpected shape anywhere in Gemini's response
+        # must never crash the whole Streamlit page — it becomes a normal chat
+        # error message instead, with the real exception name/text visible (this
+        # message is NOT redacted by Streamlit, unlike an uncaught page crash) so
+        # the actual cause is diagnosable from a screenshot if it happens again.
+        return {"image_b64": None, "mime_type": None, "text": None,
+                "error": f"Unexpected error generating that image ({type(e).__name__}: {e}) — try rephrasing, or try again."}
