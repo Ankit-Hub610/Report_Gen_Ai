@@ -1,7 +1,7 @@
 """
 app.py
 ------
-RA-I ANALYTICS PLATFORM
+SPORTS ANALYTICS PLATFORM
 A password-protected, self-contained BI tool that works on ANY tabular
 dataset (CSV / XLSX / JSON / PDF). No column names are hard-coded anywhere -
 everything (KPIs, chart variants, filters) is auto-derived from whatever
@@ -1846,13 +1846,11 @@ def _apply_loaded_df(df, source_name):
     st.session_state.meta = de.profile_columns(df)
     st.session_state.data_source_name = source_name + (f" {cap_note}" if cap_note else "")
     st.session_state.filters = {}
+    st.session_state.dashboard_charts = []
+    st.session_state.pinned_kpis = []
     st.session_state.dashboard_slicers = []
     st.session_state.data_source_is_db = False   # a fresh file/sample load — any previous DB link no longer applies
-    st.session_state.data_source_is_gsheet = False  # a fresh file/sample load — any previous Google Sheet load link no longer applies
-    # AUTO-BUILD: every fresh upload starts with a ready-made dashboard (KPI
-    # cards + charts picked from the data itself) instead of a blank one the
-    # client has to build by hand — see auto_build_dashboard()'s docstring.
-    auto_build_dashboard(df, st.session_state.meta)
+    st.session_state.data_source_is_gsheet = False  # a fresh file/sample load — any previous Google Sheet link no longer applies
     persist_workspace_now(force_full=True)  # BUG FIX: save immediately, don't rely on reaching the bottom of the
                                              # script — the Connect Data page's st.stop() prevents that (see
                                              # persist_workspace_now()'s docstring for the full story).
@@ -2245,7 +2243,7 @@ def kpi_cards(kpis, pinnable=False, key_prefix="", df=None, filterable=False, re
                     value = ms.format_value(raw, ms.NUMBER_FORMAT_PRESETS.get(fmt_choice, "auto"), custom_code)
                     if card_filters:
                         sub = f"{sub} · {len(fdf):,} rows after this card's filter"
-                    st.metric(label, value, delta=k.get("delta"), help=sub)
+                    st.metric(label, value, help=sub)
                     with st.popover("⚙️ Format & Filter", use_container_width=True):
                         st.caption("Number format — this card only")
                         new_fmt = st.selectbox("Format", format_labels,
@@ -2261,7 +2259,7 @@ def kpi_cards(kpis, pinnable=False, key_prefix="", df=None, filterable=False, re
                         new_filters = be.render_filter_builder(df, card_filters, key_prefix=f"{key_prefix}kpi_{label}_")
                         filter_store[label] = new_filters
                 else:
-                    st.metric(label, value, delta=k.get("delta"), help=sub)
+                    st.metric(label, value, help=sub)
                 if pinnable:
                     pinned = label in st.session_state.pinned_kpis
                     new_val = st.checkbox("⭐ pin to dashboard", value=pinned, key=f"{key_prefix}pin_{label}_{row_start}_{j}")
@@ -2298,74 +2296,6 @@ def remove_from_dashboard(family, variant_id):
         c for c in st.session_state.dashboard_charts
         if not (c["family"] == family and c["variant"]["id"] == variant_id)
     ]
-
-
-def auto_build_dashboard(df, meta):
-    """Auto-picks a sensible starter set of KPI cards + charts for a dataset
-    that has NO dashboard configured yet, so a brand-new slide/workspace opens
-    with a ready, working dashboard instead of a blank page the client has to
-    build by hand. Purely deterministic (pandas + the existing role-detection
-    in intel_engine/chart_engine) - no AI call, so it's instant and free.
-
-    Picks, when the relevant column exists:
-      KPIs  - Total Records, Total/Avg of the primary measure (with the
-              ▲/▼ trend delta from compute_kpis), Unique customer/product
-              count, and the Date Range card.
-      Charts - a Line trend of the primary measure over time ("past →
-              present"), a Bar of the primary measure by the best category
-              (leaderboard-style comparison), and, when there's enough date
-              history, a Comparison-family variant that includes the
-              regression-based forecast from intel_engine (the "future"
-              side) if chart_engine exposes one - otherwise the Line trend
-              alone still tells the past/present story.
-
-    Only ever called when both pinned_kpis and dashboard_charts are empty
-    (a genuinely fresh dashboard) OR explicitly via the "Rebuild suggested
-    dashboard" button - see call sites for the exact guard in each case.
-    """
-    roles = ie.detect_roles(df, meta)
-    all_kpis = de.compute_kpis(df, meta)
-    kpi_by_label = {k["label"]: k for k in all_kpis}
-
-    wanted_labels = ["Total Records"]
-    primary = meta.get("primary_measure")
-    if primary:
-        wanted_labels += [f"Total {primary}", f"Avg {primary}"]
-    for role_key in ("customer", "product"):
-        col = roles.get(role_key)
-        if col:
-            wanted_labels.append(f"Unique {col}")
-    if meta.get("primary_date"):
-        wanted_labels.append("Date Range")
-    growth_label = next((lbl for lbl in kpi_by_label if lbl.startswith(f"{primary} Growth")), None) if primary else None
-    if growth_label:
-        wanted_labels.append(growth_label)
-
-    st.session_state.pinned_kpis = [lbl for lbl in wanted_labels if lbl in kpi_by_label][:6]
-
-    new_charts = []
-    if meta.get("primary_date") and primary:
-        line_variants = ce.generate_variants(df, meta, "Line")
-        best_line = next((v for v in line_variants if v.get("measure") == primary), line_variants[0] if line_variants else None)
-        if best_line:
-            new_charts.append({"family": "Line", "variant": copy.deepcopy(best_line)})
-
-    best_dim = roles.get("product") or roles.get("location") or roles.get("channel") or \
-        (meta["categorical_cols"][0] if meta["categorical_cols"] else None)
-    if best_dim and primary:
-        bar_variants = ce.generate_variants(df, meta, "Bar")
-        best_bar = next((v for v in bar_variants if v.get("dim") == best_dim and v.get("measure") == primary), None)
-        if best_bar:
-            new_charts.append({"family": "Bar", "variant": copy.deepcopy(best_bar)})
-
-    if roles.get("location") or roles.get("channel"):
-        pie_dim = roles.get("channel") or roles.get("location")
-        pie_variants = ce.generate_variants(df, meta, "Pie")
-        best_pie = next((v for v in pie_variants if v.get("dim") == pie_dim), pie_variants[0] if pie_variants else None)
-        if best_pie:
-            new_charts.append({"family": "Pie", "variant": copy.deepcopy(best_pie)})
-
-    st.session_state.dashboard_charts = new_charts
 
 
 def _safe_index(options, value, fallback=0):
@@ -4371,10 +4301,8 @@ elif page == "🗂 Data Table":
 # ==================================================================================
 elif page == "🤖 AI Assistant":
     st.title("🤖 AI Assistant")
-    st.caption("Ask anything — general questions, or plain-language questions about your data, KPIs, "
-               "and dashboard charts. Data-related answers are grounded in real SQL run against your "
-               "dataset — not guesses — and shown with proof below each reply. "
-               "Chat history is kept for **5 days** and then auto-deleted.")
+    st.caption("Ask anything about your data, or anything else. Data answers are grounded in "
+               "real SQL, with proof shown below each reply.")
 
     if st.session_state.df_raw is None:
         st.info("Load data on the **📥 Connect Data** page first.")
@@ -4401,7 +4329,7 @@ elif page == "🤖 AI Assistant":
                 st.markdown(
                     "**Recommended — Google Gemini** (more reliable, better answer quality):\n"
                     "1. Go to **[aistudio.google.com](https://aistudio.google.com)** and sign in with any Google account.\n"
-                    "2. Click **Get API key** → **Create API key** → copy it (starts with `AIza...`).\n"
+                    "2. Click **Get API key** → **Create API key** → copy it (starts with `AIza...` or the newer `AQ....`).\n"
                     "3. Paste it below to test it now — kept only in this browser session, never saved to disk.\n\n"
                     "*(Alternative: an [openrouter.ai](https://openrouter.ai) key, starting with `sk-or-v1-...`, "
                     "also still works — paste it the same way below, it's auto-detected. OpenRouter's free tier "
@@ -4461,12 +4389,44 @@ elif page == "🤖 AI Assistant":
             max-width: 85%; white-space: pre-wrap; word-wrap: break-word;
             font-size: 0.95rem; line-height: 1.6; padding-top: 2px;
         }
-        /* Segmented mode toggle: two plain buttons styled as one pill,
-           active side filled, inactive side ghost — replaces the default
-           radio's visible circle dot, which looked cheap/unpolished. */
+
+        /* --- Neutral chrome everywhere on this page ------------------------
+           The app theme's primaryColor (red) is meant for a handful of
+           deliberate accents (the user bubble, the active mode pill) — but
+           Streamlit's defaults also paint that same red onto every bordered/
+           focused widget (expanders, the chat input, text inputs). Applied
+           everywhere at once, that reads as a page full of validation-error
+           outlines instead of a calm chat UI. Pin borders to a quiet neutral
+           grey instead, so red only ever means "this is the active thing". */
+        [data-testid="stExpander"] {
+            border: 1px solid rgba(128,128,128,0.22) !important;
+            border-radius: 14px !important;
+            box-shadow: none !important;
+        }
+        [data-testid="stChatInput"] {
+            border-radius: 999px !important;
+            border: 1px solid rgba(128,128,128,0.22) !important;
+            box-shadow: 0 1px 6px rgba(0,0,0,0.05) !important;
+            transition: border-color .15s ease, box-shadow .15s ease;
+        }
+        [data-testid="stChatInput"]:focus-within {
+            border-color: rgba(128,128,128,0.45) !important;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.08) !important;
+        }
+        [data-testid="stChatInput"] textarea { font-size: 0.95rem !important; }
+
+        /* --- Toolbar row (mode pill + clear-chat icon) ----------------------
+           Previously the mode pill sat isolated with lots of dead whitespace
+           around it, and "Clear chat" was a separate full bordered button
+           further down the page — two disconnected floating boxes. Now both
+           share one flex row: pill on the left, one small ghost icon on the
+           right, so it reads as a single toolbar instead of stray widgets. */
+        div.st-key-ai_toolbar_row div[data-testid="stHorizontalBlock"] {
+            align-items: center; gap: 0 !important; margin: 2px 0 14px 0;
+        }
         div.st-key-ai_mode_row div[data-testid="stHorizontalBlock"] {
-            gap: 0 !important; width: fit-content; border: 1px solid rgba(128,128,128,0.35);
-            border-radius: 999px; padding: 3px; margin-bottom: 10px;
+            gap: 0 !important; width: fit-content; border: 1px solid rgba(128,128,128,0.22);
+            border-radius: 999px; padding: 3px; background: rgba(128,128,128,0.05);
         }
         div.st-key-ai_mode_row button {
             border-radius: 999px !important; border: none !important; box-shadow: none !important;
@@ -4474,6 +4434,12 @@ elif page == "🤖 AI Assistant":
         div.st-key-ai_mode_row div[data-testid="stHorizontalBlock"] > div:has(button[kind="secondary"]) button {
             background: transparent !important;
         }
+        div.st-key-ai_clear_btn button {
+            border: none !important; background: transparent !important; box-shadow: none !important;
+            color: rgba(128,128,128,0.85) !important; font-size: 0.85rem !important;
+        }
+        div.st-key-ai_clear_btn button:hover { color: var(--primary-color, #FF4B4B) !important; }
+
         /* Small ghost icon-buttons under each assistant reply (Copy / Regenerate).
            Container keys are dynamic per-turn (ai_msg_actions_0, _1, ...), so
            match on a class-name substring instead of one exact st-key-X class. */
@@ -4527,21 +4493,32 @@ elif page == "🤖 AI Assistant":
     if _ai_remaining_top is not None:
         st.caption(f"🆓 Free plan: {_ai_remaining_top} AI request(s) left today.")
 
-    # Two-button segmented mode toggle — see CSS above for the pill styling.
+    # Toolbar row: mode pill on the left, a small ghost "clear chat" icon on
+    # the right — one row instead of two disconnected floating widgets.
     st.session_state.setdefault("ai_page_mode", "💬 Poocho")
     _ai_modes = ["💬 Poocho", "🪄 Card/Chart banao"] if can_edit() else ["💬 Poocho"]
     if st.session_state.ai_page_mode not in _ai_modes:
         st.session_state.ai_page_mode = _ai_modes[0]
-    with st.container(key="ai_mode_row"):
-        _mode_cols = st.columns(len(_ai_modes))
-        for _mi, _m in enumerate(_ai_modes):
-            with _mode_cols[_mi]:
-                _is_active = st.session_state.ai_page_mode == _m
-                if st.button(_m, key=f"ai_mode_btn_{_mi}",
-                             type="primary" if _is_active else "secondary",
-                             use_container_width=True):
-                    st.session_state.ai_page_mode = _m
-                    st.rerun()
+    with st.container(key="ai_toolbar_row"):
+        _tb_left, _tb_right = st.columns([5, 1])
+        with _tb_left:
+            with st.container(key="ai_mode_row"):
+                _mode_cols = st.columns(len(_ai_modes))
+                for _mi, _m in enumerate(_ai_modes):
+                    with _mode_cols[_mi]:
+                        _is_active = st.session_state.ai_page_mode == _m
+                        if st.button(_m, key=f"ai_mode_btn_{_mi}",
+                                     type="primary" if _is_active else "secondary",
+                                     use_container_width=True):
+                            st.session_state.ai_page_mode = _m
+                            st.rerun()
+        with _tb_right:
+            if st.session_state.ai_chat_history:
+                with st.container(key="ai_clear_btn"):
+                    if st.button("🗑️ Clear", key="ai_clear_chat_btn", help="Clear this chat"):
+                        st.session_state.ai_chat_history = []
+                        ws.save_chat_history([], ai_history_storage_id())
+                        st.rerun()
     _ask_mode = st.session_state.ai_page_mode == "💬 Poocho"
     _placeholder = "Ask anything about your data..." if _ask_mode else 'e.g. "monthly revenue trend" or "top clients by total paid"'
 
@@ -4579,11 +4556,6 @@ elif page == "🤖 AI Assistant":
                 "sql_used": result["sql_used"], "proof_df": result["proof_df"], "ts": time.time(),
             })
         ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
-        st.rerun()
-
-    if st.session_state.ai_chat_history and st.button("🗑️ Clear chat"):
-        st.session_state.ai_chat_history = []
-        ws.save_chat_history([], ai_history_storage_id())
         st.rerun()
 
     # ------------------------------------------------------------------------
@@ -5126,7 +5098,7 @@ elif page == "⚙️ Settings":
         # exists - belongs here. That description lives ONLY inside the
         # Admin Panel page itself, gated to role == admin. Keep it that way.
         st.markdown("""
-**RA_I Analytics Platform** turns any spreadsheet-shaped file into a boardroom-ready
+**Sports Analytics Platform** turns any spreadsheet-shaped file into a boardroom-ready
 report, without you writing a single formula.
 
 **📊 Raw Analysis (Page 1)**
