@@ -82,6 +82,11 @@ MAX_TOOL_ROUNDS = 3
 MAX_ROWS_TO_MODEL = 40   # cap how many result rows get sent back into the prompt (keeps cost/latency low)
 
 
+GEMINI_IMAGE_MODEL_DEFAULT = "gemini-2.5-flash-image"   # "Nano Banana" — Google's free-tier
+# image-generation model, same API key as the text model above. Same override mechanism as
+# GEMINI_MODEL, via GEMINI_IMAGE_MODEL, in case Google renames/retires this one too later.
+
+
 def get_gemini_model():
     """Resolves the Gemini model name at call time (not import time) so an
     admin-set override in secrets/env always wins over the built-in default."""
@@ -97,8 +102,25 @@ def get_gemini_model():
     return GEMINI_MODEL_DEFAULT
 
 
+def get_gemini_image_model():
+    model = os.environ.get("GEMINI_IMAGE_MODEL")
+    if model:
+        return model
+    try:
+        import streamlit as st
+        if "GEMINI_IMAGE_MODEL" in st.secrets:
+            return st.secrets["GEMINI_IMAGE_MODEL"]
+    except Exception:
+        pass
+    return GEMINI_IMAGE_MODEL_DEFAULT
+
+
 def _gemini_url():
     return f"https://generativelanguage.googleapis.com/v1beta/models/{get_gemini_model()}:generateContent"
+
+
+def _gemini_image_url():
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{get_gemini_image_model()}:generateContent"
 
 
 class ChatError(Exception):
@@ -722,3 +744,72 @@ def suggest_card_or_chart(requirement: str, df: pd.DataFrame, api_key):
         return {"spec": None, "error": "AI didn't return a valid card/chart definition — try rephrasing your requirement."}
     except requests.RequestException as e:
         return {"spec": None, "error": f"Network error reaching OpenRouter — check internet: {e}"}
+
+# ==================================================================================
+# IMAGE GENERATION (Gemini "Nano Banana" — free tier, same API key as the text model)
+# ==================================================================================
+# Deliberately Gemini-only: OpenRouter's free/auto-routed tier doesn't reliably expose
+# an image-output model, so asking it would silently fail or pick something odd. If the
+# admin's configured key is an OpenRouter key, this tells the user plainly to add a
+# Gemini key instead, rather than pretending to generate something it can't.
+
+def generate_image(prompt: str, api_key: str):
+    """Returns {"image_b64": str|None, "mime_type": str|None, "text": str|None,
+    "error": str|None}. image_b64 is raw base64 (no data: prefix) — caller decides
+    how to display/store it."""
+    if not api_key:
+        return {"image_b64": None, "mime_type": None, "text": None,
+                "error": "No AI API key configured yet — add one on the AI Assistant page (it's free)."}
+    if detect_provider(api_key) != "gemini":
+        return {"image_b64": None, "mime_type": None, "text": None,
+                "error": "Image generation needs a Gemini API key (OpenRouter's free tier doesn't "
+                         "reliably support it). Ask your admin to add a Gemini key from "
+                         "aistudio.google.com in Secrets as GEMINI_API_KEY."}
+
+    body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
+    try:
+        resp = requests.post(
+            _gemini_image_url(),
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+            json=body,
+            timeout=90,
+        )
+        if resp.status_code in (401, 403):
+            return {"image_b64": None, "mime_type": None, "text": None,
+                    "error": "Gemini API key rejected — check the key at aistudio.google.com."}
+        if resp.status_code == 404:
+            return {"image_b64": None, "mime_type": None, "text": None,
+                    "error": f"Gemini image model '{get_gemini_image_model()}' is no longer available. "
+                             f"Set GEMINI_IMAGE_MODEL in Secrets to whatever model name Google's docs "
+                             f"currently recommend for image generation, then reboot the app."}
+        if resp.status_code == 429:
+            return {"image_b64": None, "mime_type": None, "text": None,
+                    "error": "Free-tier image quota hit for now — wait a bit and try again."}
+        if resp.status_code >= 400:
+            return {"image_b64": None, "mime_type": None, "text": None,
+                    "error": f"Gemini image API error ({resp.status_code}): {resp.text[:300]}"}
+
+        data = resp.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            block_reason = (data.get("promptFeedback") or {}).get("blockReason")
+            reason_txt = f" (reason: {block_reason})" if block_reason else ""
+            return {"image_b64": None, "mime_type": None, "text": None,
+                    "error": f"Gemini declined to generate that image{reason_txt}. Try rephrasing."}
+
+        parts = candidates[0].get("content", {}).get("parts", [])
+        image_b64, mime_type, text = None, None, None
+        for p in parts:
+            if "inlineData" in p:
+                image_b64 = p["inlineData"].get("data")
+                mime_type = p["inlineData"].get("mimeType", "image/png")
+            elif "text" in p:
+                text = (text or "") + p["text"]
+
+        if not image_b64:
+            return {"image_b64": None, "mime_type": None, "text": text,
+                    "error": "Gemini didn't return an image for that — try rephrasing the request."}
+        return {"image_b64": image_b64, "mime_type": mime_type, "text": text, "error": None}
+    except requests.RequestException as e:
+        return {"image_b64": None, "mime_type": None, "text": None,
+                "error": f"Network error reaching Gemini — check internet: {e}"}
