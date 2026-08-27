@@ -222,27 +222,41 @@ def _trend_summary(trend: dict) -> str:
 def _system_prompt(df, meta, kpis, dashboard_charts, trend=None, forecast=None):
     has_data = df is not None
     if not has_data:
-        return """You are a helpful, general-purpose AI assistant embedded in a BI dashboard app.
-No dataset is loaded in this session right now, so just answer the user's question directly and
-helpfully from your own knowledge — general knowledge, explanations, advice, definitions, how-to
-help, casual conversation, sports/news/trivia, writing help, math, coding help, translations, etc.
-— exactly like a normal general-purpose AI assistant (e.g. ChatGPT) would.
+        return """You are a helpful, all-in-one, general-purpose AI assistant embedded in a BI dashboard app —
+like ChatGPT, the user can type anything into one box and you figure out what they meant, with no
+manual mode-picker. No dataset is loaded in this session right now, so:
 
-If the user asks something that clearly needs THEIR OWN business data (e.g. "what was my revenue
-last month"), gently let them know you don't see any dataset loaded yet and they can load one on
-the 📥 Connect Data page — then answer whatever you still reasonably can in general terms.
+- If the user is asking you to DRAW/DESIGN/GENERATE AN IMAGE (banner, logo, poster, illustration,
+  wallpaper, icon, artwork, etc.), call the generate_image tool if it's offered to you below. If it
+  isn't offered (e.g. a view-only account), say so plainly instead of pretending.
+- If the user asks something that clearly needs THEIR OWN business data/chart-building (e.g. "what
+  was my revenue last month", "ek chart banao"), gently let them know you don't see any dataset
+  loaded yet and they can load one on the 📥 Connect Data page — then answer whatever you still
+  reasonably can in general terms.
+- For everything else — general knowledge, explanations, advice, definitions, how-to help, casual
+  conversation, sports/news/trivia, writing help, math, coding help, translations, etc. — just
+  answer directly and helpfully from your own knowledge, exactly like a normal general-purpose AI
+  assistant would.
 
 Reply in clear, simple language (Hindi/English mix is fine if the user writes that way). Keep
 answers concise — a short paragraph or a few bullet points, not an essay."""
 
-    return f"""You are a helpful AI assistant embedded in a BI dashboard app. You can do TWO kinds
-of things, and you should figure out which one a question needs:
+    return f"""You are a helpful, all-in-one AI assistant embedded in a BI dashboard app — like ChatGPT, the
+user should be able to type ANYTHING into one box and have you figure out what they meant, with no
+manual mode-picker. You can do FOUR kinds of things; decide which one a message needs from its
+wording alone, exactly once, without asking the user to clarify which mode they meant:
 
 1. QUESTIONS ABOUT THE USER'S OWN LOADED DATASET (their business data, KPIs, charts, trend history,
-   or forecast) — for these, ground every number either in the PRE-COMPUTED PAST TREND / FUTURE
-   FORECAST facts given to you below, or, for anything not already covered there, in a real
-   run_sql result. Never guess or make up numbers for the user's data.
-2. ANYTHING ELSE — general knowledge, explanations, advice, definitions, how-to help, casual
+   or forecast) — ground every number either in the PRE-COMPUTED PAST TREND / FUTURE FORECAST facts
+   given to you below, or, for anything not already covered there, in a real run_sql result. Never
+   guess or make up numbers for the user's data.
+2. A request to DRAW/DESIGN/GENERATE AN IMAGE (a banner, logo, poster, illustration, wallpaper,
+   icon, artwork, etc.) — call the generate_image tool if it's offered to you below. If it isn't
+   offered (view-only account, or no image tool available), say so plainly instead of pretending.
+3. A request to BUILD A NEW CHART OR KPI CARD for their dashboard from their own data (e.g.
+   "monthly revenue trend banao", "top clients ka chart banao") — call design_card_or_chart if it's
+   offered to you below.
+4. ANYTHING ELSE — general knowledge, explanations, advice, definitions, how-to help, casual
    conversation, sports/news/trivia, writing help, math, coding help, translations, etc. — answer
    these directly and helpfully from your own knowledge, exactly like a normal general-purpose AI
    assistant (e.g. ChatGPT) would. Do NOT refuse or deflect a question just because it isn't about
@@ -296,36 +310,108 @@ Keep answers concise — a short paragraph or a few bullet points, not an essay 
 """
 
 
-TOOLS = [{
-    "type": "function",
-    "function": {
-        "name": "run_sql",
-        "description": "Run a read-only SQL SELECT query against the loaded dataset and return the results.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "A single read-only SQL SELECT/WITH statement."}
-            },
-            "required": ["query"],
+# --------------------------------------------------------------------------------
+# ONE UNIFIED INPUT, THREE POSSIBLE INTENTS — CHATGPT-STYLE AUTO-DETECTION
+# --------------------------------------------------------------------------------
+# BUG FIX (reported): the AI Assistant page used to make the user manually pick
+# from 3 mode buttons ("💬 Poocho" / "🪄 Card/Chart banao" / "🖼️ Image banao")
+# before typing, which looked unprofessional next to a normal chat box - "usko
+# kuch bhi bolo vo samajh jata he" (ChatGPT-like: tell it anything, it figures
+# out what you meant) was the ask. Fixed by giving the model itself THREE tools
+# in every call instead of three separate hand-picked code paths - it decides,
+# from the wording alone, whether a message needs `run_sql` (a data question),
+# `generate_image` (draw/design something), or `design_card_or_chart` (build a
+# new dashboard chart/KPI from their data), or none of those (just answer in
+# plain text). app.py now has exactly ONE input box; see ask()'s "kind" field
+# in its return value for how the caller renders whichever one the model chose.
+_RUN_SQL_DECL = {
+    "name": "run_sql",
+    "description": "Run a read-only SQL SELECT query against the loaded dataset and return the results.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "A single read-only SQL SELECT/WITH statement."}
         },
+        "required": ["query"],
     },
-}]
-
-# Same tool, expressed in Gemini's function-declaration shape (no "type": "function" wrapper,
-# and no JSON-Schema $-prefixed keys beyond what Gemini's subset supports — this subset is fine).
-GEMINI_TOOLS = [{
-    "function_declarations": [{
-        "name": "run_sql",
-        "description": "Run a read-only SQL SELECT query against the loaded dataset and return the results.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "A single read-only SQL SELECT/WITH statement."}
-            },
-            "required": ["query"],
+}
+_GENERATE_IMAGE_DECL = {
+    "name": "generate_image",
+    "description": (
+        "Generate a picture (banner, logo, illustration, poster, icon, wallpaper, artwork, etc.) from a "
+        "plain-language description. Call this whenever the user is asking you to draw/design/generate/create "
+        "an IMAGE or VISUAL ARTWORK - NOT for a chart/graph of their data, use design_card_or_chart for those."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "prompt": {"type": "string",
+                       "description": "A clear, detailed image-generation prompt capturing exactly what the user asked for, in English."}
         },
-    }]
-}]
+        "required": ["prompt"],
+    },
+}
+_DESIGN_CARD_CHART_DECL = {
+    "name": "design_card_or_chart",
+    "description": (
+        "Design ONE new KPI card or ONE new chart for the dashboard, built from the user's OWN loaded dataset. "
+        "Call this whenever the user asks you to build/add/create a chart, graph, KPI card, or metric for their "
+        "dashboard (e.g. 'monthly revenue trend banao', 'top clients by total paid ka chart banao') - NOT for a "
+        "generic image/artwork request, use generate_image for those."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "requirement": {"type": "string",
+                             "description": "The user's requirement in their own words, e.g. 'monthly revenue trend' or 'top 5 clients by total paid'."}
+        },
+        "required": ["requirement"],
+    },
+}
+
+
+def _build_openai_tools(has_data: bool, can_edit: bool):
+    """Only offers each tool when it can actually be fulfilled: run_sql needs
+    a loaded dataset; design_card_or_chart needs BOTH a dataset and edit
+    rights (view-only accounts can chat but not build); generate_image only
+    needs edit rights. Returns None (no tools at all) if nothing qualifies -
+    a plain-text-only call, same as before this feature existed."""
+    decls = []
+    if has_data:
+        decls.append(_RUN_SQL_DECL)
+    if can_edit:
+        decls.append(_GENERATE_IMAGE_DECL)
+        if has_data:
+            decls.append(_DESIGN_CARD_CHART_DECL)
+    if not decls:
+        return None
+    return [{"type": "function", "function": d} for d in decls]
+
+
+def _build_gemini_tools(has_data: bool, can_edit: bool):
+    decls = []
+    if has_data:
+        decls.append(_RUN_SQL_DECL)
+    if can_edit:
+        decls.append(_GENERATE_IMAGE_DECL)
+        if has_data:
+            decls.append(_DESIGN_CARD_CHART_DECL)
+    if not decls:
+        return None
+    return [{"function_declarations": decls}]
+
+
+def _result(kind="text", answer=None, sql_used=None, proof_df=None,
+            image_b64=None, mime_type=None, spec=None, error=None):
+    """Canonical return shape for ask() regardless of which of the 3 intents
+    the model picked. `kind` tells app.py how to render this turn:
+      "text"       -> normal chat bubble (`answer`, optionally `sql_used`/`proof_df` as proof)
+      "image"      -> an image bubble (`image_b64` + `mime_type`, `answer` as an optional caption)
+      "card_chart" -> the existing Add/Pin-to-dashboard preview UI, built from `spec`
+    `error` set means something went wrong — callers should show it and not
+    trust the other fields."""
+    return {"kind": kind, "answer": answer, "sql_used": sql_used, "proof_df": proof_df,
+            "image_b64": image_b64, "mime_type": mime_type, "spec": spec, "error": error}
 
 
 def _call_gemini(api_key, system_instruction, contents, tools=None, temperature=0.2):
@@ -377,7 +463,11 @@ def _gemini_extract(data):
     return "\n".join(text_parts).strip(), fn_call, content
 
 
-def _call_openrouter(api_key, messages):
+def _call_openrouter(api_key, messages, tools=None):
+    body = {"model": OPENROUTER_MODEL, "messages": messages, "temperature": 0.2}
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
     resp = requests.post(
         OPENROUTER_URL,
         headers={
@@ -387,8 +477,7 @@ def _call_openrouter(api_key, messages):
             "HTTP-Referer": "https://sports-analytics-platform.local",
             "X-Title": "Sports Analytics Platform",
         },
-        json={"model": OPENROUTER_MODEL, "messages": messages, "tools": TOOLS,
-              "tool_choice": "auto", "temperature": 0.2},
+        json=body,
         timeout=60,
     )
     if resp.status_code == 401:
@@ -400,22 +489,33 @@ def _call_openrouter(api_key, messages):
     return resp.json()
 
 
-def ask(question, df, meta, kpis, dashboard_charts, api_key, history=None):
-    """Runs the tool-calling loop. Returns dict:
-       {answer: str, sql_used: str|None, proof_df: DataFrame|None, error: str|None}
-    Routes to Gemini or OpenRouter based on the key's shape (see detect_provider) —
-    this is the one place that decides, everything downstream is provider-specific."""
+def ask(question, df, meta, kpis, dashboard_charts, api_key, history=None, can_edit=False):
+    """Runs the tool-calling loop and lets the model itself pick the intent —
+    a data/general question, an image request, or a new-chart/KPI-card
+    request (see the 3 tool declarations above) - no manual mode picker
+    needed on the caller's side. Returns a dict shaped by _result() above;
+    check `kind` to know how to render it.
+
+    `can_edit` gates whether the image/card-chart tools are even offered -
+    pass False (the default) for any read-only/follow-up Q&A surface that
+    should only ever produce plain-text answers (e.g. the Full Analysis
+    page's follow-up box); the main 🤖 AI Assistant page passes the real
+    can_edit() so only editors can trigger those two.
+
+    Routes to Gemini or OpenRouter based on the key's shape (see
+    detect_provider) — this is the one place that decides, everything
+    downstream is provider-specific."""
     if not api_key:
-        return {"answer": None, "sql_used": None, "proof_df": None,
-                "error": "No AI API key configured yet — add one below (it's free)."}
+        return _result(error="No AI API key configured yet — add one below (it's free).")
 
     system_prompt = _system_prompt(df, meta, kpis, dashboard_charts)
     if detect_provider(api_key) == "gemini":
-        return _ask_gemini(question, df, system_prompt, api_key, history)
-    return _ask_openrouter(question, df, system_prompt, api_key, history)
+        return _ask_gemini(question, df, system_prompt, api_key, history, can_edit)
+    return _ask_openrouter(question, df, system_prompt, api_key, history, can_edit)
 
 
-def _ask_openrouter(question, df, system_prompt, api_key, history):
+def _ask_openrouter(question, df, system_prompt, api_key, history, can_edit):
+    tools = _build_openai_tools(has_data=df is not None, can_edit=can_edit)
     messages = [{"role": "system", "content": system_prompt}]
     for turn in (history or [])[-6:]:   # keep a little chat memory, capped to avoid huge prompts
         messages.append({"role": turn["role"], "content": turn["content"]})
@@ -424,13 +524,25 @@ def _ask_openrouter(question, df, system_prompt, api_key, history):
     last_sql, last_proof = None, None
     try:
         for _ in range(MAX_TOOL_ROUNDS):
-            data = _call_openrouter(api_key, messages)
+            data = _call_openrouter(api_key, messages, tools=tools)
             choice = data["choices"][0]["message"]
             tool_calls = choice.get("tool_calls")
 
             if not tool_calls:
-                return {"answer": choice.get("content", "").strip(), "sql_used": last_sql,
-                        "proof_df": last_proof, "error": None}
+                return _result(answer=choice.get("content", "").strip(), sql_used=last_sql, proof_df=last_proof)
+
+            # An image or card/chart request ends the turn right here — only
+            # run_sql calls loop back for further refinement.
+            for tc in tool_calls:
+                name = tc["function"]["name"]
+                if name in ("generate_image", "design_card_or_chart"):
+                    args = json.loads(tc["function"]["arguments"] or "{}")
+                    if name == "generate_image":
+                        img = generate_image(args.get("prompt", question), api_key)
+                        return _result(kind="image", answer=img.get("text"), image_b64=img.get("image_b64"),
+                                       mime_type=img.get("mime_type"), error=img.get("error"))
+                    cc = suggest_card_or_chart(args.get("requirement", question), df, api_key)
+                    return _result(kind="card_chart", spec=cc.get("spec"), error=cc.get("error"))
 
             messages.append(choice)
             for tc in tool_calls:
@@ -445,23 +557,23 @@ def _ask_openrouter(question, df, system_prompt, api_key, history):
                     tool_content = f"SQL error: {e}"
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": tool_content})
 
-        return {"answer": "Ran out of steps trying to answer that — try rephrasing the question.",
-                "sql_used": last_sql, "proof_df": last_proof, "error": None}
+        return _result(answer="Ran out of steps trying to answer that — try rephrasing the question.",
+                        sql_used=last_sql, proof_df=last_proof)
     except ChatError as e:
-        return {"answer": None, "sql_used": last_sql, "proof_df": last_proof, "error": str(e)}
+        return _result(sql_used=last_sql, proof_df=last_proof, error=str(e))
     except requests.RequestException as e:
-        return {"answer": None, "sql_used": last_sql, "proof_df": last_proof,
-                "error": f"Network error reaching OpenRouter — check internet: {e}"}
+        return _result(sql_used=last_sql, proof_df=last_proof,
+                        error=f"Network error reaching OpenRouter — check internet: {e}")
 
 
-def _ask_gemini(question, df, system_prompt, api_key, history):
+def _ask_gemini(question, df, system_prompt, api_key, history, can_edit):
     contents = []
     for turn in (history or [])[-6:]:
         role = "model" if turn["role"] == "assistant" else "user"
         contents.append({"role": role, "parts": [{"text": turn["content"]}]})
     contents.append({"role": "user", "parts": [{"text": question}]})
 
-    tools = GEMINI_TOOLS if df is not None else None
+    tools = _build_gemini_tools(has_data=df is not None, can_edit=can_edit)
     last_sql, last_proof = None, None
     try:
         for _ in range(MAX_TOOL_ROUNDS):
@@ -469,10 +581,21 @@ def _ask_gemini(question, df, system_prompt, api_key, history):
             text, fn_call, model_content = _gemini_extract(data)
 
             if not fn_call:
-                return {"answer": text, "sql_used": last_sql, "proof_df": last_proof, "error": None}
+                return _result(answer=text, sql_used=last_sql, proof_df=last_proof)
+
+            name = fn_call.get("name")
+            args = fn_call.get("args") or {}
+
+            if name == "generate_image":
+                img = generate_image(args.get("prompt", question), api_key)
+                return _result(kind="image", answer=img.get("text"), image_b64=img.get("image_b64"),
+                               mime_type=img.get("mime_type"), error=img.get("error"))
+            if name == "design_card_or_chart":
+                cc = suggest_card_or_chart(args.get("requirement", question), df, api_key)
+                return _result(kind="card_chart", spec=cc.get("spec"), error=cc.get("error"))
 
             contents.append(model_content)   # the model's turn, including its functionCall part
-            sql = (fn_call.get("args") or {}).get("query", "")
+            sql = args.get("query", "")
             try:
                 result_df = qe.run_sql(df, sql)
                 last_sql, last_proof = sql, result_df
@@ -481,17 +604,16 @@ def _ask_gemini(question, df, system_prompt, api_key, history):
             except qe.QueryError as e:
                 tool_content = f"SQL error: {e}"
             contents.append({"role": "user", "parts": [{
-                "functionResponse": {"name": fn_call.get("name", "run_sql"),
-                                      "response": {"content": tool_content}}
+                "functionResponse": {"name": name or "run_sql", "response": {"content": tool_content}}
             }]})
 
-        return {"answer": "Ran out of steps trying to answer that — try rephrasing the question.",
-                "sql_used": last_sql, "proof_df": last_proof, "error": None}
+        return _result(answer="Ran out of steps trying to answer that — try rephrasing the question.",
+                        sql_used=last_sql, proof_df=last_proof)
     except ChatError as e:
-        return {"answer": None, "sql_used": last_sql, "proof_df": last_proof, "error": str(e)}
+        return _result(sql_used=last_sql, proof_df=last_proof, error=str(e))
     except requests.RequestException as e:
-        return {"answer": None, "sql_used": last_sql, "proof_df": last_proof,
-                "error": f"Network error reaching Gemini — check internet: {e}"}
+        return _result(sql_used=last_sql, proof_df=last_proof,
+                        error=f"Network error reaching Gemini — check internet: {e}")
 
 
 # ==================================================================================
