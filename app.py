@@ -2586,7 +2586,7 @@ with st.sidebar:
     sync_workspace_from_disk()
 
     nav_options = ["📥 Connect Data", "📊 Raw Analysis", "🧩 Custom Builder", "⭐ Boss Dashboard",
-                    "📈 Full Analysis", "🗂 Data Table", "🤖 AI Assistant", "⚙️ Settings", "💎 Plans"]
+                    "📈 Full Analysis", "🗂 Data Table", "🤖 RA-I - AI Assistant", "⚙️ Settings", "💎 Plans"]
     # "💡 Business Insights" only makes sense for datasets that actually have a
     # Payment Page Title-shaped column (e.g. "Badminton AMD Mondays") - this app
     # is used by many different clients with unrelated datasets, so the tab
@@ -2606,7 +2606,7 @@ with st.sidebar:
         if st.session_state.df_raw is not None and ppt.detect_title_column(st.session_state.df_raw, st.session_state.meta):
             nav_options.append("💡 Business Insights")
         nav_options.append("📈 Full Analysis")
-        nav_options.append("🤖 AI Assistant")
+        nav_options.append("🤖 RA-I - AI Assistant")
         nav_options.append("⚙️ Settings")   # Defaults tab only — see the Settings page's role check
     if st.session_state.role == auth.ROLE_ADMIN:
         nav_options.append("🔐 Admin Panel")
@@ -3987,7 +3987,7 @@ elif page == "📈 Full Analysis":
                        "write-up hai agar chahiye — sabhi numbers wahi hain, koi naya number invent nahi hota.")
             if not api_key:
                 if st.session_state.role == auth.ROLE_ADMIN:
-                    st.warning("No free OpenRouter API key configured yet — add one on the **🤖 AI Assistant** page to enable this.")
+                    st.warning("No free OpenRouter API key configured yet — add one on the **🤖 RA-I - AI Assistant** page to enable this.")
                 else:
                     st.info("🧠 AI write-up abhi enable nahi hai. Please contact your admin to turn this on.")
             else:
@@ -4299,8 +4299,8 @@ elif page == "🗂 Data Table":
 # ==================================================================================
 # PAGE 3.5: AI ASSISTANT — free chat with your data (OpenRouter free tier)
 # ==================================================================================
-elif page == "🤖 AI Assistant":
-    st.title("🤖 AI Assistant")
+elif page == "🤖 RA-I - AI Assistant":
+    st.title("🤖 RA-I - AI Assistant")
     st.caption("Ask anything about your data, or anything else. Data answers are grounded in "
                "real SQL, with proof shown below each reply.")
 
@@ -4348,7 +4348,7 @@ elif page == "🤖 AI Assistant":
                 st.session_state.ai_groq_key = typed_key
                 st.rerun()
         else:
-            st.info("🤖 AI Assistant abhi enable nahi hai. Please contact your admin to turn this on.")
+            st.info("🤖 RA-I - AI Assistant abhi enable nahi hai. Please contact your admin to turn this on.")
         st.stop()
 
     kpis = de.compute_kpis(df_raw, meta)
@@ -5176,7 +5176,7 @@ report, without you writing a single formula.
   in pandas/SQL-like syntax (e.g. `Amount > 100000 and Status == 'Paid'`), sort,
   and export the exact slice you need as CSV.
 
-**🤖 AI Assistant**
+**🤖 RA-I - AI Assistant**
 - Ask questions about your data in plain language — answers are grounded in
   real SQL run against your actual dataset, not guesses, with the underlying
   query shown as proof under each reply.
