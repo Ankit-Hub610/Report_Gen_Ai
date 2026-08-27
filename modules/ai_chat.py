@@ -65,6 +65,7 @@ SETUP (one-time, free):
 
 import os
 import json
+import re
 
 import pandas as pd
 import requests
@@ -237,6 +238,9 @@ manual mode-picker. No dataset is loaded in this session right now, so:
   conversation, sports/news/trivia, writing help, math, coding help, translations, etc. — just
   answer directly and helpfully from your own knowledge, exactly like a normal general-purpose AI
   assistant would.
+- IMPORTANT: a tool being available doesn't mean you must use it. For a greeting, small talk,
+  thanks, "ok", or anything that isn't explicitly asking for an image, just reply in plain text
+  and call no tool at all.
 
 Reply in clear, simple language (Hindi/English mix is fine if the user writes that way). Keep
 answers concise — a short paragraph or a few bullet points, not an essay."""
@@ -305,6 +309,15 @@ WHEN YOU ANSWER A DATASET QUESTION
 WHEN YOU ANSWER A GENERAL QUESTION
 - Just answer it well and concisely, like any capable AI assistant would — no need to mention the
   dataset, SQL, or the dashboard at all unless the user's question is actually about those.
+
+IMPORTANT — DON'T CALL A TOOL JUST BECAUSE ONE IS AVAILABLE
+- A tool is offered on every turn, but that does NOT mean one is needed for every turn. For a
+  greeting, small talk, thanks, "ok", or any message that isn't clearly asking for a SQL answer,
+  an image, or a new chart/KPI — just reply in plain text and call no tool at all.
+- Only call generate_image when the user is explicitly asking for a picture/artwork to be drawn.
+  Only call design_card_or_chart when they're explicitly asking for a new dashboard chart/KPI.
+  Only call run_sql when you actually need a real number/record from their dataset that isn't
+  already given to you above. When in doubt, don't call a tool — answer in plain text instead.
 
 Keep answers concise — a short paragraph or a few bullet points, not an essay — for either kind.
 """
@@ -491,6 +504,37 @@ def _call_openrouter(api_key, messages, tools=None):
     return resp.json()
 
 
+# BUG FIX (reported: plain "hello" triggered a "Free-tier image quota hit"
+# error, though the message had nothing to do with an image): every call
+# offers the model all 3 tools (run_sql / generate_image / design_card_or_chart)
+# together and lets IT decide which one (if any) a message needs - see the
+# big comment above the tool declarations. That's the right design for real
+# requests, but free/weaker models occasionally reach for a tool "because
+# it's there" even on a plain greeting or one-word message that obviously
+# needs none of them. Prompt wording alone can't fully guarantee this for
+# every model, so this is a small, deliberately NARROW second layer: for
+# messages that are ENTIRELY a greeting/social nicety (and nothing else -
+# "hello, also make me a chart" does NOT match, only pure "hello" does), we
+# don't hand the model any tools for that turn at all. A tool that was never
+# offered physically cannot be called, so this guarantees a plain-text reply
+# regardless of what a particular model would have been tempted to do.
+_GREETING_ONLY_RE = re.compile(
+    r"^\s*("
+    r"hi+|hello+|hey+|yo|namaste|namaskar|salaam|sup|"
+    r"good\s*(morning|afternoon|evening|night)|"
+    r"ok(ay)?|k|kk|thanks?|thank\s*you|thankyou|thnx|ty|"
+    r"bye|goodbye|see\s*ya|good\s*night|"
+    r"kaise\s*ho|kaisi\s*ho|kya\s*haal\s*hai|kaisa\s*hai|sab\s*theek|kya\s*chal\s*raha\s*hai|"
+    r"how\s*are\s*you|whats?\s*up|wassup"
+    r")\s*[!.?]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_greeting_only(text: str) -> bool:
+    return bool(_GREETING_ONLY_RE.match((text or "").strip()))
+
+
 def ask(question, df, meta, kpis, dashboard_charts, api_key, history=None, can_edit=False):
     """Runs the tool-calling loop and lets the model itself pick the intent —
     a data/general question, an image request, or a new-chart/KPI-card
@@ -512,9 +556,10 @@ def ask(question, df, meta, kpis, dashboard_charts, api_key, history=None, can_e
 
     try:
         system_prompt = _system_prompt(df, meta, kpis, dashboard_charts)
+        force_no_tools = _is_greeting_only(question)
         if detect_provider(api_key) == "gemini":
-            return _ask_gemini(question, df, system_prompt, api_key, history, can_edit)
-        return _ask_openrouter(question, df, system_prompt, api_key, history, can_edit)
+            return _ask_gemini(question, df, system_prompt, api_key, history, can_edit, force_no_tools)
+        return _ask_openrouter(question, df, system_prompt, api_key, history, can_edit, force_no_tools)
     except Exception as e:
         # Outermost safety net — even a failure building the prompt itself
         # (before either provider call starts) must never crash the whole
@@ -522,8 +567,8 @@ def ask(question, df, meta, kpis, dashboard_charts, api_key, history=None, can_e
         return _result(error=f"Unexpected error while answering ({type(e).__name__}: {e}) — try again.")
 
 
-def _ask_openrouter(question, df, system_prompt, api_key, history, can_edit):
-    tools = _build_openai_tools(has_data=df is not None, can_edit=can_edit)
+def _ask_openrouter(question, df, system_prompt, api_key, history, can_edit, force_no_tools=False):
+    tools = None if force_no_tools else _build_openai_tools(has_data=df is not None, can_edit=can_edit)
     messages = [{"role": "system", "content": system_prompt}]
     for turn in (history or [])[-6:]:   # keep a little chat memory, capped to avoid huge prompts
         messages.append({"role": turn["role"], "content": turn["content"]})
@@ -582,14 +627,14 @@ def _ask_openrouter(question, df, system_prompt, api_key, history, can_edit):
                         error=f"Unexpected error while answering ({type(e).__name__}: {e}) — try again.")
 
 
-def _ask_gemini(question, df, system_prompt, api_key, history, can_edit):
+def _ask_gemini(question, df, system_prompt, api_key, history, can_edit, force_no_tools=False):
     contents = []
     for turn in (history or [])[-6:]:
         role = "model" if turn["role"] == "assistant" else "user"
         contents.append({"role": role, "parts": [{"text": turn["content"]}]})
     contents.append({"role": "user", "parts": [{"text": question}]})
 
-    tools = _build_gemini_tools(has_data=df is not None, can_edit=can_edit)
+    tools = None if force_no_tools else _build_gemini_tools(has_data=df is not None, can_edit=can_edit)
     last_sql, last_proof = None, None
     try:
         for _ in range(MAX_TOOL_ROUNDS):
