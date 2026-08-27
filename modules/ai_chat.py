@@ -284,6 +284,50 @@ GEMINI_TOOLS = [{
 }]
 
 
+def _call_gemini(api_key, system_instruction, contents, tools=None, temperature=0.2):
+    """Low-level call to Gemini's native generateContent endpoint. `contents`
+    is already in Gemini's {"role": "user"|"model", "parts": [...]} shape —
+    callers build that, this just sends it and checks for errors."""
+    body = {"contents": contents, "generationConfig": {"temperature": temperature}}
+    if system_instruction:
+        body["system_instruction"] = {"parts": [{"text": system_instruction}]}
+    if tools:
+        body["tools"] = tools
+    resp = requests.post(
+        GEMINI_URL,
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        json=body,
+        timeout=60,
+    )
+    if resp.status_code in (401, 403):
+        raise ChatError("Gemini API key rejected — check the key at aistudio.google.com "
+                         "(Get API key). Make sure it was pasted in full, with no extra spaces.")
+    if resp.status_code == 429:
+        raise ChatError("Gemini free-tier rate limit hit — wait a minute and try again.")
+    if resp.status_code >= 400:
+        raise ChatError(f"Gemini API error ({resp.status_code}): {resp.text[:300]}")
+    data = resp.json()
+    if not data.get("candidates"):
+        block_reason = (data.get("promptFeedback") or {}).get("blockReason")
+        if block_reason:
+            raise ChatError(f"Gemini declined to answer that (reason: {block_reason}). Try rephrasing.")
+        raise ChatError("Gemini returned no answer — try again.")
+    return data
+
+
+def _gemini_extract(data):
+    """Pulls (text, function_call, raw_model_content) out of a generateContent
+    response. function_call is {"name": ..., "args": {...}} or None."""
+    content = data["candidates"][0].get("content", {"role": "model", "parts": []})
+    text_parts, fn_call = [], None
+    for p in content.get("parts", []):
+        if "text" in p:
+            text_parts.append(p["text"])
+        elif "functionCall" in p:
+            fn_call = p["functionCall"]
+    return "\n".join(text_parts).strip(), fn_call, content
+
+
 def _call_openrouter(api_key, messages):
     resp = requests.post(
         OPENROUTER_URL,
@@ -309,12 +353,21 @@ def _call_openrouter(api_key, messages):
 
 def ask(question, df, meta, kpis, dashboard_charts, api_key, history=None):
     """Runs the tool-calling loop. Returns dict:
-       {answer: str, sql_used: str|None, proof_df: DataFrame|None, error: str|None}"""
+       {answer: str, sql_used: str|None, proof_df: DataFrame|None, error: str|None}
+    Routes to Gemini or OpenRouter based on the key's shape (see detect_provider) —
+    this is the one place that decides, everything downstream is provider-specific."""
     if not api_key:
         return {"answer": None, "sql_used": None, "proof_df": None,
-                "error": "No OpenRouter API key configured yet — add one below (it's free)."}
+                "error": "No AI API key configured yet — add one below (it's free)."}
 
-    messages = [{"role": "system", "content": _system_prompt(df, meta, kpis, dashboard_charts)}]
+    system_prompt = _system_prompt(df, meta, kpis, dashboard_charts)
+    if detect_provider(api_key) == "gemini":
+        return _ask_gemini(question, df, system_prompt, api_key, history)
+    return _ask_openrouter(question, df, system_prompt, api_key, history)
+
+
+def _ask_openrouter(question, df, system_prompt, api_key, history):
+    messages = [{"role": "system", "content": system_prompt}]
     for turn in (history or [])[-6:]:   # keep a little chat memory, capped to avoid huge prompts
         messages.append({"role": turn["role"], "content": turn["content"]})
     messages.append({"role": "user", "content": question})
@@ -350,6 +403,46 @@ def ask(question, df, meta, kpis, dashboard_charts, api_key, history=None):
     except requests.RequestException as e:
         return {"answer": None, "sql_used": last_sql, "proof_df": last_proof,
                 "error": f"Network error reaching OpenRouter — check internet: {e}"}
+
+
+def _ask_gemini(question, df, system_prompt, api_key, history):
+    contents = []
+    for turn in (history or [])[-6:]:
+        role = "model" if turn["role"] == "assistant" else "user"
+        contents.append({"role": role, "parts": [{"text": turn["content"]}]})
+    contents.append({"role": "user", "parts": [{"text": question}]})
+
+    tools = GEMINI_TOOLS if df is not None else None
+    last_sql, last_proof = None, None
+    try:
+        for _ in range(MAX_TOOL_ROUNDS):
+            data = _call_gemini(api_key, system_prompt, contents, tools=tools, temperature=0.2)
+            text, fn_call, model_content = _gemini_extract(data)
+
+            if not fn_call:
+                return {"answer": text, "sql_used": last_sql, "proof_df": last_proof, "error": None}
+
+            contents.append(model_content)   # the model's turn, including its functionCall part
+            sql = (fn_call.get("args") or {}).get("query", "")
+            try:
+                result_df = qe.run_sql(df, sql)
+                last_sql, last_proof = sql, result_df
+                preview = result_df.head(MAX_ROWS_TO_MODEL).to_csv(index=False)
+                tool_content = f"{len(result_df)} row(s) returned.\n{preview}"
+            except qe.QueryError as e:
+                tool_content = f"SQL error: {e}"
+            contents.append({"role": "user", "parts": [{
+                "functionResponse": {"name": fn_call.get("name", "run_sql"),
+                                      "response": {"content": tool_content}}
+            }]})
+
+        return {"answer": "Ran out of steps trying to answer that — try rephrasing the question.",
+                "sql_used": last_sql, "proof_df": last_proof, "error": None}
+    except ChatError as e:
+        return {"answer": None, "sql_used": last_sql, "proof_df": last_proof, "error": str(e)}
+    except requests.RequestException as e:
+        return {"answer": None, "sql_used": last_sql, "proof_df": last_proof,
+                "error": f"Network error reaching Gemini — check internet: {e}"}
 
 
 # ==================================================================================
@@ -489,6 +582,16 @@ def _call_openrouter_plain(api_key, messages, temperature=0.1):
     return resp.json()
 
 
+def _call_gemini_plain(api_key, prompt_text, temperature=0.1):
+    """Single-turn plain-text Gemini call — no tools, no system_instruction
+    split, the whole prompt is just the one user turn (matches how the
+    OpenRouter equivalents in this file build their prompt)."""
+    data = _call_gemini(api_key, None, [{"role": "user", "parts": [{"text": prompt_text}]}],
+                         tools=None, temperature=temperature)
+    text, _, _ = _gemini_extract(data)
+    return text
+
+
 # ==================================================================================
 # INTELLIGENCE REPORT — NARRATIVE WRITE-UP OVER ALREADY-COMPUTED FACTS
 # ==================================================================================
@@ -544,19 +647,22 @@ def generate_report_narrative(facts_text: str, api_key: str, language: str = "En
     'English', 'Hindi', or 'Both' (caller should call this twice for 'Both',
     once per language, and cache each separately)."""
     if not api_key:
-        return {"report": None, "error": "No OpenRouter API key configured yet — add one on the AI Assistant page (it's free)."}
+        return {"report": None, "error": "No AI API key configured yet — add one on the AI Assistant page (it's free)."}
     lang = "Hindi" if language == "Hindi" else "English"
-    messages = [{"role": "user", "content": _report_system_prompt(facts_text, lang)}]
+    prompt_text = _report_system_prompt(facts_text, lang)
     try:
-        data = _call_openrouter_plain(api_key, messages, temperature=0.35)
-        content = data["choices"][0]["message"].get("content", "").strip()
+        if detect_provider(api_key) == "gemini":
+            content = _call_gemini_plain(api_key, prompt_text, temperature=0.35)
+        else:
+            data = _call_openrouter_plain(api_key, [{"role": "user", "content": prompt_text}], temperature=0.35)
+            content = data["choices"][0]["message"].get("content", "").strip()
         if not content:
             return {"report": None, "error": "AI returned an empty report — try again."}
         return {"report": content, "error": None}
     except ChatError as e:
         return {"report": None, "error": str(e)}
     except requests.RequestException as e:
-        return {"report": None, "error": f"Network error reaching OpenRouter — check internet: {e}"}
+        return {"report": None, "error": f"Network error reaching the AI provider — check internet: {e}"}
     except (KeyError, IndexError, TypeError):
         return {"report": None, "error": "AI didn't return a usable report — try again."}
 
@@ -567,14 +673,15 @@ def suggest_card_or_chart(requirement: str, df: pd.DataFrame, api_key):
     `spec` (when present) is a plain dict in one of the two shapes documented
     in _card_chart_system_prompt, not yet a full custom_kpis/custom_charts item."""
     if not api_key:
-        return {"spec": None, "error": "No OpenRouter API key configured yet — add one on this page (it's free)."}
-    messages = [
-        {"role": "system", "content": _card_chart_system_prompt(df)},
-        {"role": "user", "content": requirement},
-    ]
+        return {"spec": None, "error": "No AI API key configured yet — add one on this page (it's free)."}
+    system_text = _card_chart_system_prompt(df)
     try:
-        data = _call_openrouter_plain(api_key, messages)
-        content = data["choices"][0]["message"].get("content", "").strip()
+        if detect_provider(api_key) == "gemini":
+            content = _call_gemini_plain(api_key, f"{system_text}\n\n{requirement}")
+        else:
+            messages = [{"role": "system", "content": system_text}, {"role": "user", "content": requirement}]
+            data = _call_openrouter_plain(api_key, messages)
+            content = data["choices"][0]["message"].get("content", "").strip()
         content = content.strip("`\n ")
         if content.lower().startswith("json"):
             content = content[4:].strip()
