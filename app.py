@@ -2586,7 +2586,7 @@ with st.sidebar:
     sync_workspace_from_disk()
 
     nav_options = ["📥 Connect Data", "📊 Raw Analysis", "🧩 Custom Builder", "⭐ Boss Dashboard",
-                    "📈 Full Analysis", "🗂 Data Table", "🤖 RA-I - AI Assistant", "⚙️ Settings", "💎 Plans"]
+                    "📈 Full Analysis", "🗂 Data Table", "🤖 AI Assistant", "⚙️ Settings", "💎 Plans"]
     # "💡 Business Insights" only makes sense for datasets that actually have a
     # Payment Page Title-shaped column (e.g. "Badminton AMD Mondays") - this app
     # is used by many different clients with unrelated datasets, so the tab
@@ -2606,7 +2606,7 @@ with st.sidebar:
         if st.session_state.df_raw is not None and ppt.detect_title_column(st.session_state.df_raw, st.session_state.meta):
             nav_options.append("💡 Business Insights")
         nav_options.append("📈 Full Analysis")
-        nav_options.append("🤖 RA-I - AI Assistant")
+        nav_options.append("🤖 AI Assistant")
         nav_options.append("⚙️ Settings")   # Defaults tab only — see the Settings page's role check
     if st.session_state.role == auth.ROLE_ADMIN:
         nav_options.append("🔐 Admin Panel")
@@ -3987,7 +3987,7 @@ elif page == "📈 Full Analysis":
                        "write-up hai agar chahiye — sabhi numbers wahi hain, koi naya number invent nahi hota.")
             if not api_key:
                 if st.session_state.role == auth.ROLE_ADMIN:
-                    st.warning("No free OpenRouter API key configured yet — add one on the **🤖 RA-I - AI Assistant** page to enable this.")
+                    st.warning("No free OpenRouter API key configured yet — add one on the **🤖 AI Assistant** page to enable this.")
                 else:
                     st.info("🧠 AI write-up abhi enable nahi hai. Please contact your admin to turn this on.")
             else:
@@ -4299,8 +4299,8 @@ elif page == "🗂 Data Table":
 # ==================================================================================
 # PAGE 3.5: AI ASSISTANT — free chat with your data (OpenRouter free tier)
 # ==================================================================================
-elif page == "🤖 RA-I - AI Assistant":
-    st.title("🤖 RA-I - AI Assistant")
+elif page == "🤖 AI Assistant":
+    st.title("🤖 AI Assistant")
     st.caption("Ask anything about your data, or anything else. Data answers are grounded in "
                "real SQL, with proof shown below each reply.")
 
@@ -4348,7 +4348,7 @@ elif page == "🤖 RA-I - AI Assistant":
                 st.session_state.ai_groq_key = typed_key
                 st.rerun()
         else:
-            st.info("🤖 RA-I - AI Assistant abhi enable nahi hai. Please contact your admin to turn this on.")
+            st.info("🤖 AI Assistant abhi enable nahi hai. Please contact your admin to turn this on.")
         st.stop()
 
     kpis = de.compute_kpis(df_raw, meta)
@@ -4455,6 +4455,8 @@ elif page == "🤖 RA-I - AI Assistant":
     import html as _html_mod
 
     def _render_bubble(role: str, content: str):
+        if not content:
+            return
         css_class = "ai-bubble-user" if role == "user" else "ai-bubble-assistant"
         st.markdown(
             f'<div class="ai-chat-row {role}"><div class="{css_class}">'
@@ -4466,6 +4468,12 @@ elif page == "🤖 RA-I - AI Assistant":
     with chat_scope:
         for _turn_i, turn in enumerate(st.session_state.ai_chat_history):
             _render_bubble(turn["role"], turn["content"])
+            if turn.get("image_b64"):
+                import base64 as _b64mod
+                try:
+                    st.image(_b64mod.b64decode(turn["image_b64"]), width=420)
+                except Exception:
+                    st.caption("⚠️ Could not display the generated image.")
             if turn.get("proof_df") is not None:
                 with st.expander("🔍 Proof (SQL + data used)"):
                     st.code(turn["sql_used"], language="sql")
@@ -4496,7 +4504,7 @@ elif page == "🤖 RA-I - AI Assistant":
     # Toolbar row: mode pill on the left, a small ghost "clear chat" icon on
     # the right — one row instead of two disconnected floating widgets.
     st.session_state.setdefault("ai_page_mode", "💬 Poocho")
-    _ai_modes = ["💬 Poocho", "🪄 Card/Chart banao"] if can_edit() else ["💬 Poocho"]
+    _ai_modes = ["💬 Poocho", "🪄 Card/Chart banao", "🖼️ Image banao"] if can_edit() else ["💬 Poocho"]
     if st.session_state.ai_page_mode not in _ai_modes:
         st.session_state.ai_page_mode = _ai_modes[0]
     with st.container(key="ai_toolbar_row"):
@@ -4520,7 +4528,14 @@ elif page == "🤖 RA-I - AI Assistant":
                         ws.save_chat_history([], ai_history_storage_id())
                         st.rerun()
     _ask_mode = st.session_state.ai_page_mode == "💬 Poocho"
-    _placeholder = "Ask anything about your data..." if _ask_mode else 'e.g. "monthly revenue trend" or "top clients by total paid"'
+    _image_mode = st.session_state.ai_page_mode == "🖼️ Image banao"
+    if _ask_mode:
+        _placeholder = "Ask anything about your data..."
+    elif _image_mode:
+        _placeholder = 'e.g. "ek banner banao badminton tournament ke liye" or "a friendly cartoon cricket ball logo"'
+    else:
+        _placeholder = 'e.g. "monthly revenue trend" or "top clients by total paid"'
+
 
     # st.chat_input() is ALWAYS pinned to the bottom of the viewport by
     # Streamlit itself — this is what actually fixes the reported "box
@@ -4538,7 +4553,8 @@ elif page == "🤖 RA-I - AI Assistant":
         _ask_mode = True
 
     question = _typed if (_typed and _ask_mode) else None
-    ai_req = _typed if (_typed and not _ask_mode) else None
+    image_req = _typed if (_typed and _image_mode) else None
+    ai_req = _typed if (_typed and not _ask_mode and not _image_mode) else None
     if question:
         st.session_state.ai_chat_history.append({"role": "user", "content": question, "ts": time.time()})
         ai_ok, ai_limit_msg = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "ai_calls")
@@ -4554,6 +4570,25 @@ elif page == "🤖 RA-I - AI Assistant":
             st.session_state.ai_chat_history.append({
                 "role": "assistant", "content": result["answer"],
                 "sql_used": result["sql_used"], "proof_df": result["proof_df"], "ts": time.time(),
+            })
+        ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
+        st.rerun()
+
+    if image_req:
+        st.session_state.ai_chat_history.append({"role": "user", "content": image_req, "ts": time.time()})
+        ai_ok, ai_limit_msg = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "ai_calls")
+        if not ai_ok:
+            st.error(f"🚫 {ai_limit_msg}")
+            st.stop()
+        with st.spinner("Generating image..."):
+            img_result = ac.generate_image(image_req, api_key)
+        if img_result["error"]:
+            st.error(img_result["error"])
+        else:
+            st.session_state.ai_chat_history.append({
+                "role": "assistant", "content": img_result.get("text") or "",
+                "image_b64": img_result["image_b64"], "image_mime": img_result["mime_type"],
+                "ts": time.time(),
             })
         ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
         st.rerun()
@@ -5176,7 +5211,7 @@ report, without you writing a single formula.
   in pandas/SQL-like syntax (e.g. `Amount > 100000 and Status == 'Paid'`), sort,
   and export the exact slice you need as CSV.
 
-**🤖 RA-I - AI Assistant**
+**🤖 AI Assistant**
 - Ask questions about your data in plain language — answers are grounded in
   real SQL run against your actual dataset, not guesses, with the underlying
   query shown as proof under each reply.
