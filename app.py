@@ -1840,14 +1840,84 @@ def load_file(uploaded_file):
     return df
 
 
+# The 3 chart families picked for auto-suggestion — the most universally
+# readable/"boardroom" chart types for a first look at ANY dataset,
+# regardless of industry (sports, e-commerce, invoices...). Order matters:
+# this is also the priority order used if a dataset only supports some of
+# them (e.g. no usable date column for a Line chart).
+_AUTO_SUGGEST_CHART_FAMILIES = ["Bar", "Line", "Pie"]
+_AUTO_SUGGEST_KPI_COUNT = 4
+
+
+def _auto_suggest_dashboard(df, meta):
+    """Picks a sensible STARTING set of KPI cards + charts for the Boss
+    Dashboard the moment a dataset is freshly loaded — so a brand-new user
+    (or a client loading a new file) opens an already-populated,
+    presentation-ready dashboard instead of a blank page with a 'go pin
+    something yourself' message.
+
+    IMPORTANT: nothing this picks is locked or special — every card/chart
+    it returns is pinned through the EXACT SAME pinned_kpis/dashboard_charts
+    mechanism as manually clicking ⭐ on Raw Analysis, so the existing
+    🗑️ Remove button on Boss Dashboard un-pins an auto-suggested card/chart
+    exactly the same way as a manually-pinned one — no separate "AI pick"
+    concept for the person to learn.
+
+    What it picks, and why:
+      - The first `_AUTO_SUGGEST_KPI_COUNT` KPI cards data_engine generates
+        for this dataset. compute_kpis() already returns a small, CURATED
+        set (Total X, Average, Unique count, Date range, Growth rate...) in
+        a deliberate priority order for whatever columns this dataset has —
+        it is NOT one generic card per column — so "the first few of that
+        list" is already a meaningful pick, not an arbitrary slice.
+      - The single best (first-generated) variant from each of
+        _AUTO_SUGGEST_CHART_FAMILIES — Bar, Line, Pie — skipping any family
+        this particular dataset doesn't have suitable columns for (e.g. no
+        date column at all -> no Line suggestion). generate_variants()
+        already orders each family's variants with its most informative
+        one first, so taking variant[0] per family reuses that same
+        judgment rather than re-inventing a new scoring system here.
+
+    Returns (suggested_kpi_labels, suggested_chart_entries) — safe to feed
+    straight into st.session_state.pinned_kpis / dashboard_charts, or to
+    merge into an existing set (see the "✨ Suggest cards & charts for me"
+    button on Boss Dashboard, which reuses this same function later, after
+    the initial load, without wiping whatever the person has since curated).
+    """
+    suggested_kpis = []
+    try:
+        kpis = de.compute_kpis(df, meta)
+        suggested_kpis = [k["label"] for k in kpis[:_AUTO_SUGGEST_KPI_COUNT]]
+    except Exception:
+        pass  # never let a suggestion failure block the actual data load
+
+    suggested_charts = []
+    for fam in _AUTO_SUGGEST_CHART_FAMILIES:
+        try:
+            variants = ce.generate_variants(df, meta, fam)
+        except Exception:
+            variants = []
+        if variants:
+            suggested_charts.append({"family": fam, "variant": copy.deepcopy(variants[0])})
+
+    return suggested_kpis, suggested_charts
+
+
 def _apply_loaded_df(df, source_name):
     df, cap_note = _enforce_row_cap(df)
     st.session_state.df_raw = df
     st.session_state.meta = de.profile_columns(df)
     st.session_state.data_source_name = source_name + (f" {cap_note}" if cap_note else "")
     st.session_state.filters = {}
-    st.session_state.dashboard_charts = []
-    st.session_state.pinned_kpis = []
+    # Auto-suggest a starting Boss Dashboard for this FRESH dataset (see
+    # _auto_suggest_dashboard's docstring) instead of leaving it blank.
+    # Deliberately only happens here / in load_sample() (a genuinely NEW
+    # load) — never in _refresh_loaded_df(), which must never disturb
+    # whatever the person has since pinned/removed on a live-refreshing
+    # source.
+    _sugg_kpis, _sugg_charts = _auto_suggest_dashboard(df, st.session_state.meta)
+    st.session_state.pinned_kpis = _sugg_kpis
+    st.session_state.dashboard_charts = _sugg_charts
     st.session_state.dashboard_slicers = []
     st.session_state.data_source_is_db = False   # a fresh file/sample load — any previous DB link no longer applies
     st.session_state.data_source_is_gsheet = False  # a fresh file/sample load — any previous Google Sheet link no longer applies
@@ -1858,6 +1928,8 @@ def _apply_loaded_df(df, source_name):
         st.warning(f"🆓 Free plan is capped at {ul.FREE_PLAN_LIMITS['max_rows']:,} rows — "
                    f"loaded the first {ul.FREE_PLAN_LIMITS['max_rows']:,} rows of this file. "
                    f"Ask your admin to upgrade your plan for full data.")
+    if _sugg_kpis or _sugg_charts:
+        st.session_state["_dashboard_just_auto_suggested"] = True  # one-shot banner, see Boss Dashboard page
 
 
 def _enforce_row_cap(df):
@@ -1983,9 +2055,14 @@ def load_sample(filename: str = "sample_sports_payments.csv"):
     st.session_state.meta = de.profile_columns(df)
     st.session_state.data_source_name = f"{filename} (demo data)"
     st.session_state.filters = {}
-    st.session_state.dashboard_charts = []
-    st.session_state.pinned_kpis = []
+    # Same auto-suggested starting dashboard as a real file/DB/Sheet load —
+    # see _auto_suggest_dashboard's docstring above.
+    _sugg_kpis, _sugg_charts = _auto_suggest_dashboard(df, st.session_state.meta)
+    st.session_state.pinned_kpis = _sugg_kpis
+    st.session_state.dashboard_charts = _sugg_charts
     st.session_state.dashboard_slicers = []
+    if _sugg_kpis or _sugg_charts:
+        st.session_state["_dashboard_just_auto_suggested"] = True
 
 
 def render_filters(df, meta, key_prefix=""):
@@ -3210,6 +3287,28 @@ elif page == "⭐ Boss Dashboard":
 
     df_raw = st.session_state.df_raw
     meta = st.session_state.meta
+
+    # ---- Auto-suggested starting dashboard: one-shot banner + a button to
+    # re-run suggestions any time (see _auto_suggest_dashboard's docstring). ----
+    if can_edit_dashboard():
+        if st.session_state.pop("_dashboard_just_auto_suggested", False):
+            st.info("✨ We've pre-selected a few KPI cards and charts based on your data to get you "
+                     "started. Keep whatever's useful, remove the rest with 🗑️, or add more from "
+                     "**📊 Raw Analysis** — nothing here is locked.")
+        _sugg_col, _ = st.columns([2, 4])
+        with _sugg_col:
+            if st.button("✨ Suggest cards & charts for me", use_container_width=True,
+                          help="Adds a few auto-picked KPI cards and charts based on your current data — "
+                               "keeps whatever you already have pinned, just adds to it."):
+                _new_kpis, _new_charts = _auto_suggest_dashboard(df_raw, meta)
+                for _lbl in _new_kpis:
+                    if _lbl not in st.session_state.pinned_kpis:
+                        st.session_state.pinned_kpis.append(_lbl)
+                for _entry in _new_charts:
+                    if not chart_in_dashboard(_entry["family"], _entry["variant"]["id"]):
+                        st.session_state.dashboard_charts.append(_entry)
+                persist_workspace_now(force_full=False)
+                st.rerun()
 
     with st.expander("🎨 Dashboard Theme & Style", expanded=False):
         th = st.session_state.theme
