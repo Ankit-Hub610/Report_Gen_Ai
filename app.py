@@ -3650,6 +3650,21 @@ elif page == "📈 Full Analysis":
     # ------------------------------------------------------------------------
     # PAGE NAVIGATION — 2 pages, as requested
     # ------------------------------------------------------------------------
+    # BUG FIX (reported): clicking "Continue to Page 2" / "Back to Page 1"
+    # crashed with StreamlitAPIException. Root cause: the radio widget below
+    # is instantiated with key="intel_part_radio" — and once a widget with a
+    # given key has rendered THIS SAME script run, Streamlit forbids
+    # directly assigning to st.session_state["intel_part_radio"] afterwards
+    # (exactly what those two buttons, further down, used to do). This
+    # mirrors the EXACT same class of bug the Slide switcher hit earlier in
+    # this file (see switch_active_slide()'s docstring) — same fix here:
+    # a one-shot "pending" flag that gets applied to the widget's key BEFORE
+    # the widget is instantiated on the NEXT run (always safe, since that
+    # always happens before the widget exists for that run), instead of
+    # writing to the key directly after the fact.
+    _pending_intel_part = st.session_state.pop("_pending_intel_part_radio", None)
+    if _pending_intel_part is not None:
+        st.session_state["intel_part_radio"] = _pending_intel_part
     part = st.radio("Report section", ["📋 Page 1 — Full Analysis", "📈 Page 2 — Summary & Recommendations"],
                      horizontal=True, index=st.session_state.intel_part - 1, key="intel_part_radio",
                      label_visibility="collapsed")
@@ -3825,9 +3840,15 @@ elif page == "📈 Full Analysis":
             # The radio above has its own key ("intel_part_radio"), so once it's
             # rendered once, Streamlit reads ITS OWN keyed session_state value on
             # every rerun and ignores the index= param — setting intel_part alone
-            # was silently doing nothing. Setting the radio's own key directly is
-            # what actually moves the selection to Page 2.
-            st.session_state["intel_part_radio"] = "📈 Page 2 — Summary & Recommendations"
+            # would silently do nothing. But this widget has ALREADY been
+            # instantiated earlier in THIS SAME run (it renders near the top of
+            # the page, this button is much further down) — Streamlit forbids
+            # writing directly to a widget's own key after it's been
+            # instantiated this run (that's the StreamlitAPIException that was
+            # reported here). Set the one-shot pending flag instead; it gets
+            # applied to the widget's key right before the widget renders on
+            # the NEXT run (see just above where the radio is defined).
+            st.session_state["_pending_intel_part_radio"] = "📈 Page 2 — Summary & Recommendations"
             st.rerun()
 
     # ==========================================================================
@@ -4043,7 +4064,10 @@ elif page == "📈 Full Analysis":
         st.divider()
         if st.button("⬅️ Back to Page 1", key="intel_back_part1"):
             st.session_state.intel_part = 1
-            st.session_state["intel_part_radio"] = "📋 Page 1 — Full Analysis"  # same fix as Continue button above
+            # Same StreamlitAPIException fix as the Continue button above —
+            # can't write "intel_part_radio" directly after it's already been
+            # instantiated this run, so use the one-shot pending flag instead.
+            st.session_state["_pending_intel_part_radio"] = "📋 Page 1 — Full Analysis"
             st.rerun()
 
 
@@ -4301,8 +4325,10 @@ elif page == "🗂 Data Table":
 # ==================================================================================
 elif page == "🤖 AI Assistant":
     st.title("🤖 AI Assistant")
-    st.caption("Ask anything about your data, or anything else. Data answers are grounded in "
-               "real SQL, with proof shown below each reply.")
+    st.caption("Ask anything — general questions, or plain-language questions about your data, KPIs, "
+               "and dashboard charts. Data-related answers are grounded in real SQL run against your "
+               "dataset — not guesses — and shown with proof below each reply. "
+               "Chat history is kept for **5 days** and then auto-deleted.")
 
     if st.session_state.df_raw is None:
         st.info("Load data on the **📥 Connect Data** page first.")
@@ -4329,7 +4355,7 @@ elif page == "🤖 AI Assistant":
                 st.markdown(
                     "**Recommended — Google Gemini** (more reliable, better answer quality):\n"
                     "1. Go to **[aistudio.google.com](https://aistudio.google.com)** and sign in with any Google account.\n"
-                    "2. Click **Get API key** → **Create API key** → copy it (starts with `AIza...` or the newer `AQ....`).\n"
+                    "2. Click **Get API key** → **Create API key** → copy it (starts with `AIza...`).\n"
                     "3. Paste it below to test it now — kept only in this browser session, never saved to disk.\n\n"
                     "*(Alternative: an [openrouter.ai](https://openrouter.ai) key, starting with `sk-or-v1-...`, "
                     "also still works — paste it the same way below, it's auto-detected. OpenRouter's free tier "
@@ -4389,47 +4415,19 @@ elif page == "🤖 AI Assistant":
             max-width: 85%; white-space: pre-wrap; word-wrap: break-word;
             font-size: 0.95rem; line-height: 1.6; padding-top: 2px;
         }
-
-        /* --- Neutral chrome everywhere on this page ------------------------
-           The app theme's primaryColor (red) is meant for a handful of
-           deliberate accents (the user bubble, the active mode pill) — but
-           Streamlit's defaults also paint that same red onto every bordered/
-           focused widget (expanders, the chat input, text inputs). Applied
-           everywhere at once, that reads as a page full of validation-error
-           outlines instead of a calm chat UI. Pin borders to a quiet neutral
-           grey instead, so red only ever means "this is the active thing". */
-        [data-testid="stExpander"] {
-            border: 1px solid rgba(128,128,128,0.22) !important;
-            border-radius: 14px !important;
-            box-shadow: none !important;
+        /* Segmented mode toggle: two plain buttons styled as one pill,
+           active side filled, inactive side ghost — replaces the default
+           radio's visible circle dot, which looked cheap/unpolished. */
+        div.st-key-ai_mode_row div[data-testid="stHorizontalBlock"] {
+            gap: 0 !important; width: fit-content; border: 1px solid rgba(128,128,128,0.35);
+            border-radius: 999px; padding: 3px; margin-bottom: 10px;
         }
-        [data-testid="stChatInput"] {
-            border-radius: 999px !important;
-            border: 1px solid rgba(128,128,128,0.22) !important;
-            box-shadow: 0 1px 6px rgba(0,0,0,0.05) !important;
-            transition: border-color .15s ease, box-shadow .15s ease;
+        div.st-key-ai_mode_row button {
+            border-radius: 999px !important; border: none !important; box-shadow: none !important;
         }
-        [data-testid="stChatInput"]:focus-within {
-            border-color: rgba(128,128,128,0.45) !important;
-            box-shadow: 0 2px 12px rgba(0,0,0,0.08) !important;
+        div.st-key-ai_mode_row div[data-testid="stHorizontalBlock"] > div:has(button[kind="secondary"]) button {
+            background: transparent !important;
         }
-        [data-testid="stChatInput"] textarea { font-size: 0.95rem !important; }
-
-        /* --- Toolbar row (just the clear-chat icon now) ----------------------
-           Used to also hold a 3-button mode-picker pill (Poocho/Card-Chart/
-           Image) — removed (see the "ONE UNIFIED INPUT" block below in this
-           page) so the AI itself detects intent from the message instead of
-           the user picking a mode by hand, ChatGPT-style. Kept as a flex row
-           in case more small icon actions land here later. */
-        div.st-key-ai_toolbar_row div[data-testid="stHorizontalBlock"] {
-            align-items: center; gap: 0 !important; margin: 2px 0 14px 0;
-        }
-        div.st-key-ai_clear_btn button {
-            border: none !important; background: transparent !important; box-shadow: none !important;
-            color: rgba(128,128,128,0.85) !important; font-size: 0.85rem !important;
-        }
-        div.st-key-ai_clear_btn button:hover { color: var(--primary-color, #FF4B4B) !important; }
-
         /* Small ghost icon-buttons under each assistant reply (Copy / Regenerate).
            Container keys are dynamic per-turn (ai_msg_actions_0, _1, ...), so
            match on a class-name substring instead of one exact st-key-X class. */
@@ -4445,8 +4443,6 @@ elif page == "🤖 AI Assistant":
     import html as _html_mod
 
     def _render_bubble(role: str, content: str):
-        if not content:
-            return
         css_class = "ai-bubble-user" if role == "user" else "ai-bubble-assistant"
         st.markdown(
             f'<div class="ai-chat-row {role}"><div class="{css_class}">'
@@ -4458,12 +4454,6 @@ elif page == "🤖 AI Assistant":
     with chat_scope:
         for _turn_i, turn in enumerate(st.session_state.ai_chat_history):
             _render_bubble(turn["role"], turn["content"])
-            if turn.get("image_b64"):
-                import base64 as _b64mod
-                try:
-                    st.image(_b64mod.b64decode(turn["image_b64"]), width=420)
-                except Exception:
-                    st.caption("⚠️ Could not display the generated image.")
             if turn.get("proof_df") is not None:
                 with st.expander("🔍 Proof (SQL + data used)"):
                     st.code(turn["sql_used"], language="sql")
@@ -4491,31 +4481,23 @@ elif page == "🤖 AI Assistant":
     if _ai_remaining_top is not None:
         st.caption(f"🆓 Free plan: {_ai_remaining_top} AI request(s) left today.")
 
-    # ------------------------------------------------------------------------
-    # ONE UNIFIED INPUT — NO MANUAL MODE PICKER
-    # ------------------------------------------------------------------------
-    # BUG FIX (reported): a 3-button row ("💬 Poocho" / "🪄 Card/Chart banao" /
-    # "🖼️ Image banao") used to sit above the input, forcing the user to pick
-    # a mode by hand before every message — "kuch bhi bolo vo samajh jata he,
-    # jesa ChatGPT" was the ask. The picker is gone; there's just the one
-    # chat box below now. ac.ask() itself figures out — from the wording
-    # alone, via 3 tool declarations the model chooses between — whether this
-    # is a data/general question, an image request, or a new chart/KPI-card
-    # request, and returns which one it picked in result["kind"]. This block
-    # just renders whichever kind comes back; see modules/ai_chat.py for the
-    # actual intent-routing logic.
-    if st.session_state.ai_chat_history:
-        with st.container(key="ai_toolbar_row"):
-            _tb_left, _tb_right = st.columns([5, 1])
-            with _tb_right:
-                with st.container(key="ai_clear_btn"):
-                    if st.button("🗑️ Clear", key="ai_clear_chat_btn", help="Clear this chat"):
-                        st.session_state.ai_chat_history = []
-                        ws.save_chat_history([], ai_history_storage_id())
-                        st.rerun()
-
-    _placeholder = ("Ask anything, or ask me to build a chart/KPI card, or generate an image..."
-                    if can_edit() else "Ask anything about your data...")
+    # Two-button segmented mode toggle — see CSS above for the pill styling.
+    st.session_state.setdefault("ai_page_mode", "💬 Poocho")
+    _ai_modes = ["💬 Poocho", "🪄 Card/Chart banao"] if can_edit() else ["💬 Poocho"]
+    if st.session_state.ai_page_mode not in _ai_modes:
+        st.session_state.ai_page_mode = _ai_modes[0]
+    with st.container(key="ai_mode_row"):
+        _mode_cols = st.columns(len(_ai_modes))
+        for _mi, _m in enumerate(_ai_modes):
+            with _mode_cols[_mi]:
+                _is_active = st.session_state.ai_page_mode == _m
+                if st.button(_m, key=f"ai_mode_btn_{_mi}",
+                             type="primary" if _is_active else "secondary",
+                             use_container_width=True):
+                    st.session_state.ai_page_mode = _m
+                    st.rerun()
+    _ask_mode = st.session_state.ai_page_mode == "💬 Poocho"
+    _placeholder = "Ask anything about your data..." if _ask_mode else 'e.g. "monthly revenue trend" or "top clients by total paid"'
 
     # st.chat_input() is ALWAYS pinned to the bottom of the viewport by
     # Streamlit itself — this is what actually fixes the reported "box
@@ -4530,43 +4512,50 @@ elif page == "🤖 AI Assistant":
         if st.session_state.ai_chat_history and st.session_state.ai_chat_history[-1]["role"] == "assistant":
             st.session_state.ai_chat_history.pop()
         _typed = _last_user_q
+        _ask_mode = True
 
-    if _typed:
-        st.session_state.ai_chat_history.append({"role": "user", "content": _typed, "ts": time.time()})
+    question = _typed if (_typed and _ask_mode) else None
+    ai_req = _typed if (_typed and not _ask_mode) else None
+    if question:
+        st.session_state.ai_chat_history.append({"role": "user", "content": question, "ts": time.time()})
         ai_ok, ai_limit_msg = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "ai_calls")
         if not ai_ok:
             st.error(f"🚫 {ai_limit_msg}")
             st.stop()
         with st.spinner("Analysing..."):
-            result = ac.ask(_typed, df_raw, meta, kpis, st.session_state.dashboard_charts,
-                             api_key, history=st.session_state.ai_chat_history[:-1], can_edit=can_edit())
-
-        if result["kind"] == "card_chart" and not result["error"]:
-            # A chart/KPI-card request never becomes a chat bubble — same as
-            # before, it renders as an Add/Pin preview box further down.
-            st.session_state.ai_chat_history.pop()
-            st.session_state["_ai_card_spec"] = result["spec"]
-        elif result["error"]:
+            result = ac.ask(question, df_raw, meta, kpis, st.session_state.dashboard_charts,
+                             api_key, history=st.session_state.ai_chat_history[:-1])
+        if result["error"]:
             st.error(result["error"])
-            ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
         else:
             st.session_state.ai_chat_history.append({
-                "role": "assistant", "content": result.get("answer") or "",
-                "sql_used": result.get("sql_used"), "proof_df": result.get("proof_df"),
-                "image_b64": result.get("image_b64"), "image_mime": result.get("mime_type"),
-                "ts": time.time(),
+                "role": "assistant", "content": result["answer"],
+                "sql_used": result["sql_used"], "proof_df": result["proof_df"], "ts": time.time(),
             })
-            ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
+        ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
+        st.rerun()
+
+    if st.session_state.ai_chat_history and st.button("🗑️ Clear chat"):
+        st.session_state.ai_chat_history = []
+        ws.save_chat_history([], ai_history_storage_id())
         st.rerun()
 
     # ------------------------------------------------------------------------
-    # ADD/PIN PREVIEW FOR AN AI-DESIGNED KPI CARD OR CHART
-    # (view-only accounts never get the design_card_or_chart tool offered to
-    # the model — see can_edit=can_edit() above — so _ai_card_spec never gets
-    # set for them; nothing below this point can trigger for a viewer)
+    # AUTO-BUILD A KPI CARD OR CHART FROM A PLAIN-LANGUAGE REQUIREMENT
+    # (view-only accounts never see "🪄 Card/Chart banao" mode above, so
+    # ai_req is always None for them — nothing below this point can trigger)
     # ------------------------------------------------------------------------
     if not can_edit():
         st.stop()
+
+    if ai_req:
+        with st.spinner("Designing a card/chart from your data..."):
+            gen_result = ac.suggest_card_or_chart(ai_req.strip(), df_raw, api_key)
+        if gen_result.get("error"):
+            st.error(gen_result["error"])
+            st.session_state["_ai_card_spec"] = None
+        else:
+            st.session_state["_ai_card_spec"] = gen_result["spec"]
 
     ai_spec = st.session_state.get("_ai_card_spec")
     if ai_spec:
