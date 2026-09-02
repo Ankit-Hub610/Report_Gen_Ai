@@ -3558,130 +3558,123 @@ elif page == "💡 Business Insights":
     # ------------------------------------------------------------------------
     st.divider()
 
-    def _bi_hex_to_rgb(h):
-        h = (h or "#FFFFFF").lstrip("#")
-        if len(h) != 6:
-            h = "FFFFFF"
-        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    # A dedicated, SAFE color theme for this PDF — deliberately independent
+    # of st.session_state.theme. That dashboard theme defaults to a near-black
+    # background (#0E1117) with near-black text (#1a1a1a) — tuned for other
+    # screens, but in a PDF (always rendered on its own page background) that
+    # combination makes almost everything unreadable: title, footer, table
+    # text all become near-invisible dark-on-dark. Defaulting THIS picker to
+    # a guaranteed-readable light theme fixes that, and still lets the user
+    # pick their own colors for a client-matching look.
+    _BI_THEME_PRESETS = {
+        "Light (recommended)": {"bg": "#FFFFFF", "font": "#111111", "accent": "#2C6E49"},
+        "Dark":                {"bg": "#12151C", "font": "#F2F2F2", "accent": "#4CC38A"},
+        "Navy":                {"bg": "#FFFFFF", "font": "#0B1E3D", "accent": "#1E5AA8"},
+        "Warm":                {"bg": "#FFFDF8", "font": "#2B2118", "accent": "#C1662B"},
+    }
+    st.session_state.setdefault("bi_pdf_theme_preset", "Light (recommended)")
+    st.session_state.setdefault("bi_pdf_theme_custom", dict(_BI_THEME_PRESETS["Light (recommended)"]))
 
-    def _bi_blend_hex(hex_a, hex_b, t):
-        """Blend hex_a toward hex_b by fraction t (0=hex_a, 1=hex_b)."""
-        try:
-            ra, ga, ba = _bi_hex_to_rgb(hex_a)
-            rb, gb, bb = _bi_hex_to_rgb(hex_b)
-            r = round(ra + (rb - ra) * t)
-            g = round(ga + (gb - ga) * t)
-            b = round(ba + (bb - ba) * t)
-            return f"#{r:02X}{g:02X}{b:02X}"
-        except Exception:
-            return hex_a
+    with st.expander("🎨 Report theme (colors used in the downloaded PDF)", expanded=False):
+        st.caption("Separate from the dashboard's on-screen colors — chosen so the PDF text always "
+                   "stays readable regardless of what theme the dashboard itself uses.")
+        preset_names = list(_BI_THEME_PRESETS.keys()) + ["Custom"]
+        chosen_preset = st.selectbox("Preset", preset_names,
+                                      index=preset_names.index(st.session_state.bi_pdf_theme_preset)
+                                      if st.session_state.bi_pdf_theme_preset in preset_names else 0,
+                                      key="bi_pdf_theme_select")
+        st.session_state.bi_pdf_theme_preset = chosen_preset
 
-    _bi_bg = st.session_state.theme.get("bg_color", "#FFFFFF")
-    _bi_accent = st.session_state.theme.get("accent_color", "#2C6E49")
-    _bi_font = st.session_state.theme.get("font_color", "#111111")
-    _bi_card_bg = _bi_blend_hex(_bi_bg, _bi_accent, 0.08)      # subtle theme tint
-    _bi_card_border = _bi_blend_hex(_bi_bg, _bi_accent, 0.45)
+        if chosen_preset == "Custom":
+            cc1, cc2, cc3 = st.columns(3)
+            base = st.session_state.bi_pdf_theme_custom
+            with cc1:
+                base["bg"] = st.color_picker("Background", base.get("bg", "#FFFFFF"), key="bi_pdf_bg")
+            with cc2:
+                base["font"] = st.color_picker("Text", base.get("font", "#111111"), key="bi_pdf_font")
+            with cc3:
+                base["accent"] = st.color_picker("Accent", base.get("accent", "#2C6E49"), key="bi_pdf_accent")
+            _bi_pdf_colors = base
+        else:
+            _bi_pdf_colors = _BI_THEME_PRESETS[chosen_preset]
+            pc1, pc2, pc3 = st.columns(3)
+            pc1.color_picker("Background", _bi_pdf_colors["bg"], key="bi_pdf_bg_preview", disabled=True)
+            pc2.color_picker("Text", _bi_pdf_colors["font"], key="bi_pdf_font_preview", disabled=True)
+            pc3.color_picker("Accent", _bi_pdf_colors["accent"], key="bi_pdf_accent_preview", disabled=True)
 
-    # Scoped CSS using the container's stable "st-key-..." class (Streamlit
-    # >=1.38, already the app's pinned minimum) so this card always matches
-    # the current theme instead of a hardcoded color, and both download
-    # buttons render identically (same size/shape) instead of one being a
-    # big primary pill and the other a small default button.
-    st.markdown(f"""
-    <style>
-    .st-key-bi_download_card {{
-        background-color: {_bi_card_bg};
-        border: 1px solid {_bi_card_border};
-        border-radius: 12px;
-        padding: 18px 20px 14px 20px;
-    }}
-    .st-key-bi_download_card [data-testid="stButton"] button,
-    .st-key-bi_download_card [data-testid="stDownloadButton"] button {{
-        width: 100%;
-        border: 1px solid {_bi_accent};
-        background-color: {_bi_accent};
-        color: {_bi_blend_hex(_bi_accent, "#FFFFFF", 0.92)};
-    }}
-    .st-key-bi_download_card [data-testid="stButton"] button:hover,
-    .st-key-bi_download_card [data-testid="stDownloadButton"] button:hover {{
-        border-color: {_bi_accent};
-        color: {_bi_accent};
-        background-color: {_bi_blend_hex(_bi_bg, _bi_accent, 0.08)};
-    }}
-    </style>
-    """, unsafe_allow_html=True)
+    decisions_df = pd.DataFrame(decisions) if decisions else pd.DataFrame()
 
-    with st.container(key="bi_download_card"):
-        st.markdown(f"<div style='color:{_bi_font}; font-weight:600; font-size:1.05rem; "
-                    f"margin-bottom:12px;'>⬇️ Download this report</div>", unsafe_allow_html=True)
-        dl_c1, dl_c2 = st.columns(2)
+    st.markdown("**⬇️ Download this report**")
+    if st.session_state.plan == "free":
+        st.caption("🆓 Free plan: PDF exports are limited per day and carry a small watermark — "
+                   "upgrade to Standard for clean, client-ready exports.")
 
-        decisions_df = pd.DataFrame(decisions) if decisions else pd.DataFrame()
+    dl_c1, dl_c2 = st.columns(2)
+    with dl_c1:
+        if st.button("📄  Generate PDF", key="bi_pdf_btn", use_container_width=True):
+            ok_inc, msg_inc = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "pdf_exports")
+            if not ok_inc:
+                st.error(f"🚫 {msg_inc}")
+                st.stop()
+            with st.spinner("Building PDF report..."):
+                bi_theme = {
+                    "bg_color": _bi_pdf_colors["bg"],
+                    "font_color": _bi_pdf_colors["font"],
+                    "accent_color": _bi_pdf_colors["accent"],
+                    "font_name": "Helvetica",
+                    "wallpaper_bytes": None,  # dashboard wallpaper is skipped here — it can clash
+                                              # with a picked color and re-cause the invisible-text bug.
+                }
+                bi_kpis = [
+                    # Note: PDF uses "Rs." not "₹" — the PDF's base font (Helvetica)
+                    # can't render the rupee glyph and would show a black box instead.
+                    {"label": "Captured Revenue", "value": f"Rs. {total_rev:,.0f}", "sub": ""},
+                    {"label": "Captured Transactions", "value": f"{total_captured:,}", "sub": ""},
+                    {"label": "Capture Rate", "value": f"{capture_rate}%", "sub": ""},
+                    {"label": "Unique Payment Pages",
+                     "value": f"{page_t['Payment Page Title'].nunique():,}" if not page_t.empty else "0", "sub": ""},
+                    {"label": "Health Score",
+                     "value": f"{hs['score']}" if hs["score"] is not None else "—", "sub": hs["label"]},
+                ]
+                bi_pdf_bytes = pe.build_business_insights_pdf(
+                    report_title="Business Insights",
+                    subtitle=f"Payment Page Title \u2192 Sport / Location / Day breakdown \u2014 {pd.Timestamp.today().date()}",
+                    kpis=bi_kpis,
+                    tables=[
+                        {"title": "🏆 Sport Analysis", "df": sport_t},
+                        {"title": "📍 Code / Location Analysis", "df": code_t},
+                        {"title": "📅 Day Analysis", "df": day_t},
+                        {"title": "🧾 Payment Page Analysis (detailed)", "df": page_t},
+                    ],
+                    decisions=decisions_df,
+                    theme=bi_theme,
+                    watermark=("FREE TRIAL — UPGRADE FOR CLEAN REPORTS"
+                               if st.session_state.plan == "free" else None),
+                )
+            st.session_state["_bi_pdf_bytes"] = bi_pdf_bytes
 
-        with dl_c1:
-            if st.session_state.plan == "free":
-                st.caption("🆓 Free plan: PDF exports are limited per day and carry a small watermark — "
-                           "upgrade to Standard for clean, client-ready exports.")
-            if st.button("📄 Generate & Download PDF", key="bi_pdf_btn", type="primary", use_container_width=True):
-                ok_inc, msg_inc = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "pdf_exports")
-                if not ok_inc:
-                    st.error(f"🚫 {msg_inc}")
-                    st.stop()
-                with st.spinner("Building PDF report..."):
-                    bi_theme = {
-                        "bg_color": st.session_state.theme["bg_color"],
-                        "font_color": st.session_state.theme["font_color"],
-                        "accent_color": st.session_state.theme["accent_color"],
-                        "font_name": st.session_state.theme["font_name"],
-                        "wallpaper_bytes": st.session_state.theme.get("wallpaper_bytes"),
-                    }
-                    bi_kpis = [
-                        # Note: PDF uses "Rs." not "₹" — the PDF's base font (Helvetica)
-                        # can't render the rupee glyph and would show a black box instead.
-                        {"label": "Captured Revenue", "value": f"Rs. {total_rev:,.0f}", "sub": ""},
-                        {"label": "Captured Transactions", "value": f"{total_captured:,}", "sub": ""},
-                        {"label": "Capture Rate", "value": f"{capture_rate}%", "sub": ""},
-                        {"label": "Unique Payment Pages",
-                         "value": f"{page_t['Payment Page Title'].nunique():,}" if not page_t.empty else "0", "sub": ""},
-                        {"label": "Health Score",
-                         "value": f"{hs['score']}" if hs["score"] is not None else "—", "sub": hs["label"]},
-                    ]
-                    bi_pdf_bytes = pe.build_business_insights_pdf(
-                        report_title="Business Insights",
-                        subtitle=f"Payment Page Title \u2192 Sport / Location / Day breakdown \u2014 {pd.Timestamp.today().date()}",
-                        kpis=bi_kpis,
-                        tables=[
-                            {"title": "🏆 Sport Analysis", "df": sport_t},
-                            {"title": "📍 Code / Location Analysis", "df": code_t},
-                            {"title": "📅 Day Analysis", "df": day_t},
-                            {"title": "🧾 Payment Page Analysis (detailed)", "df": page_t},
-                        ],
-                        decisions=decisions_df,
-                        theme=bi_theme,
-                        watermark=("FREE TRIAL — UPGRADE FOR CLEAN REPORTS"
-                                   if st.session_state.plan == "free" else None),
-                    )
-                st.download_button("📥 Click to download business_insights.pdf", data=bi_pdf_bytes,
-                                    file_name="business_insights.pdf", mime="application/pdf",
-                                    key="bi_pdf_dl", type="primary", use_container_width=True)
+        if st.session_state.get("_bi_pdf_bytes"):
+            st.download_button("📥  Download report.pdf", data=st.session_state["_bi_pdf_bytes"],
+                                file_name="business_insights.pdf", mime="application/pdf",
+                                key="bi_pdf_dl", use_container_width=True)
 
-        with dl_c2:
-            # Bundle every table into one CSV (with a section header row) so a
-            # single click gets everything — no separate button per table needed.
-            _csv_parts = []
-            for _name, _tbl in [("Sport Analysis", sport_t), ("Code / Location Analysis", code_t),
-                                 ("Day Analysis", day_t), ("Payment Page Analysis", page_t),
-                                 ("Management Decisions", decisions_df)]:
-                if _tbl is not None and not _tbl.empty:
-                    _csv_parts.append(f"# {_name}\n")
-                    _csv_parts.append(_tbl.to_csv(index=False))
-                    _csv_parts.append("\n")
-            bi_csv_bytes = "".join(_csv_parts).encode("utf-8")
-            st.caption("Every table above, bundled into one file.")
-            st.download_button("📊 Download full data (.csv)", data=bi_csv_bytes,
-                                file_name="business_insights.csv", mime="text/csv",
-                                key="bi_csv_dl", type="primary", use_container_width=True,
-                                disabled=not _csv_parts)
+    with dl_c2:
+        # Bundle every table into one CSV (with a section header row) so a
+        # single click gets everything — no separate button per table needed.
+        _csv_parts = []
+        for _name, _tbl in [("Sport Analysis", sport_t), ("Code / Location Analysis", code_t),
+                             ("Day Analysis", day_t), ("Payment Page Analysis", page_t),
+                             ("Management Decisions", decisions_df)]:
+            if _tbl is not None and not _tbl.empty:
+                _csv_parts.append(f"# {_name}\n")
+                _csv_parts.append(_tbl.to_csv(index=False))
+                _csv_parts.append("\n")
+        bi_csv_bytes = "".join(_csv_parts).encode("utf-8")
+        st.write("")  # small vertical nudge so this button lines up with the PDF one above
+        st.download_button("📊  Download data (.csv)", data=bi_csv_bytes,
+                            file_name="business_insights.csv", mime="text/csv",
+                            key="bi_csv_dl", use_container_width=True,
+                            disabled=not _csv_parts)
 
 elif page == "📈 Full Analysis":
     st.title("📈 Full Analysis")
