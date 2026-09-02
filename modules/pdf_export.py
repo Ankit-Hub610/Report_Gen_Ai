@@ -262,6 +262,215 @@ def build_pdf_report(report_title, subtitle, kpis, chart_items, theme, filters_s
     return buf.getvalue()
 
 
+def _fmt_cell(v):
+    """Format a single dataframe cell for display inside a PDF table."""
+    if v is None:
+        return "\u2014"
+    try:
+        import math
+        if isinstance(v, float):
+            if math.isnan(v):
+                return "\u2014"
+            if v == int(v):
+                return f"{int(v):,}"
+            return f"{v:,.2f}"
+        if isinstance(v, int):
+            return f"{v:,}"
+    except Exception:
+        pass
+    return str(v)
+
+
+def build_business_insights_pdf(report_title, subtitle, kpis, tables, theme,
+                                 decisions=None, filters_summary="", watermark=None,
+                                 max_rows_per_table=60):
+    """
+    Builds a print-ready PDF for the "Business Insights" page.
+
+    kpis: list of {"label","value","sub"} — same shape as build_pdf_report.
+    tables: list of {"title": str, "df": pandas.DataFrame} — one section per
+      table (Sport Analysis, Code/Location Analysis, Day Analysis, Payment
+      Page Analysis, ...). Rendered in the order given, each starting on its
+      own page. Long tables are capped at `max_rows_per_table` rows (with a
+      note) so the PDF stays a reasonable size; the on-screen table and any
+      CSV export still show every row.
+    decisions: optional pandas.DataFrame (Management Decisions) rendered as
+      its own final section.
+    theme / filters_summary / watermark: same meaning as build_pdf_report.
+    """
+    buf = io.BytesIO()
+    bg_hex = theme.get("bg_color", "#FFFFFF")
+    font_hex = theme.get("font_color", "#111111")
+    accent_hex = theme.get("accent_color", "#2C6E49")
+
+    bg_color = _hex_to_color(bg_hex)
+    font_color = _hex_to_color(font_hex)
+    accent = _hex_to_color(accent_hex)
+    card_bg = _blend(bg_hex, accent_hex, 0.10)
+    box_border = _blend(bg_hex, accent_hex, 0.55)
+    masthead_text_hex = _readable_text_color(accent_hex)
+    masthead_text = _hex_to_color(masthead_text_hex)
+    grid_line = _blend(bg_hex, "#000000", 0.25)
+
+    page_size = landscape(A4)
+    MASTHEAD_H = 0.95 * cm
+
+    def draw_background(canvas, doc):
+        canvas.saveState()
+        canvas.setFillColor(bg_color)
+        canvas.rect(0, 0, page_size[0], page_size[1], fill=1, stroke=0)
+        wp = theme.get("wallpaper_bytes")
+        if wp:
+            try:
+                from reportlab.lib.utils import ImageReader
+                img = ImageReader(io.BytesIO(wp))
+                canvas.drawImage(img, 0, 0, width=page_size[0], height=page_size[1],
+                                  preserveAspectRatio=False, mask='auto')
+            except Exception:
+                pass
+
+        canvas.setFillColor(accent)
+        canvas.rect(0, page_size[1] - MASTHEAD_H, page_size[0], MASTHEAD_H, fill=1, stroke=0)
+        canvas.setFillColor(masthead_text)
+        canvas.setFont(theme.get("font_name", "Helvetica-Bold"), 9.5)
+        canvas.drawString(1.2 * cm, page_size[1] - MASTHEAD_H + 0.28 * cm, report_title.upper())
+        canvas.setFont(theme.get("font_name", "Helvetica"), 8)
+        canvas.drawRightString(page_size[0] - 1.2 * cm, page_size[1] - MASTHEAD_H + 0.28 * cm,
+                                f"Page {doc.page}")
+
+        canvas.setFont(theme.get("font_name", "Helvetica"), 8)
+        canvas.setFillColor(font_color)
+        canvas.drawString(1.2 * cm, 0.6 * cm, f"Generated {datetime.now().strftime('%d-%b-%Y %H:%M')}")
+        canvas.drawCentredString(page_size[0] / 2, 0.6 * cm, "Confidential - Internal Use Only")
+
+        if watermark:
+            canvas.saveState()
+            try:
+                canvas.setFillColor(colors.grey)
+                canvas.setFillAlpha(0.16)
+            except Exception:
+                canvas.setFillColorRGB(0.65, 0.65, 0.65)
+            canvas.setFont("Helvetica-Bold", 44)
+            canvas.translate(page_size[0] / 2, page_size[1] / 2)
+            canvas.rotate(32)
+            canvas.drawCentredString(0, 0, watermark)
+            canvas.restoreState()
+
+        canvas.restoreState()
+
+    doc = BaseDocTemplate(buf, pagesize=page_size,
+                           leftMargin=1.2 * cm, rightMargin=1.2 * cm,
+                           topMargin=MASTHEAD_H + 0.6 * cm, bottomMargin=1.2 * cm)
+    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="normal")
+    template = PageTemplate(id="bg", frames=[frame], onPage=draw_background)
+    doc.addPageTemplates([template])
+
+    styles = getSampleStyleSheet()
+    font_name = theme.get("font_name", "Helvetica")
+    title_style = ParagraphStyle("TitleY", parent=styles["Title"], textColor=font_color,
+                                  fontName=font_name, fontSize=22, alignment=TA_CENTER)
+    sub_style = ParagraphStyle("SubY", parent=styles["Normal"], textColor=font_color,
+                                fontName=font_name, fontSize=11, alignment=TA_CENTER, spaceAfter=10)
+    section_style = ParagraphStyle("SecY", parent=styles["Heading2"], textColor=accent,
+                                    fontName=font_name, fontSize=14, spaceBefore=6, spaceAfter=6)
+    note_style = ParagraphStyle("NoteY", parent=styles["Normal"], textColor=font_color,
+                                 fontName=font_name, fontSize=8, alignment=TA_LEFT, spaceBefore=4)
+    kpi_eyebrow_style = ParagraphStyle("KEyebrowY", parent=styles["Normal"], fontName=font_name, fontSize=7,
+                                        textColor=accent, alignment=TA_CENTER)
+    kpi_label_style = ParagraphStyle("KLabelY", parent=styles["Normal"], fontName=font_name, fontSize=9,
+                                      textColor=font_color, alignment=TA_CENTER)
+    kpi_value_style = ParagraphStyle("KValueY", parent=styles["Normal"], fontName=font_name, fontSize=17,
+                                      textColor=accent, alignment=TA_CENTER, leading=19)
+    kpi_sub_style = ParagraphStyle("KSubY", parent=styles["Normal"], fontName=font_name, fontSize=8,
+                                    textColor=font_color, alignment=TA_CENTER)
+    th_style = ParagraphStyle("ThY", parent=styles["Normal"], fontName=font_name, fontSize=8.5,
+                               textColor=masthead_text, alignment=TA_CENTER)
+    td_style = ParagraphStyle("TdY", parent=styles["Normal"], fontName=font_name, fontSize=8,
+                               textColor=font_color, alignment=TA_CENTER)
+
+    story = []
+    story.append(Spacer(1, 4))
+    story.append(Paragraph(report_title, title_style))
+    if subtitle:
+        story.append(Paragraph(subtitle, sub_style))
+    if filters_summary:
+        story.append(Paragraph(f"<i>Filters applied: {filters_summary}</i>", sub_style))
+    story.append(Spacer(1, 6))
+
+    # ---- KPI grid (same visual language as the Boss Dashboard PDF) ----
+    if kpis:
+        story.append(Paragraph("\u25A0 KEY PERFORMANCE INDICATORS", section_style))
+        rows, row = [], []
+        for k in kpis:
+            cell = [Paragraph("KPI", kpi_eyebrow_style),
+                    Paragraph(k["label"], kpi_label_style),
+                    Paragraph(str(k["value"]), kpi_value_style),
+                    Paragraph(k.get("sub", "") or "", kpi_sub_style)]
+            row.append(cell)
+            if len(row) == 5:
+                rows.append(row)
+                row = []
+        if row:
+            while len(row) < 5:
+                row.append([Paragraph("", kpi_label_style)])
+            rows.append(row)
+
+        table_data = [[_stack(c) for c in r] for r in rows]
+        t = Table(table_data, colWidths=[doc.width / 5.0] * 5)
+        style_cmds = [
+            ("BOX", (0, 0), (-1, -1), 0.6, box_border),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, box_border),
+            ("BACKGROUND", (0, 0), (-1, -1), card_bg),
+            ("TOPPADDING", (0, 0), (-1, -1), 9),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]
+        for r_idx in range(len(rows)):
+            for c_idx in range(5):
+                style_cmds.append(("LINEABOVE", (c_idx, r_idx), (c_idx, r_idx), 2.2, accent))
+        t.setStyle(TableStyle(style_cmds))
+        story.append(t)
+
+    def _render_df_table(df, title):
+        story.append(PageBreak())
+        story.append(Paragraph(title, section_style))
+        if df is None or df.empty:
+            story.append(Paragraph("No rows for this section.", note_style))
+            return
+        shown = df
+        truncated = False
+        if len(df) > max_rows_per_table:
+            shown = df.head(max_rows_per_table)
+            truncated = True
+        header = [Paragraph(str(c), th_style) for c in shown.columns]
+        data_rows = [[Paragraph(_fmt_cell(v), td_style) for v in row] for row in shown.itertuples(index=False)]
+        data = [header] + data_rows
+        n_cols = len(shown.columns)
+        t = Table(data, repeatRows=1, colWidths=[doc.width / n_cols] * n_cols)
+        t.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.5, grid_line),
+            ("INNERGRID", (0, 0), (-1, -1), 0.3, grid_line),
+            ("BACKGROUND", (0, 0), (-1, 0), accent),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(t)
+        if truncated:
+            story.append(Paragraph(
+                f"Showing top {max_rows_per_table:,} of {len(df):,} rows. "
+                f"Download the CSV for the full dataset.", note_style))
+
+    # ---- One table section per page ----
+    for item in (tables or []):
+        _render_df_table(item.get("df"), item.get("title", "Table"))
+
+    if decisions is not None and not decisions.empty:
+        _render_df_table(decisions, "\U0001F9ED Management Decisions")
+
+    doc.build(story)
+    return buf.getvalue()
+
+
 def _stack(paragraphs):
     from reportlab.platypus import Table as InnerTable
     it = InnerTable([[p] for p in paragraphs])
