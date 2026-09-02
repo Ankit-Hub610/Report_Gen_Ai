@@ -3553,6 +3553,78 @@ elif page == "💡 Business Insights":
     else:
         st.dataframe(pd.DataFrame(decisions).head(25), use_container_width=True, hide_index=True)
 
+    # ------------------------------------------------------------------------
+    # DOWNLOAD — Business Insights as PDF or CSV
+    # ------------------------------------------------------------------------
+    st.divider()
+    st.subheader("⬇️ Download this report")
+    dl_c1, dl_c2 = st.columns(2)
+
+    decisions_df = pd.DataFrame(decisions) if decisions else pd.DataFrame()
+
+    with dl_c1:
+        if st.session_state.plan == "free":
+            st.caption("🆓 Free plan: PDF exports are limited per day and carry a small watermark — "
+                       "upgrade to Standard for clean, client-ready exports.")
+        if st.button("📄 Generate & Download PDF", key="bi_pdf_btn", type="primary"):
+            ok_inc, msg_inc = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "pdf_exports")
+            if not ok_inc:
+                st.error(f"🚫 {msg_inc}")
+                st.stop()
+            with st.spinner("Building PDF report..."):
+                bi_theme = {
+                    "bg_color": st.session_state.theme["bg_color"],
+                    "font_color": st.session_state.theme["font_color"],
+                    "accent_color": st.session_state.theme["accent_color"],
+                    "font_name": st.session_state.theme["font_name"],
+                    "wallpaper_bytes": st.session_state.theme.get("wallpaper_bytes"),
+                }
+                bi_kpis = [
+                    # Note: PDF uses "Rs." not "₹" — the PDF's base font (Helvetica)
+                    # can't render the rupee glyph and would show a black box instead.
+                    {"label": "Captured Revenue", "value": f"Rs. {total_rev:,.0f}", "sub": ""},
+                    {"label": "Captured Transactions", "value": f"{total_captured:,}", "sub": ""},
+                    {"label": "Capture Rate", "value": f"{capture_rate}%", "sub": ""},
+                    {"label": "Unique Payment Pages",
+                     "value": f"{page_t['Payment Page Title'].nunique():,}" if not page_t.empty else "0", "sub": ""},
+                    {"label": "Health Score",
+                     "value": f"{hs['score']}" if hs["score"] is not None else "—", "sub": hs["label"]},
+                ]
+                bi_pdf_bytes = pe.build_business_insights_pdf(
+                    report_title="Business Insights",
+                    subtitle=f"Payment Page Title \u2192 Sport / Location / Day breakdown \u2014 {pd.Timestamp.today().date()}",
+                    kpis=bi_kpis,
+                    tables=[
+                        {"title": "🏆 Sport Analysis", "df": sport_t},
+                        {"title": "📍 Code / Location Analysis", "df": code_t},
+                        {"title": "📅 Day Analysis", "df": day_t},
+                        {"title": "🧾 Payment Page Analysis (detailed)", "df": page_t},
+                    ],
+                    decisions=decisions_df,
+                    theme=bi_theme,
+                    watermark=("FREE TRIAL — UPGRADE FOR CLEAN REPORTS"
+                               if st.session_state.plan == "free" else None),
+                )
+            st.download_button("📥 Click to download business_insights.pdf", data=bi_pdf_bytes,
+                                file_name="business_insights.pdf", mime="application/pdf",
+                                key="bi_pdf_dl", type="primary")
+
+    with dl_c2:
+        # Bundle every table into one CSV (with a section header row) so a
+        # single click gets everything — no separate button per table needed.
+        _csv_parts = []
+        for _name, _tbl in [("Sport Analysis", sport_t), ("Code / Location Analysis", code_t),
+                             ("Day Analysis", day_t), ("Payment Page Analysis", page_t),
+                             ("Management Decisions", decisions_df)]:
+            if _tbl is not None and not _tbl.empty:
+                _csv_parts.append(f"# {_name}\n")
+                _csv_parts.append(_tbl.to_csv(index=False))
+                _csv_parts.append("\n")
+        bi_csv_bytes = "".join(_csv_parts).encode("utf-8")
+        st.download_button("📊 Download full data (.csv)", data=bi_csv_bytes,
+                            file_name="business_insights.csv", mime="text/csv",
+                            key="bi_csv_dl", disabled=not _csv_parts)
+
 elif page == "📈 Full Analysis":
     st.title("📈 Full Analysis")
     st.caption("Har number Python khud calculate karta hai (koi invented figure nahi). "
