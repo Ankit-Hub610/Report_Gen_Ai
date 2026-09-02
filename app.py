@@ -1840,84 +1840,14 @@ def load_file(uploaded_file):
     return df
 
 
-# The 3 chart families picked for auto-suggestion — the most universally
-# readable/"boardroom" chart types for a first look at ANY dataset,
-# regardless of industry (sports, e-commerce, invoices...). Order matters:
-# this is also the priority order used if a dataset only supports some of
-# them (e.g. no usable date column for a Line chart).
-_AUTO_SUGGEST_CHART_FAMILIES = ["Bar", "Line", "Pie"]
-_AUTO_SUGGEST_KPI_COUNT = 4
-
-
-def _auto_suggest_dashboard(df, meta):
-    """Picks a sensible STARTING set of KPI cards + charts for the Boss
-    Dashboard the moment a dataset is freshly loaded — so a brand-new user
-    (or a client loading a new file) opens an already-populated,
-    presentation-ready dashboard instead of a blank page with a 'go pin
-    something yourself' message.
-
-    IMPORTANT: nothing this picks is locked or special — every card/chart
-    it returns is pinned through the EXACT SAME pinned_kpis/dashboard_charts
-    mechanism as manually clicking ⭐ on Raw Analysis, so the existing
-    🗑️ Remove button on Boss Dashboard un-pins an auto-suggested card/chart
-    exactly the same way as a manually-pinned one — no separate "AI pick"
-    concept for the person to learn.
-
-    What it picks, and why:
-      - The first `_AUTO_SUGGEST_KPI_COUNT` KPI cards data_engine generates
-        for this dataset. compute_kpis() already returns a small, CURATED
-        set (Total X, Average, Unique count, Date range, Growth rate...) in
-        a deliberate priority order for whatever columns this dataset has —
-        it is NOT one generic card per column — so "the first few of that
-        list" is already a meaningful pick, not an arbitrary slice.
-      - The single best (first-generated) variant from each of
-        _AUTO_SUGGEST_CHART_FAMILIES — Bar, Line, Pie — skipping any family
-        this particular dataset doesn't have suitable columns for (e.g. no
-        date column at all -> no Line suggestion). generate_variants()
-        already orders each family's variants with its most informative
-        one first, so taking variant[0] per family reuses that same
-        judgment rather than re-inventing a new scoring system here.
-
-    Returns (suggested_kpi_labels, suggested_chart_entries) — safe to feed
-    straight into st.session_state.pinned_kpis / dashboard_charts, or to
-    merge into an existing set (see the "✨ Suggest cards & charts for me"
-    button on Boss Dashboard, which reuses this same function later, after
-    the initial load, without wiping whatever the person has since curated).
-    """
-    suggested_kpis = []
-    try:
-        kpis = de.compute_kpis(df, meta)
-        suggested_kpis = [k["label"] for k in kpis[:_AUTO_SUGGEST_KPI_COUNT]]
-    except Exception:
-        pass  # never let a suggestion failure block the actual data load
-
-    suggested_charts = []
-    for fam in _AUTO_SUGGEST_CHART_FAMILIES:
-        try:
-            variants = ce.generate_variants(df, meta, fam)
-        except Exception:
-            variants = []
-        if variants:
-            suggested_charts.append({"family": fam, "variant": copy.deepcopy(variants[0])})
-
-    return suggested_kpis, suggested_charts
-
-
 def _apply_loaded_df(df, source_name):
     df, cap_note = _enforce_row_cap(df)
     st.session_state.df_raw = df
     st.session_state.meta = de.profile_columns(df)
     st.session_state.data_source_name = source_name + (f" {cap_note}" if cap_note else "")
     st.session_state.filters = {}
-    # Auto-suggest a starting Boss Dashboard for this FRESH dataset (see
-    # _auto_suggest_dashboard's docstring) instead of leaving it blank.
-    # Deliberately only happens here / in load_sample() (a genuinely NEW
-    # load) — never in _refresh_loaded_df(), which must never disturb
-    # whatever the person has since pinned/removed on a live-refreshing
-    # source.
-    _sugg_kpis, _sugg_charts = _auto_suggest_dashboard(df, st.session_state.meta)
-    st.session_state.pinned_kpis = _sugg_kpis
-    st.session_state.dashboard_charts = _sugg_charts
+    st.session_state.dashboard_charts = []
+    st.session_state.pinned_kpis = []
     st.session_state.dashboard_slicers = []
     st.session_state.data_source_is_db = False   # a fresh file/sample load — any previous DB link no longer applies
     st.session_state.data_source_is_gsheet = False  # a fresh file/sample load — any previous Google Sheet link no longer applies
@@ -1928,8 +1858,6 @@ def _apply_loaded_df(df, source_name):
         st.warning(f"🆓 Free plan is capped at {ul.FREE_PLAN_LIMITS['max_rows']:,} rows — "
                    f"loaded the first {ul.FREE_PLAN_LIMITS['max_rows']:,} rows of this file. "
                    f"Ask your admin to upgrade your plan for full data.")
-    if _sugg_kpis or _sugg_charts:
-        st.session_state["_dashboard_just_auto_suggested"] = True  # one-shot banner, see Boss Dashboard page
 
 
 def _enforce_row_cap(df):
@@ -2055,14 +1983,9 @@ def load_sample(filename: str = "sample_sports_payments.csv"):
     st.session_state.meta = de.profile_columns(df)
     st.session_state.data_source_name = f"{filename} (demo data)"
     st.session_state.filters = {}
-    # Same auto-suggested starting dashboard as a real file/DB/Sheet load —
-    # see _auto_suggest_dashboard's docstring above.
-    _sugg_kpis, _sugg_charts = _auto_suggest_dashboard(df, st.session_state.meta)
-    st.session_state.pinned_kpis = _sugg_kpis
-    st.session_state.dashboard_charts = _sugg_charts
+    st.session_state.dashboard_charts = []
+    st.session_state.pinned_kpis = []
     st.session_state.dashboard_slicers = []
-    if _sugg_kpis or _sugg_charts:
-        st.session_state["_dashboard_just_auto_suggested"] = True
 
 
 def render_filters(df, meta, key_prefix=""):
@@ -3288,28 +3211,6 @@ elif page == "⭐ Boss Dashboard":
     df_raw = st.session_state.df_raw
     meta = st.session_state.meta
 
-    # ---- Auto-suggested starting dashboard: one-shot banner + a button to
-    # re-run suggestions any time (see _auto_suggest_dashboard's docstring). ----
-    if can_edit_dashboard():
-        if st.session_state.pop("_dashboard_just_auto_suggested", False):
-            st.info("✨ We've pre-selected a few KPI cards and charts based on your data to get you "
-                     "started. Keep whatever's useful, remove the rest with 🗑️, or add more from "
-                     "**📊 Raw Analysis** — nothing here is locked.")
-        _sugg_col, _ = st.columns([2, 4])
-        with _sugg_col:
-            if st.button("✨ Suggest cards & charts for me", use_container_width=True,
-                          help="Adds a few auto-picked KPI cards and charts based on your current data — "
-                               "keeps whatever you already have pinned, just adds to it."):
-                _new_kpis, _new_charts = _auto_suggest_dashboard(df_raw, meta)
-                for _lbl in _new_kpis:
-                    if _lbl not in st.session_state.pinned_kpis:
-                        st.session_state.pinned_kpis.append(_lbl)
-                for _entry in _new_charts:
-                    if not chart_in_dashboard(_entry["family"], _entry["variant"]["id"]):
-                        st.session_state.dashboard_charts.append(_entry)
-                persist_workspace_now(force_full=False)
-                st.rerun()
-
     with st.expander("🎨 Dashboard Theme & Style", expanded=False):
         th = st.session_state.theme
         c1, c2, c3, c4 = st.columns(4)
@@ -3749,21 +3650,6 @@ elif page == "📈 Full Analysis":
     # ------------------------------------------------------------------------
     # PAGE NAVIGATION — 2 pages, as requested
     # ------------------------------------------------------------------------
-    # BUG FIX (reported): clicking "Continue to Page 2" / "Back to Page 1"
-    # crashed with StreamlitAPIException. Root cause: the radio widget below
-    # is instantiated with key="intel_part_radio" — and once a widget with a
-    # given key has rendered THIS SAME script run, Streamlit forbids
-    # directly assigning to st.session_state["intel_part_radio"] afterwards
-    # (exactly what those two buttons, further down, used to do). This
-    # mirrors the EXACT same class of bug the Slide switcher hit earlier in
-    # this file (see switch_active_slide()'s docstring) — same fix here:
-    # a one-shot "pending" flag that gets applied to the widget's key BEFORE
-    # the widget is instantiated on the NEXT run (always safe, since that
-    # always happens before the widget exists for that run), instead of
-    # writing to the key directly after the fact.
-    _pending_intel_part = st.session_state.pop("_pending_intel_part_radio", None)
-    if _pending_intel_part is not None:
-        st.session_state["intel_part_radio"] = _pending_intel_part
     part = st.radio("Report section", ["📋 Page 1 — Full Analysis", "📈 Page 2 — Summary & Recommendations"],
                      horizontal=True, index=st.session_state.intel_part - 1, key="intel_part_radio",
                      label_visibility="collapsed")
@@ -3939,15 +3825,9 @@ elif page == "📈 Full Analysis":
             # The radio above has its own key ("intel_part_radio"), so once it's
             # rendered once, Streamlit reads ITS OWN keyed session_state value on
             # every rerun and ignores the index= param — setting intel_part alone
-            # would silently do nothing. But this widget has ALREADY been
-            # instantiated earlier in THIS SAME run (it renders near the top of
-            # the page, this button is much further down) — Streamlit forbids
-            # writing directly to a widget's own key after it's been
-            # instantiated this run (that's the StreamlitAPIException that was
-            # reported here). Set the one-shot pending flag instead; it gets
-            # applied to the widget's key right before the widget renders on
-            # the NEXT run (see just above where the radio is defined).
-            st.session_state["_pending_intel_part_radio"] = "📈 Page 2 — Summary & Recommendations"
+            # was silently doing nothing. Setting the radio's own key directly is
+            # what actually moves the selection to Page 2.
+            st.session_state["intel_part_radio"] = "📈 Page 2 — Summary & Recommendations"
             st.rerun()
 
     # ==========================================================================
@@ -4163,10 +4043,7 @@ elif page == "📈 Full Analysis":
         st.divider()
         if st.button("⬅️ Back to Page 1", key="intel_back_part1"):
             st.session_state.intel_part = 1
-            # Same StreamlitAPIException fix as the Continue button above —
-            # can't write "intel_part_radio" directly after it's already been
-            # instantiated this run, so use the one-shot pending flag instead.
-            st.session_state["_pending_intel_part_radio"] = "📋 Page 1 — Full Analysis"
+            st.session_state["intel_part_radio"] = "📋 Page 1 — Full Analysis"  # same fix as Continue button above
             st.rerun()
 
 
@@ -4424,10 +4301,8 @@ elif page == "🗂 Data Table":
 # ==================================================================================
 elif page == "🤖 AI Assistant":
     st.title("🤖 AI Assistant")
-    st.caption("Ask anything — general questions, or plain-language questions about your data, KPIs, "
-               "and dashboard charts. Data-related answers are grounded in real SQL run against your "
-               "dataset — not guesses — and shown with proof below each reply. "
-               "Chat history is kept for **5 days** and then auto-deleted.")
+    st.caption("Ask anything about your data, or anything else. Data answers are grounded in "
+               "real SQL, with proof shown below each reply.")
 
     if st.session_state.df_raw is None:
         st.info("Load data on the **📥 Connect Data** page first.")
@@ -4454,7 +4329,7 @@ elif page == "🤖 AI Assistant":
                 st.markdown(
                     "**Recommended — Google Gemini** (more reliable, better answer quality):\n"
                     "1. Go to **[aistudio.google.com](https://aistudio.google.com)** and sign in with any Google account.\n"
-                    "2. Click **Get API key** → **Create API key** → copy it (starts with `AIza...`).\n"
+                    "2. Click **Get API key** → **Create API key** → copy it (starts with `AIza...` or the newer `AQ....`).\n"
                     "3. Paste it below to test it now — kept only in this browser session, never saved to disk.\n\n"
                     "*(Alternative: an [openrouter.ai](https://openrouter.ai) key, starting with `sk-or-v1-...`, "
                     "also still works — paste it the same way below, it's auto-detected. OpenRouter's free tier "
@@ -4514,19 +4389,47 @@ elif page == "🤖 AI Assistant":
             max-width: 85%; white-space: pre-wrap; word-wrap: break-word;
             font-size: 0.95rem; line-height: 1.6; padding-top: 2px;
         }
-        /* Segmented mode toggle: two plain buttons styled as one pill,
-           active side filled, inactive side ghost — replaces the default
-           radio's visible circle dot, which looked cheap/unpolished. */
-        div.st-key-ai_mode_row div[data-testid="stHorizontalBlock"] {
-            gap: 0 !important; width: fit-content; border: 1px solid rgba(128,128,128,0.35);
-            border-radius: 999px; padding: 3px; margin-bottom: 10px;
+
+        /* --- Neutral chrome everywhere on this page ------------------------
+           The app theme's primaryColor (red) is meant for a handful of
+           deliberate accents (the user bubble, the active mode pill) — but
+           Streamlit's defaults also paint that same red onto every bordered/
+           focused widget (expanders, the chat input, text inputs). Applied
+           everywhere at once, that reads as a page full of validation-error
+           outlines instead of a calm chat UI. Pin borders to a quiet neutral
+           grey instead, so red only ever means "this is the active thing". */
+        [data-testid="stExpander"] {
+            border: 1px solid rgba(128,128,128,0.22) !important;
+            border-radius: 14px !important;
+            box-shadow: none !important;
         }
-        div.st-key-ai_mode_row button {
-            border-radius: 999px !important; border: none !important; box-shadow: none !important;
+        [data-testid="stChatInput"] {
+            border-radius: 999px !important;
+            border: 1px solid rgba(128,128,128,0.22) !important;
+            box-shadow: 0 1px 6px rgba(0,0,0,0.05) !important;
+            transition: border-color .15s ease, box-shadow .15s ease;
         }
-        div.st-key-ai_mode_row div[data-testid="stHorizontalBlock"] > div:has(button[kind="secondary"]) button {
-            background: transparent !important;
+        [data-testid="stChatInput"]:focus-within {
+            border-color: rgba(128,128,128,0.45) !important;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.08) !important;
         }
+        [data-testid="stChatInput"] textarea { font-size: 0.95rem !important; }
+
+        /* --- Toolbar row (just the clear-chat icon now) ----------------------
+           Used to also hold a 3-button mode-picker pill (Poocho/Card-Chart/
+           Image) — removed (see the "ONE UNIFIED INPUT" block below in this
+           page) so the AI itself detects intent from the message instead of
+           the user picking a mode by hand, ChatGPT-style. Kept as a flex row
+           in case more small icon actions land here later. */
+        div.st-key-ai_toolbar_row div[data-testid="stHorizontalBlock"] {
+            align-items: center; gap: 0 !important; margin: 2px 0 14px 0;
+        }
+        div.st-key-ai_clear_btn button {
+            border: none !important; background: transparent !important; box-shadow: none !important;
+            color: rgba(128,128,128,0.85) !important; font-size: 0.85rem !important;
+        }
+        div.st-key-ai_clear_btn button:hover { color: var(--primary-color, #FF4B4B) !important; }
+
         /* Small ghost icon-buttons under each assistant reply (Copy / Regenerate).
            Container keys are dynamic per-turn (ai_msg_actions_0, _1, ...), so
            match on a class-name substring instead of one exact st-key-X class. */
@@ -4542,6 +4445,8 @@ elif page == "🤖 AI Assistant":
     import html as _html_mod
 
     def _render_bubble(role: str, content: str):
+        if not content:
+            return
         css_class = "ai-bubble-user" if role == "user" else "ai-bubble-assistant"
         st.markdown(
             f'<div class="ai-chat-row {role}"><div class="{css_class}">'
@@ -4553,6 +4458,12 @@ elif page == "🤖 AI Assistant":
     with chat_scope:
         for _turn_i, turn in enumerate(st.session_state.ai_chat_history):
             _render_bubble(turn["role"], turn["content"])
+            if turn.get("image_b64"):
+                import base64 as _b64mod
+                try:
+                    st.image(_b64mod.b64decode(turn["image_b64"]), width=420)
+                except Exception:
+                    st.caption("⚠️ Could not display the generated image.")
             if turn.get("proof_df") is not None:
                 with st.expander("🔍 Proof (SQL + data used)"):
                     st.code(turn["sql_used"], language="sql")
@@ -4580,23 +4491,31 @@ elif page == "🤖 AI Assistant":
     if _ai_remaining_top is not None:
         st.caption(f"🆓 Free plan: {_ai_remaining_top} AI request(s) left today.")
 
-    # Two-button segmented mode toggle — see CSS above for the pill styling.
-    st.session_state.setdefault("ai_page_mode", "💬 Poocho")
-    _ai_modes = ["💬 Poocho", "🪄 Card/Chart banao"] if can_edit() else ["💬 Poocho"]
-    if st.session_state.ai_page_mode not in _ai_modes:
-        st.session_state.ai_page_mode = _ai_modes[0]
-    with st.container(key="ai_mode_row"):
-        _mode_cols = st.columns(len(_ai_modes))
-        for _mi, _m in enumerate(_ai_modes):
-            with _mode_cols[_mi]:
-                _is_active = st.session_state.ai_page_mode == _m
-                if st.button(_m, key=f"ai_mode_btn_{_mi}",
-                             type="primary" if _is_active else "secondary",
-                             use_container_width=True):
-                    st.session_state.ai_page_mode = _m
-                    st.rerun()
-    _ask_mode = st.session_state.ai_page_mode == "💬 Poocho"
-    _placeholder = "Ask anything about your data..." if _ask_mode else 'e.g. "monthly revenue trend" or "top clients by total paid"'
+    # ------------------------------------------------------------------------
+    # ONE UNIFIED INPUT — NO MANUAL MODE PICKER
+    # ------------------------------------------------------------------------
+    # BUG FIX (reported): a 3-button row ("💬 Poocho" / "🪄 Card/Chart banao" /
+    # "🖼️ Image banao") used to sit above the input, forcing the user to pick
+    # a mode by hand before every message — "kuch bhi bolo vo samajh jata he,
+    # jesa ChatGPT" was the ask. The picker is gone; there's just the one
+    # chat box below now. ac.ask() itself figures out — from the wording
+    # alone, via 3 tool declarations the model chooses between — whether this
+    # is a data/general question, an image request, or a new chart/KPI-card
+    # request, and returns which one it picked in result["kind"]. This block
+    # just renders whichever kind comes back; see modules/ai_chat.py for the
+    # actual intent-routing logic.
+    if st.session_state.ai_chat_history:
+        with st.container(key="ai_toolbar_row"):
+            _tb_left, _tb_right = st.columns([5, 1])
+            with _tb_right:
+                with st.container(key="ai_clear_btn"):
+                    if st.button("🗑️ Clear", key="ai_clear_chat_btn", help="Clear this chat"):
+                        st.session_state.ai_chat_history = []
+                        ws.save_chat_history([], ai_history_storage_id())
+                        st.rerun()
+
+    _placeholder = ("Ask anything, or ask me to build a chart/KPI card, or generate an image..."
+                    if can_edit() else "Ask anything about your data...")
 
     # st.chat_input() is ALWAYS pinned to the bottom of the viewport by
     # Streamlit itself — this is what actually fixes the reported "box
@@ -4611,50 +4530,82 @@ elif page == "🤖 AI Assistant":
         if st.session_state.ai_chat_history and st.session_state.ai_chat_history[-1]["role"] == "assistant":
             st.session_state.ai_chat_history.pop()
         _typed = _last_user_q
-        _ask_mode = True
 
-    question = _typed if (_typed and _ask_mode) else None
-    ai_req = _typed if (_typed and not _ask_mode) else None
-    if question:
-        st.session_state.ai_chat_history.append({"role": "user", "content": question, "ts": time.time()})
+    # BUG FIX (reported): the same question showing up repeated many times in
+    # a row, each one failing, ending in "Gemini free-tier rate limit hit".
+    #
+    # Root cause #1: when ac.ask() returned an error (rate limit, or any
+    # other API failure), the ONLY feedback was a transient st.error() call —
+    # which vanishes the moment st.rerun() fires right after it. The user's
+    # question stayed sitting in the chat with literally nothing after it
+    # once the page redrew, no visible error, no reply. That looks exactly
+    # like "did this even go through?", which is what drove someone to just
+    # retype the same question again — and again — each attempt burning
+    # another call against an already-tight free-tier quota, which is what
+    # actually caused the rate limit in the first place.
+    #
+    # Root cause #2: nothing stopped an IMMEDIATE retry from being sent the
+    # instant a rate-limit error came back — even though a rate limit is by
+    # definition not going to succeed if retried a second later.
+    #
+    # Fix: (a) an error now gets appended into ai_chat_history as a real,
+    # permanent assistant-role turn — same as any other reply — so it's
+    # still sitting there after the rerun, impossible to mistake for "nothing
+    # happened"; (b) a rate-limit error specifically starts a short cooldown
+    # (see _ai_rate_limited_until below) during which a new question is
+    # politely declined client-side, with a countdown, instead of being sent
+    # to the API at all — so mashing Enter repeatedly can no longer make the
+    # rate limit worse.
+    _cooldown_until = st.session_state.get("_ai_rate_limited_until", 0)
+    if _typed and time.time() < _cooldown_until:
+        st.warning(f"⏳ Still cooling down from the last rate-limit error — "
+                   f"try again in {int(_cooldown_until - time.time())}s.")
+    elif _typed:
+        st.session_state.ai_chat_history.append({"role": "user", "content": _typed, "ts": time.time()})
         ai_ok, ai_limit_msg = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "ai_calls")
         if not ai_ok:
-            st.error(f"🚫 {ai_limit_msg}")
-            st.stop()
+            st.session_state.ai_chat_history.append({
+                "role": "assistant", "content": f"🚫 {ai_limit_msg}", "ts": time.time(),
+            })
+            ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
+            st.rerun()
         with st.spinner("Analysing..."):
-            result = ac.ask(question, df_raw, meta, kpis, st.session_state.dashboard_charts,
-                             api_key, history=st.session_state.ai_chat_history[:-1])
-        if result["error"]:
-            st.error(result["error"])
+            result = ac.ask(_typed, df_raw, meta, kpis, st.session_state.dashboard_charts,
+                             api_key, history=st.session_state.ai_chat_history[:-1], can_edit=can_edit())
+
+        if result["kind"] == "card_chart" and not result["error"]:
+            # A chart/KPI-card request never becomes a chat bubble — same as
+            # before, it renders as an Add/Pin preview box further down.
+            st.session_state.ai_chat_history.pop()
+            st.session_state["_ai_card_spec"] = result["spec"]
+        elif result["error"]:
+            if "rate limit" in result["error"].lower():
+                st.session_state["_ai_rate_limited_until"] = time.time() + 20
+            # Appended as a real, PERSISTENT chat turn (see the bug-fix note
+            # above) instead of a transient st.error() that disappeared on
+            # the very next rerun.
+            st.session_state.ai_chat_history.append({
+                "role": "assistant", "content": f"⚠️ {result['error']}", "ts": time.time(),
+            })
+            ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
         else:
             st.session_state.ai_chat_history.append({
-                "role": "assistant", "content": result["answer"],
-                "sql_used": result["sql_used"], "proof_df": result["proof_df"], "ts": time.time(),
+                "role": "assistant", "content": result.get("answer") or "",
+                "sql_used": result.get("sql_used"), "proof_df": result.get("proof_df"),
+                "image_b64": result.get("image_b64"), "image_mime": result.get("mime_type"),
+                "ts": time.time(),
             })
-        ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
-        st.rerun()
-
-    if st.session_state.ai_chat_history and st.button("🗑️ Clear chat"):
-        st.session_state.ai_chat_history = []
-        ws.save_chat_history([], ai_history_storage_id())
+            ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
         st.rerun()
 
     # ------------------------------------------------------------------------
-    # AUTO-BUILD A KPI CARD OR CHART FROM A PLAIN-LANGUAGE REQUIREMENT
-    # (view-only accounts never see "🪄 Card/Chart banao" mode above, so
-    # ai_req is always None for them — nothing below this point can trigger)
+    # ADD/PIN PREVIEW FOR AN AI-DESIGNED KPI CARD OR CHART
+    # (view-only accounts never get the design_card_or_chart tool offered to
+    # the model — see can_edit=can_edit() above — so _ai_card_spec never gets
+    # set for them; nothing below this point can trigger for a viewer)
     # ------------------------------------------------------------------------
     if not can_edit():
         st.stop()
-
-    if ai_req:
-        with st.spinner("Designing a card/chart from your data..."):
-            gen_result = ac.suggest_card_or_chart(ai_req.strip(), df_raw, api_key)
-        if gen_result.get("error"):
-            st.error(gen_result["error"])
-            st.session_state["_ai_card_spec"] = None
-        else:
-            st.session_state["_ai_card_spec"] = gen_result["spec"]
 
     ai_spec = st.session_state.get("_ai_card_spec")
     if ai_spec:
