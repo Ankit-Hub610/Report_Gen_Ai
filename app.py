@@ -4531,12 +4531,44 @@ elif page == "🤖 AI Assistant":
             st.session_state.ai_chat_history.pop()
         _typed = _last_user_q
 
-    if _typed:
+    # BUG FIX (reported): the same question showing up repeated many times in
+    # a row, each one failing, ending in "Gemini free-tier rate limit hit".
+    #
+    # Root cause #1: when ac.ask() returned an error (rate limit, or any
+    # other API failure), the ONLY feedback was a transient st.error() call —
+    # which vanishes the moment st.rerun() fires right after it. The user's
+    # question stayed sitting in the chat with literally nothing after it
+    # once the page redrew, no visible error, no reply. That looks exactly
+    # like "did this even go through?", which is what drove someone to just
+    # retype the same question again — and again — each attempt burning
+    # another call against an already-tight free-tier quota, which is what
+    # actually caused the rate limit in the first place.
+    #
+    # Root cause #2: nothing stopped an IMMEDIATE retry from being sent the
+    # instant a rate-limit error came back — even though a rate limit is by
+    # definition not going to succeed if retried a second later.
+    #
+    # Fix: (a) an error now gets appended into ai_chat_history as a real,
+    # permanent assistant-role turn — same as any other reply — so it's
+    # still sitting there after the rerun, impossible to mistake for "nothing
+    # happened"; (b) a rate-limit error specifically starts a short cooldown
+    # (see _ai_rate_limited_until below) during which a new question is
+    # politely declined client-side, with a countdown, instead of being sent
+    # to the API at all — so mashing Enter repeatedly can no longer make the
+    # rate limit worse.
+    _cooldown_until = st.session_state.get("_ai_rate_limited_until", 0)
+    if _typed and time.time() < _cooldown_until:
+        st.warning(f"⏳ Still cooling down from the last rate-limit error — "
+                   f"try again in {int(_cooldown_until - time.time())}s.")
+    elif _typed:
         st.session_state.ai_chat_history.append({"role": "user", "content": _typed, "ts": time.time()})
         ai_ok, ai_limit_msg = ul.check_and_increment(st.session_state.workspace_id, st.session_state.plan, "ai_calls")
         if not ai_ok:
-            st.error(f"🚫 {ai_limit_msg}")
-            st.stop()
+            st.session_state.ai_chat_history.append({
+                "role": "assistant", "content": f"🚫 {ai_limit_msg}", "ts": time.time(),
+            })
+            ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
+            st.rerun()
         with st.spinner("Analysing..."):
             result = ac.ask(_typed, df_raw, meta, kpis, st.session_state.dashboard_charts,
                              api_key, history=st.session_state.ai_chat_history[:-1], can_edit=can_edit())
@@ -4547,7 +4579,14 @@ elif page == "🤖 AI Assistant":
             st.session_state.ai_chat_history.pop()
             st.session_state["_ai_card_spec"] = result["spec"]
         elif result["error"]:
-            st.error(result["error"])
+            if "rate limit" in result["error"].lower():
+                st.session_state["_ai_rate_limited_until"] = time.time() + 20
+            # Appended as a real, PERSISTENT chat turn (see the bug-fix note
+            # above) instead of a transient st.error() that disappeared on
+            # the very next rerun.
+            st.session_state.ai_chat_history.append({
+                "role": "assistant", "content": f"⚠️ {result['error']}", "ts": time.time(),
+            })
             ws.save_chat_history(st.session_state.ai_chat_history, ai_history_storage_id())
         else:
             st.session_state.ai_chat_history.append({
